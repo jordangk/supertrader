@@ -19,11 +19,19 @@ export default function App() {
   const [buying, setBuying] = useState(null);
   const [toast, setToast] = useState(null);
 
-  // Fetch wallet + orders on load
+  // Fetch wallet + orders on load and when event changes
   useEffect(() => {
     fetch('/api/wallet').then(r => r.json()).then(setWallet).catch(() => {});
     fetchOrders();
   }, []);
+
+  // Refetch orders when a new event arrives
+  useEffect(() => {
+    if (event?.slug) {
+      fetchOrders();
+      fetch('/api/wallet').then(r => r.json()).then(setWallet).catch(() => {});
+    }
+  }, [event?.slug]);
 
   function fetchOrders() {
     fetch('/api/orders').then(r => r.json()).then(d => setOrders(d.orders || [])).catch(() => {});
@@ -48,21 +56,16 @@ export default function App() {
     }
   }
 
-  // Calculate expected returns & fees
-  function calcReturns(side, amount) {
-    const price = side === 'up' ? prices.upPrice : prices.downPrice;
-    if (!price) return null;
-    const buyPrice = Math.min(price + 0.01, 0.99);
-    const fee = amount * FEE_PCT;
-    const net = amount - fee;
-    const shares = net / buyPrice;
-    const returnIfWin = shares * 1.0; // $1 per share on win
-    const profit = returnIfWin - amount;
-    return { buyPrice, fee, shares, returnIfWin, profit };
+  // Compute current holdings from orders
+  const holdings = { up: { shares: 0, cost: 0 }, down: { shares: 0, cost: 0 } };
+  for (const o of orders) {
+    if (o.order_status === 'resolved') continue;
+    const s = o.direction;
+    if (holdings[s]) {
+      holdings[s].shares += parseFloat(o.shares || 0);
+      holdings[s].cost += parseFloat(o.purchase_amount || 0);
+    }
   }
-
-  const upReturn = calcReturns('up', 10); // preview for $10 default
-  const downReturn = calcReturns('down', 10);
 
   return (
     <div className="min-h-screen bg-gray-950 flex flex-col">
@@ -93,7 +96,7 @@ export default function App() {
             amounts={AMOUNTS}
             buying={buying}
             onBuy={handleBuy}
-            calcReturns={calcReturns}
+            holdings={holdings}
           />
           <BuyPanel
             side="down"
@@ -101,7 +104,7 @@ export default function App() {
             amounts={AMOUNTS}
             buying={buying}
             onBuy={handleBuy}
-            calcReturns={calcReturns}
+            holdings={holdings}
           />
         </div>
 
@@ -109,7 +112,7 @@ export default function App() {
         <Positions orders={orders} prices={prices} />
 
         {/* Orders */}
-        <OrderHistory orders={orders} />
+        <OrderHistory orders={orders} prices={prices} />
 
         {/* Toast */}
         <OrderToast toast={toast} onDismiss={() => setToast(null)} />

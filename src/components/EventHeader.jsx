@@ -1,6 +1,14 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 
 export default function EventHeader({ event }) {
+  const [now, setNow] = useState(Date.now());
+
+  // Tick every second for countdown
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+
   if (!event) return (
     <div className="bg-gray-900 rounded-xl p-4 animate-pulse">
       <div className="h-4 bg-gray-700 rounded w-3/4 mb-2" />
@@ -8,22 +16,31 @@ export default function EventHeader({ event }) {
     </div>
   );
 
-  const end = event.endDate ? new Date(event.endDate) : null;
-  const now = new Date();
+  const end = event.endDate ? new Date(event.endDate).getTime() : null;
   const secsLeft = end ? Math.max(0, Math.floor((end - now) / 1000)) : null;
   const mins = secsLeft !== null ? Math.floor(secsLeft / 60) : '?';
   const secs = secsLeft !== null ? secsLeft % 60 : '?';
+  const expired = secsLeft === 0;
 
   return (
-    <div className="bg-gray-900 rounded-xl p-4 border border-gray-800">
+    <div className={`bg-gray-900 rounded-xl p-4 border ${expired ? 'border-yellow-600' : 'border-gray-800'}`}>
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <span className="w-2 h-2 bg-green-400 rounded-full animate-pulse" />
-          <span className="text-sm font-semibold text-gray-100">{event.title || 'Bitcoin Up or Down – 5m'}</span>
+          <span className={`w-2 h-2 rounded-full animate-pulse ${expired ? 'bg-yellow-400' : 'bg-green-400'}`} />
+          <a
+            href={`https://polymarket.com/event/${event.slug}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-sm font-semibold text-gray-100 hover:text-blue-400 transition-colors"
+          >
+            {event.title || 'Bitcoin Up or Down – 5m'}
+          </a>
         </div>
         {secsLeft !== null && (
-          <span className={`text-sm font-mono font-bold ${secsLeft < 60 ? 'text-red-400' : 'text-gray-400'}`}>
-            {String(mins).padStart(2,'0')}:{String(secs).padStart(2,'0')}
+          <span className={`text-sm font-mono font-bold ${
+            expired ? 'text-yellow-400' : secsLeft < 60 ? 'text-red-400' : 'text-gray-400'
+          }`}>
+            {expired ? 'ENDED' : `${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}`}
           </span>
         )}
       </div>

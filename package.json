@@ -8,6 +8,8 @@
     "start": "NODE_ENV=production node server.js"
   },
   "dependencies": {
+    "@polymarket/clob-client": "^5.5.0",
+    "@polymarket/order-utils": "^3.0.1",
     "@supabase/supabase-js": "^2.39.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.1",
