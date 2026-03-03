@@ -130,8 +130,16 @@ export default function Positions({ positions, eventSlug, fallbackOrders, prices
   const hedgeDownAmount = shortfallDown > 0 && downPrice ? shortfallDown * downPrice : null;
   const hedgeUpAmount = shortfallUp > 0 && upPrice ? shortfallUp * upPrice : null;
 
-  const needUpForProfit = upPayout < totalCost && upPrice ? (totalCost - upPayout) * upPrice : null;
-  const needDownForProfit = downPayout < totalCost && downPrice ? (totalCost - downPayout) * downPrice : null;
+  const upShortfall = Math.max(0, totalCost - upPayout);
+  const downShortfall = Math.max(0, totalCost - downPayout);
+  const needUpForProfit = upShortfall > 0 && upPrice && upPrice < 1 ? upShortfall * upPrice / (1 - upPrice) : null;
+  const needDownForProfit = downShortfall > 0 && downPrice && downPrice < 1 ? downShortfall * downPrice / (1 - downPrice) : null;
+  const needUpShares = upShortfall > 0 && upPrice && upPrice < 1 ? upShortfall / (1 - upPrice) : null;
+  const needDownShares = downShortfall > 0 && downPrice && downPrice < 1 ? downShortfall / (1 - downPrice) : null;
+  const upAvgCost = upPayout > 0 ? (upPos?.initialValue || 0) / upPayout : 0;
+  const downAvgCost = downPayout > 0 ? (downPos?.initialValue || 0) / downPayout : 0;
+  const maxPriceUpForLock = upShortfall > 0 && downAvgCost > 0 ? (1 - downAvgCost) : null;
+  const maxPriceDownForLock = downShortfall > 0 && upAvgCost > 0 ? (1 - upAvgCost) : null;
 
   return (
     <div className="bg-gray-900 rounded-xl border border-gray-800 overflow-hidden">
@@ -228,11 +236,18 @@ export default function Positions({ positions, eventSlug, fallbackOrders, prices
               {(needDownForProfit != null || needUpForProfit != null) && (
                 <div>
                   <p className="text-[10px] uppercase tracking-wider text-gray-500 mb-0.5">To be profitable either way</p>
-                  <p className="text-xs font-mono text-green-400">
-                    {needDownForProfit != null && `Buy $${needDownForProfit.toFixed(2)} of DOWN`}
-                    {needDownForProfit != null && needUpForProfit != null && ' · '}
-                    {needUpForProfit != null && `Buy $${needUpForProfit.toFixed(2)} of UP`}
-                  </p>
+                  <div className="text-xs font-mono text-green-400 space-y-0.5">
+                    {needDownForProfit != null && (
+                      <p>
+                        Buy {needDownShares?.toFixed(1)} sh of DOWN at {(maxPriceDownForLock ?? 0.99) * 100}¢ or below · ${needDownForProfit.toFixed(2)} at current price
+                      </p>
+                    )}
+                    {needUpForProfit != null && (
+                      <p>
+                        Buy {needUpShares?.toFixed(1)} sh of UP at {(maxPriceUpForLock ?? 0.99) * 100}¢ or below · ${needUpForProfit.toFixed(2)} at current price
+                      </p>
+                    )}
+                  </div>
                 </div>
               )}
               {(hedgeDownAmount != null || hedgeUpAmount != null) && (
