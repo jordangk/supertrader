@@ -1,7 +1,8 @@
 import React from 'react';
 
-export default function BuyPanel({ side, price, amounts, buying, onBuy }) {
+export default function BuyPanel({ side, price, amounts, buying, onBuy, expectedROI = 0 }) {
   const isUp = side === 'up';
+  const threshold = price != null ? price / (1 + expectedROI) : null;
 
   return (
     <div className={`rounded-xl border p-4 space-y-3 ${isUp ? 'border-green-800 bg-green-950/20' : 'border-red-800 bg-red-950/20'}`}>
@@ -13,6 +14,11 @@ export default function BuyPanel({ side, price, amounts, buying, onBuy }) {
           {price ? `${(price * 100).toFixed(1)}¢` : '—'}
         </span>
       </div>
+      {threshold != null && (
+        <p className={`text-xs ${isUp ? 'text-green-400/80' : 'text-red-400/80'}`}>
+          Buy below {(threshold * 100).toFixed(1)}¢ to increase expected ROI
+        </p>
+      )}
 
       <div className="grid grid-cols-3 gap-1.5">
         {amounts.map(amt => {
@@ -20,7 +26,7 @@ export default function BuyPanel({ side, price, amounts, buying, onBuy }) {
           return (
             <button
               key={amt}
-              disabled={!!buying || !price}
+              disabled={isBuying || !price}
               onClick={() => onBuy(side, amt)}
               className={`
                 py-2 rounded-lg text-sm font-bold transition-all

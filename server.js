@@ -6,7 +6,8 @@ import { createClient } from '@supabase/supabase-js';
 import { createServer } from 'http';
 import { ClobClient } from '@polymarket/clob-client';
 import { Wallet } from '@ethersproject/wallet';
-
+import { JsonRpcProvider } from '@ethersproject/providers';
+import { Contract } from '@ethersproject/contracts';
 
 const app = express();
 const server = createServer(app);
@@ -17,17 +18,18 @@ app.use(express.json());
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// ── Polymarket CLOB Client ───────────────────────────────────────────────
+// ── Polymarket CLOB Client (poly project pattern: sig-type 2, funder) ─────
 const CHAIN_ID = 137; // Polygon mainnet
-// SignatureType: 0 = EOA, 1 = POLY_PROXY (email/Magic login), 2 = POLY_GNOSIS_SAFE (browser wallet)
-const SIGNATURE_TYPE = 0; // EOA
+// SignatureType: 0 = EOA, 1 = POLY_PROXY (Magic), 2 = POLY_GNOSIS_SAFE (browser wallet / poly project)
+const SIGNATURE_TYPE = 2; // POLY_GNOSIS_SAFE
+const FUNDER_ADDRESS = process.env.FUNDER_ADDRESS;
 let clobClient = null;
 
 async function initClobClient() {
   try {
     const wallet = new Wallet(process.env.PRIVATE_KEY);
     console.log('[CLOB] Wallet address:', wallet.address);
-    console.log('[CLOB] Signature type:', SIGNATURE_TYPE);
+    console.log('[CLOB] Signature type:', SIGNATURE_TYPE, '(POLY_GNOSIS_SAFE), funder:', FUNDER_ADDRESS);
 
     // Derive API credentials
     const tempClient = new ClobClient(
@@ -38,17 +40,49 @@ async function initClobClient() {
     const creds = await tempClient.createOrDeriveApiKey();
     console.log('[CLOB] API key derived:', creds.key);
 
-    // Create authenticated client (EOA — no funderAddress)
+    // poly project pattern: --sig-type 2 --funder <FUNDER_ADDRESS>
     clobClient = new ClobClient(
       'https://clob.polymarket.com',
       CHAIN_ID,
       wallet,
       creds,
       SIGNATURE_TYPE,
+      FUNDER_ADDRESS || undefined,
     );
     console.log('[CLOB] Client ready');
   } catch (e) {
     console.error('[CLOB] Failed to init client:', e.message);
+  }
+}
+
+// ── USDC Allowance Check (funder = Safe that holds USDC) ──────────────────
+const POLYGON_RPC = 'https://polygon-mainnet.g.alchemy.com/v2/8kruQGYamUT6J4Ib0aMfw';
+const USDC_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+const CTF_EXCHANGE = '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E';
+const MAX_UINT256 = '0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff';
+const USDC_ABI = [
+  'function allowance(address owner, address spender) view returns (uint256)',
+  'function approve(address spender, uint256 amount) returns (bool)',
+];
+
+async function ensureAllowance() {
+  try {
+    const ownerAddress = FUNDER_ADDRESS || process.env.PROXY_WALLET;
+    if (!ownerAddress) return;
+
+    const provider = new JsonRpcProvider(POLYGON_RPC);
+    const usdc = new Contract(USDC_ADDRESS, USDC_ABI, provider);
+    const allowance = await usdc.allowance(ownerAddress, CTF_EXCHANGE);
+    console.log('[ALLOWANCE] USDC allowance for CTF Exchange:', allowance.toString(), '(funder:', ownerAddress + ')');
+
+    const enoughThreshold = '1000000000000'; // 1M USDC (6 decimals)
+    if (allowance.lt(enoughThreshold)) {
+      console.warn('[ALLOWANCE] Insufficient allowance. Approve USDC for CTF Exchange at polymarket.com before trading.');
+    } else {
+      console.log('[ALLOWANCE] OK');
+    }
+  } catch (e) {
+    console.error('[ALLOWANCE] Failed:', e.message);
   }
 }
 
@@ -148,6 +182,7 @@ async function fetchActiveEvent() {
       feeType: market.feeType,
     });
 
+    const conditionId = market.conditionId ?? market.condition_id;
     return {
       slug: event.slug,
       title: event.title,
@@ -156,6 +191,7 @@ async function fetchActiveEvent() {
       tokenUp: tokenIds[0],   // index 0 = Up
       tokenDown: tokenIds[1], // index 1 = Down
       marketId: market.id,
+      conditionId: conditionId || null,
       tickSize: market.orderPriceMinTickSize || '0.01',
       negRisk: !!market.negRisk,
     };
@@ -343,23 +379,26 @@ app.post('/api/buy', async (req, res) => {
   if (!price) return res.status(400).json({ error: 'No price available' });
 
   const buyPrice = Math.min(price + 0.01, 0.99);
-  const shares = amount / buyPrice;
+  const roundedPrice = Math.round(buyPrice * 100) / 100;
+  const rawSize = amount / roundedPrice;
+  const roundedSize = Math.ceil(rawSize * 100) / 100;
+  const actualCost = roundedSize * roundedPrice;
 
   // Snapshot of both prices & time left at moment of buy
   const endDate = activeEvent.endDate ? new Date(activeEvent.endDate) : null;
   const timeLeftSecs = endDate ? Math.max(0, Math.floor((endDate - Date.now()) / 1000)) : null;
 
-  // Record to Supabase — same polymarket_trades table
+  // Record to Supabase — same polymarket_trades table (use actual order size & cost)
   const tradeData = {
     polymarket_event_id: liveState.eventSlug,
     direction: side === 'up' ? 'up' : 'down',
-    purchase_price: buyPrice,
-    purchase_amount: amount,
+    purchase_price: roundedPrice,
+    purchase_amount: actualCost,
     purchase_time: new Date().toISOString(),
     btc_price_at_purchase: liveState.btcCurrent,
     order_type: 'supertrader',
     order_status: 'pending',
-    shares: shares,
+    shares: roundedSize,
     notes: JSON.stringify({
       tokenId,
       eventTitle: liveState.eventTitle,
@@ -403,13 +442,6 @@ app.post('/api/buy', async (req, res) => {
     orderError = 'CLOB client not initialized';
   } else {
     try {
-      // Round price to 2 decimals (Polymarket requirement)
-      const roundedPrice = Math.round(buyPrice * 100) / 100;
-      // size = number of shares to buy (amount in dollars / price per share)
-      // Ceil to 2dp to ensure we always meet minimum order size after CLOB rounding
-      const rawSize = amount / roundedPrice;
-      const roundedSize = Math.ceil(rawSize * 100) / 100;
-
       const tickSize = String(activeEvent.tickSize || '0.01');
       const negRisk = !!activeEvent.negRisk;
       console.log('[ORDER] Creating signed order:', { tokenId, price: roundedPrice, size: roundedSize, dollarAmount: amount, side: 'BUY', tickSize, negRisk });
@@ -458,15 +490,15 @@ app.post('/api/buy', async (req, res) => {
     }
   }
 
-  const success = !orderError && !dbErr;
+  const orderSuccess = !orderError && !!(orderData?.orderID || orderData?.orderId);
   res.json({
-    success,
-    error: orderError || (dbErr ? dbErr.message : null),
+    success: orderSuccess,
+    error: orderError || null,
     dbError: dbErr ? dbErr.message : null,
     trade: trade || tradeData, // return tradeData even if DB failed
     order: orderData,
-    price: buyPrice,
-    shares,
+    price: roundedPrice,
+    shares: roundedSize,
     snapshot: {
       upPrice: liveState.upPrice,
       downPrice: liveState.downPrice,
@@ -499,6 +531,29 @@ app.get('/api/wallet', async (req, res) => {
   }
 });
 
+// ── Positions from Polymarket (source of truth) ─────────────────────────────
+app.get('/api/positions', async (req, res) => {
+  try {
+    const user = (process.env.PROXY_WALLET || process.env.FUNDER_ADDRESS)?.toLowerCase();
+    if (!user) return res.json({ positions: [], error: 'PROXY_WALLET or FUNDER_ADDRESS not set' });
+    const eventSlug = req.query.event;
+    const conditionId = activeEvent?.conditionId && activeEvent?.slug === eventSlug
+      ? activeEvent.conditionId
+      : null;
+    let url = `https://data-api.polymarket.com/positions?user=${user}&limit=100`;
+    if (conditionId) url += `&market=${encodeURIComponent(conditionId)}`;
+    const r = await fetch(url);
+    const data = await r.json();
+    let positions = Array.isArray(data) ? data : data.positions || [];
+    if (eventSlug && !conditionId) {
+      positions = positions.filter(p => (p.eventSlug || p.slug) === eventSlug);
+    }
+    res.json({ positions });
+  } catch (e) {
+    res.json({ positions: [], error: e.message });
+  }
+});
+
 // ── Active event ───────────────────────────────────────────────────────────
 app.get('/api/event', (req, res) => res.json({ event: activeEvent, liveState }));
 
@@ -515,6 +570,7 @@ const PORT = process.env.PORT || 3001;
 server.listen(PORT, async () => {
   console.log(`SuperTrader server running on http://localhost:${PORT}`);
   await initClobClient();
+  await ensureAllowance();
   await refreshEvent();
   connectBtcStream();
   startPricePoll();
