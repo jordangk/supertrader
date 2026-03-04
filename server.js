@@ -557,6 +557,68 @@ app.get('/api/positions', async (req, res) => {
 // ── Active event ───────────────────────────────────────────────────────────
 app.get('/api/event', (req, res) => res.json({ event: activeEvent, liveState }));
 
+// ── k9 live trades ─────────────────────────────────────────────────────────
+app.get('/api/k9-trades', async (req, res) => {
+  const limit = parseInt(req.query.limit || '5');
+  try {
+    const { data: slugRows } = await supabase
+      .from('k9_observed_trades')
+      .select('slug')
+      .order('trade_timestamp', { ascending: false })
+      .limit(2000);
+
+    const slugSet = [...new Set((slugRows || []).map(r => r.slug))].slice(0, limit);
+    if (!slugSet.length) return res.json({ events: [] });
+
+    const { data: trades } = await supabase
+      .from('k9_observed_trades')
+      .select('*')
+      .in('slug', slugSet)
+      .order('trade_timestamp', { ascending: true });
+
+    const { data: ourTrades } = await supabase
+      .from('polymarket_copy_trades')
+      .select('*')
+      .eq('coin', 'k9-15m')
+      .order('purchase_time', { ascending: true });
+
+    const events = slugSet.map(slug => {
+      const k9 = (trades || []).filter(t => t.slug === slug);
+      const ours = (ourTrades || []).filter(t => (t.notes || '').includes(slug));
+      const summary = {};
+      for (const side of ['Up', 'Down']) {
+        const k9s = k9.filter(t => t.outcome === side);
+        const ourSide = ours.filter(t => t.direction === side.toLowerCase());
+        const k9Usdc   = k9s.reduce((s, t) => s + parseFloat(t.usdc_size), 0);
+        const k9Shares = k9s.reduce((s, t) => s + parseFloat(t.shares), 0);
+        const ourUsdc  = ourSide.reduce((s, t) => s + parseFloat(t.purchase_amount), 0);
+        const ourShares = ourSide.reduce((s, t) => s + parseFloat(t.shares || 0), 0);
+        summary[side] = {
+          k9Usdc, k9Shares,
+          k9AvgPrice: k9Shares > 0 ? k9Usdc / k9Shares : 0,
+          k9LastPrice: k9s.length ? parseFloat(k9s[k9s.length - 1].price) : 0,
+          k9Trades: k9s.length,
+          ourUsdc, ourShares,
+          ourAvgPrice: ourShares > 0 ? ourUsdc / ourShares : 0,
+          ourTrades: ourSide.length,
+          targetUsdc: k9Usdc * 0.01,
+          ratio: k9Usdc > 0 ? (ourUsdc / k9Usdc) * 100 : 0,
+        };
+      }
+      const recent = k9.slice(-30).map(t => ({
+        outcome: t.outcome, price: parseFloat(t.price),
+        shares: parseFloat(t.shares), usdc: parseFloat(t.usdc_size), ts: t.trade_timestamp,
+      }));
+      return { slug, summary, recent, totalTrades: k9.length };
+    });
+
+    res.json({ events });
+  } catch (e) {
+    console.error('/api/k9-trades error:', e.message);
+    res.json({ events: [], error: e.message });
+  }
+});
+
 // ── WS frontend connection ─────────────────────────────────────────────────
 wss.on('connection', (ws) => {
   // Send current state immediately on connect
