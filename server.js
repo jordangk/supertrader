@@ -627,6 +627,167 @@ wss.on('connection', (ws) => {
   ws.send(JSON.stringify({ type: 'btc', current: liveState.btcCurrent, start: liveState.btcStart }));
 });
 
+// ══════════════════════════════════════════════════════════════════════════
+// k9 ON-CHAIN WATCHER (Alchemy WS — mirrors sg-onchain-watcher.py logic)
+// ══════════════════════════════════════════════════════════════════════════
+const K9_WALLET     = '0xd0d6053c3c37e727402d84c14069780d360993aa';
+const K9_PAD        = '0x000000000000000000000000' + K9_WALLET.slice(2);
+const USDC_CONTRACT = '0x2791bca1f2de4661ed88a30c99a7a9449aa84174';
+const CTF_EXCHANGE  = '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e';
+const TRANSFER_SIG  = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+const ORDER_FILLED  = '0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6';
+const ALCHEMY_WS    = `wss://polygon-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_KEY || '8kruQGYamUT6J4Ib0aMfw'}`;
+const ALCHEMY_HTTP  = `https://polygon-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_KEY || '8kruQGYamUT6J4Ib0aMfw'}`;
+const GAMMA_API     = 'https://gamma-api.polymarket.com/markets';
+
+const COIN_PREFIXES = [
+  { prefix: 'btc-updown-15m', coin: 'btc', tf: '15m', interval: 900 },
+  { prefix: 'btc-updown-5m',  coin: 'btc', tf: '5m',  interval: 300 },
+];
+
+let k9TokenMap     = {};   // BigInt(tokenId) -> { slug, outcome, coin, tf, timeframe }
+let k9TokenExpiry  = 0;
+let k9Pending      = {};   // txHash -> { detectedAt }
+let k9SeenTx       = new Set();
+
+async function refreshK9TokenMap() {
+  const now = Math.floor(Date.now() / 1000);
+  const newMap = {};
+  for (const { prefix, coin, tf, interval } of COIN_PREFIXES) {
+    const lookahead = tf === '15m' ? 3 : 5;
+    const base = Math.floor(now / interval) * interval;
+    for (let i = 0; i < lookahead; i++) {
+      const epoch = base + i * interval;
+      const slug  = `${prefix}-${epoch}`;
+      try {
+        const r    = await fetch(`${GAMMA_API}?slug=${slug}`);
+        const data = await r.json();
+        if (!data || !data.length) continue;
+        const market   = data[0];
+        const tokenIds = JSON.parse(typeof market.clobTokenIds === 'string' ? market.clobTokenIds : JSON.stringify(market.clobTokenIds));
+        const outcomes = JSON.parse(typeof market.outcomes === 'string' ? market.outcomes : JSON.stringify(market.outcomes || '["Up","Down"]'));
+        tokenIds.forEach((tid, idx) => {
+          newMap[BigInt(tid).toString()] = {
+            slug, outcome: outcomes[idx] || `token${idx}`,
+            coin, tf, timeframe: prefix, epoch,
+          };
+        });
+      } catch {}
+    }
+  }
+  if (Object.keys(newMap).length) {
+    k9TokenMap    = newMap;
+    k9TokenExpiry = now + 60;
+    console.log(`[k9-watcher] Token map: ${Object.keys(newMap).length} tokens loaded`);
+  }
+}
+
+async function decodeK9Receipt(txHash) {
+  const resp = await fetch(ALCHEMY_HTTP, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_getTransactionReceipt', params: [txHash] }),
+  });
+  const { result: receipt } = await resp.json();
+  if (!receipt) return null;
+
+  const trades = [];
+  for (const log of (receipt.logs || [])) {
+    if (log.address?.toLowerCase() !== CTF_EXCHANGE.toLowerCase()) continue;
+    const topics = log.topics || [];
+    if (!topics[0] || topics[0].toLowerCase() !== ORDER_FILLED.toLowerCase()) continue;
+    const data = (log.data || '0x').slice(2);
+    if (data.length < 320) continue;
+    const chunks = [];
+    for (let i = 0; i < data.length; i += 64) chunks.push(data.slice(i, i + 64));
+    try {
+      const makerAsset  = BigInt('0x' + chunks[0]);
+      const takerAsset  = BigInt('0x' + chunks[1]);
+      const makerAmount = BigInt('0x' + chunks[2]);
+      const takerAmount = BigInt('0x' + chunks[3]);
+      if (makerAsset !== 0n) continue; // not a USDC buy
+      const usdcSize = Number(makerAmount) / 1e6;
+      const shares   = Number(takerAmount) / 1e6;
+      const price    = shares > 0 ? Math.round((usdcSize / shares) * 1e8) / 1e8 : 0;
+      const info     = k9TokenMap[takerAsset.toString()];
+      if (!info) continue;
+      trades.push({ txHash, slug: info.slug, outcome: info.outcome, price, shares, usdcSize,
+                    coin: info.coin, tf: info.tf, timeframe: info.timeframe, ts: Math.floor(Date.now() / 1000) });
+    } catch {}
+  }
+  return trades.length ? trades : null;
+}
+
+async function saveK9Trades(trades) {
+  if (!trades || !trades.length) return;
+  const rows = trades.map(t => ({
+    slug: t.slug, outcome: t.outcome, price: t.price, shares: t.shares,
+    usdc_size: t.usdcSize, tx_hash: t.txHash, trade_timestamp: t.ts,
+  }));
+  const { error } = await supabase.from('k9_observed_trades').insert(rows);
+  if (error) console.error('[k9-watcher] DB insert error:', error.message);
+  else {
+    // Broadcast to frontend
+    broadcast({ type: 'k9_trades', trades });
+    console.log(`[k9-watcher] Saved ${rows.length} trade(s): ${trades.map(t => `${t.outcome} ${t.slug} @${t.price} $${t.usdcSize.toFixed(2)}`).join(', ')}`);
+  }
+}
+
+let k9WsRetryDelay = 2000;
+function connectK9Watcher() {
+  console.log('[k9-watcher] Connecting to Alchemy WS...');
+  const ws = new WebSocket(ALCHEMY_WS);
+
+  ws.on('open', async () => {
+    k9WsRetryDelay = 2000;
+    await refreshK9TokenMap();
+    ws.send(JSON.stringify({
+      jsonrpc: '2.0', id: 1,
+      method: 'eth_subscribe',
+      params: ['logs', { address: USDC_CONTRACT, topics: [TRANSFER_SIG, [K9_PAD]] }],
+    }));
+    console.log('[k9-watcher] Subscribed to k9 USDC transfers');
+    // Refresh token map every 55s
+    setInterval(() => {
+      if (Date.now() / 1000 > k9TokenExpiry) refreshK9TokenMap();
+    }, 5000);
+  });
+
+  ws.on('message', async (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      const txHash = msg?.params?.result?.transactionHash;
+      if (!txHash || k9SeenTx.has(txHash) || k9Pending[txHash]) return;
+      k9Pending[txHash] = { detectedAt: Date.now() };
+    } catch {}
+  });
+
+  ws.on('close', () => {
+    console.log(`[k9-watcher] WS closed, retrying in ${k9WsRetryDelay}ms`);
+    setTimeout(connectK9Watcher, k9WsRetryDelay);
+    k9WsRetryDelay = Math.min(k9WsRetryDelay * 2, 30000);
+  });
+  ws.on('error', () => ws.close());
+
+  // Resolver loop — wait 500ms after detection then decode
+  setInterval(async () => {
+    const now = Date.now();
+    for (const [txHash, { detectedAt }] of Object.entries(k9Pending)) {
+      if (now - detectedAt < 500) continue;
+      delete k9Pending[txHash];
+      if (k9SeenTx.has(txHash)) continue;
+      k9SeenTx.add(txHash);
+      if (k9SeenTx.size > 5000) k9SeenTx = new Set([...k9SeenTx].slice(-2000));
+      try {
+        const trades = await decodeK9Receipt(txHash);
+        if (trades) await saveK9Trades(trades);
+      } catch (e) {
+        console.error('[k9-watcher] decode error:', e.message);
+      }
+    }
+  }, 300);
+}
+
 // ── Start ──────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, async () => {
@@ -637,4 +798,5 @@ server.listen(PORT, async () => {
   connectBtcStream();
   startPricePoll();
   scheduleNextEvent();
+  connectK9Watcher();
 });

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 
 const REFRESH_MS = 3000;
 
@@ -62,15 +62,19 @@ function UDBar({ upUsdc, downUsdc }) {
   );
 }
 
+const API_BASE = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
+
 export default function K9Trades() {
   const [events, setEvents] = useState([]);
   const [loading, setLoading] = useState(true);
   const [expanded, setExpanded] = useState({});
   const [lastUpdate, setLastUpdate] = useState(null);
+  const [liveCount, setLiveCount] = useState(0);
+  const ws = useRef(null);
 
   async function load() {
     try {
-      const r = await fetch('/api/k9-trades?tf=btc-updown-15m&limit=5');
+      const r = await fetch(`${API_BASE}/api/k9-trades?limit=5`);
       const d = await r.json();
       setEvents(d.events || []);
       setLastUpdate(new Date());
@@ -80,8 +84,33 @@ export default function K9Trades() {
 
   useEffect(() => {
     load();
+    // Poll every 3s for DB-backed summary
     const t = setInterval(load, REFRESH_MS);
-    return () => clearInterval(t);
+
+    // Also connect WS for live push notifications
+    function connectWs() {
+      const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+      const host = window.location.hostname;
+      ws.current = new WebSocket(`${protocol}://${host}:3001`);
+      ws.current.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type === 'k9_trades') {
+            setLiveCount(c => c + msg.trades.length);
+            // Reload summary to reflect new trades
+            load();
+          }
+        } catch {}
+      };
+      ws.current.onclose = () => setTimeout(connectWs, 2000);
+      ws.current.onerror = () => ws.current?.close();
+    }
+    connectWs();
+
+    return () => {
+      clearInterval(t);
+      ws.current?.close();
+    };
   }, []);
 
   function toggleExpand(slug) {
@@ -100,11 +129,18 @@ export default function K9Trades() {
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h2 className="text-sm font-semibold text-gray-300">k9 Live Trades <span className="text-gray-600 font-normal">(15m)</span></h2>
-        {lastUpdate && (
-          <span className="text-xs text-gray-600">
-            updated {lastUpdate.toLocaleTimeString('en-US', { hour12: false })}
-          </span>
-        )}
+        <div className="flex items-center gap-3">
+          {lastUpdate && (
+            <span className="text-xs text-gray-600">
+              updated {lastUpdate.toLocaleTimeString('en-US', { hour12: false })}
+            </span>
+          )}
+          {liveCount > 0 && (
+            <span className="text-xs text-orange-400 animate-pulse">
+              ● {liveCount} live
+            </span>
+          )}
+        </div>
       </div>
 
       {events.map(ev => {
