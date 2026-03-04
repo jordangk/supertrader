@@ -9,6 +9,7 @@ import OrderHistory from './components/OrderHistory.jsx';
 import Positions from './components/Positions.jsx';
 import OrderToast from './components/OrderToast.jsx';
 import K9Trades from './components/K9Trades.jsx';
+import SimDashboard from './components/SimDashboard.jsx';
 
 const AMOUNTS = [50, 20, 10, 5, 1];
 const FEE_PCT = 0.02; // 2% Polymarket fee
@@ -149,7 +150,7 @@ export default function App() {
 
       {/* Tab bar */}
       <div className="bg-gray-900 border-b border-gray-800 px-4 flex gap-1">
-        {[['trade', '⚡ Trade'], ['k9', '👁 k9 Trades']].map(([t, label]) => (
+        {[['trade', '⚡ Trade'], ['sim', '📊 Sim'], ['k9', '👁 k9 Raw']].map(([t, label]) => (
           <button key={t} onClick={() => setTab(t)}
             className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
               tab === t ? 'border-orange-500 text-orange-400' : 'border-transparent text-gray-500 hover:text-gray-300'
@@ -159,6 +160,7 @@ export default function App() {
 
       <div className="flex-1 p-4 max-w-2xl mx-auto w-full space-y-4">
         {tab === 'k9' && <K9Trades />}
+        {tab === 'sim' && <SimDashboard />}
         {tab === 'trade' && <>
         {/* Event */}
         <EventHeader event={event} />

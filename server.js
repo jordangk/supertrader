@@ -557,6 +557,79 @@ app.get('/api/positions', async (req, res) => {
 // ── Active event ───────────────────────────────────────────────────────────
 app.get('/api/event', (req, res) => res.json({ event: activeEvent, liveState }));
 
+// ── Sim dashboard ──────────────────────────────────────────────────────────
+app.get('/api/sim-dashboard', async (req, res) => {
+  const limit = parseInt(req.query.limit || '10');
+  try {
+    // Get recent slugs from sim trades
+    const { data: slugRows } = await supabase
+      .from('k9_sim_trades').select('slug')
+      .order('trade_timestamp', { ascending: false }).limit(5000);
+
+    const slugSet = [...new Set((slugRows || []).map(r => r.slug))].slice(0, limit);
+    if (!slugSet.length) return res.json({ events: [], totals: {} });
+
+    const { data: sim } = await supabase.from('k9_sim_trades')
+      .select('*').in('slug', slugSet).order('trade_timestamp', { ascending: true });
+
+    const { data: obs } = await supabase.from('k9_observed_trades')
+      .select('*').in('slug', slugSet).order('trade_timestamp', { ascending: true });
+
+    const events = slugSet.map(slug => {
+      const simTrades = (sim || []).filter(t => t.slug === slug);
+      const k9Trades  = (obs || []).filter(t => t.slug === slug);
+
+      const sides = ['Up', 'Down'];
+      const summary = {};
+      for (const side of sides) {
+        const st = simTrades.filter(t => t.outcome === side);
+        const kt = k9Trades.filter(t => t.outcome === side);
+        const simUsdc   = st.reduce((s,t) => s + parseFloat(t.sim_usdc), 0);
+        const simShares = st.reduce((s,t) => s + parseFloat(t.sim_shares), 0);
+        const k9Usdc    = kt.reduce((s,t) => s + parseFloat(t.usdc_size), 0);
+        const k9Shares  = kt.reduce((s,t) => s + parseFloat(t.shares), 0);
+        summary[side] = {
+          simUsdc, simShares,
+          simAvgPrice: simShares > 0 ? simUsdc / simShares : 0,
+          k9Usdc, k9Shares,
+          k9AvgPrice: k9Shares > 0 ? k9Usdc / k9Shares : 0,
+          k9LastPrice: kt.length ? parseFloat(kt[kt.length-1].price) : 0,
+          tradeCount: st.length,
+        };
+      }
+
+      const totalSimUsdc = (summary.Up?.simUsdc||0) + (summary.Down?.simUsdc||0);
+      const totalK9Usdc  = (summary.Up?.k9Usdc||0)  + (summary.Down?.k9Usdc||0);
+
+      // Trade feed (last 50)
+      const feed = simTrades.slice(-50).map(t => ({
+        outcome: t.outcome,
+        k9Price: parseFloat(t.k9_price),
+        k9Usdc: parseFloat(t.k9_usdc),
+        simUsdc: parseFloat(t.sim_usdc),
+        simShares: parseFloat(t.sim_shares),
+        ts: t.trade_timestamp,
+      }));
+
+      return { slug, summary, feed, totalSimUsdc, totalK9Usdc };
+    });
+
+    // Overall totals
+    const allSim = sim || [];
+    const totals = {
+      totalSimUsdc: allSim.reduce((s,t) => s + parseFloat(t.sim_usdc), 0),
+      totalK9Usdc:  (obs||[]).reduce((s,t) => s + parseFloat(t.usdc_size), 0),
+      tradeCount:   allSim.length,
+      eventCount:   slugSet.length,
+    };
+
+    res.json({ events, totals });
+  } catch(e) {
+    console.error('/api/sim-dashboard error:', e.message);
+    res.json({ events: [], totals: {}, error: e.message });
+  }
+});
+
 // ── k9 live trades ─────────────────────────────────────────────────────────
 app.get('/api/k9-trades', async (req, res) => {
   const limit = parseInt(req.query.limit || '5');
@@ -632,13 +705,10 @@ wss.on('connection', (ws) => {
 // ══════════════════════════════════════════════════════════════════════════
 const K9_WALLET     = '0xd0d6053c3c37e727402d84c14069780d360993aa';
 const K9_PAD        = '0x000000000000000000000000' + K9_WALLET.slice(2);
-const USDC_CONTRACT = '0x2791bca1f2de4661ed88a30c99a7a9449aa84174';
-const CTF_EXCHANGE  = '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e';
 const TRANSFER_SIG  = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 const ORDER_FILLED  = '0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6';
 const ALCHEMY_WS    = `wss://polygon-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_KEY || '8kruQGYamUT6J4Ib0aMfw'}`;
 const ALCHEMY_HTTP  = `https://polygon-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_KEY || '8kruQGYamUT6J4Ib0aMfw'}`;
-const GAMMA_API     = 'https://gamma-api.polymarket.com/markets';
 
 const COIN_PREFIXES = [
   { prefix: 'btc-updown-15m', coin: 'btc', tf: '15m', interval: 900 },
@@ -693,7 +763,7 @@ async function decodeK9Receipt(txHash) {
 
   const trades = [];
   for (const log of (receipt.logs || [])) {
-    if (log.address?.toLowerCase() !== CTF_EXCHANGE.toLowerCase()) continue;
+    if (log.address?.toLowerCase() !== CTF_EXCHANGE.toLowerCase()) continue; // CTF_EXCHANGE defined at top
     const topics = log.topics || [];
     if (!topics[0] || topics[0].toLowerCase() !== ORDER_FILLED.toLowerCase()) continue;
     const data = (log.data || '0x').slice(2);
@@ -718,18 +788,36 @@ async function decodeK9Receipt(txHash) {
   return trades.length ? trades : null;
 }
 
+const COPY_PCT = 0.01;
+
 async function saveK9Trades(trades) {
   if (!trades || !trades.length) return;
-  const rows = trades.map(t => ({
+
+  // Save observed trades
+  const obsRows = trades.map(t => ({
     slug: t.slug, outcome: t.outcome, price: t.price, shares: t.shares,
     usdc_size: t.usdcSize, tx_hash: t.txHash, trade_timestamp: t.ts,
   }));
-  const { error } = await supabase.from('k9_observed_trades').insert(rows);
-  if (error) console.error('[k9-watcher] DB insert error:', error.message);
-  else {
-    // Broadcast to frontend
-    broadcast({ type: 'k9_trades', trades });
-    console.log(`[k9-watcher] Saved ${rows.length} trade(s): ${trades.map(t => `${t.outcome} ${t.slug} @${t.price} $${t.usdcSize.toFixed(2)}`).join(', ')}`);
+  const { error: e1 } = await supabase.from('k9_observed_trades').insert(obsRows);
+  if (e1) console.error('[k9-watcher] observed insert error:', e1.message);
+
+  // Save simulated trades at COPY_PCT
+  const simRows = trades.map(t => {
+    const simUsdc   = t.usdcSize * COPY_PCT;
+    const simShares = t.price > 0 ? simUsdc / t.price : 0;
+    return {
+      slug: t.slug, outcome: t.outcome,
+      k9_price: t.price, k9_usdc: t.usdcSize, k9_shares: t.shares,
+      sim_usdc: simUsdc, sim_shares: simShares, sim_price: t.price,
+      copy_pct: COPY_PCT, tx_hash: t.txHash, trade_timestamp: t.ts,
+    };
+  });
+  const { error: e2 } = await supabase.from('k9_sim_trades').insert(simRows);
+  if (e2) console.error('[k9-watcher] sim insert error:', e2.message);
+
+  if (!e1 && !e2) {
+    broadcast({ type: 'k9_trades', trades, simRows });
+    console.log(`[k9-watcher] ${trades.map(t => `${t.outcome} ${t.slug} @${t.price} k9=$${t.usdcSize.toFixed(2)} sim=$${(t.usdcSize*COPY_PCT).toFixed(2)}`).join(' | ')}`);
   }
 }
 
@@ -744,7 +832,7 @@ function connectK9Watcher() {
     ws.send(JSON.stringify({
       jsonrpc: '2.0', id: 1,
       method: 'eth_subscribe',
-      params: ['logs', { address: USDC_CONTRACT, topics: [TRANSFER_SIG, [K9_PAD]] }],
+      params: ['logs', { address: USDC_ADDRESS, topics: [TRANSFER_SIG, [K9_PAD]] }],
     }));
     console.log('[k9-watcher] Subscribed to k9 USDC transfers');
     // Refresh token map every 55s
