@@ -861,12 +861,20 @@ function connectK9Watcher() {
   ws.on('open', async () => {
     k9WsRetryDelay = 2000;
     await refreshK9TokenMap();
+    // Subscribe directly to CTF OrderFilled where k9 is TAKER (topic[3])
     ws.send(JSON.stringify({
       jsonrpc: '2.0', id: 1,
       method: 'eth_subscribe',
-      params: ['logs', { address: USDC_ADDRESS, topics: [TRANSFER_SIG, [K9_PAD]] }],
+      params: ['logs', { address: CTF_EXCHANGE, topics: [ORDER_FILLED, null, null, K9_PAD] }],
     }));
-    console.log('[k9-watcher] Subscribed to k9 USDC transfers');
+    await new Promise(r => setTimeout(r, 300));
+    // Also subscribe where k9 is MAKER (topic[2])
+    ws.send(JSON.stringify({
+      jsonrpc: '2.0', id: 2,
+      method: 'eth_subscribe',
+      params: ['logs', { address: CTF_EXCHANGE, topics: [ORDER_FILLED, null, K9_PAD, null] }],
+    }));
+    console.log('[k9-watcher] Subscribed to CTF OrderFilled (k9 as maker + taker)');
     // Refresh token map every 55s
     setInterval(() => {
       if (Date.now() / 1000 > k9TokenExpiry) refreshK9TokenMap();
@@ -876,10 +884,47 @@ function connectK9Watcher() {
   ws.on('message', async (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
-      const txHash = msg?.params?.result?.transactionHash;
-      if (!txHash || k9SeenTx.has(txHash) || k9Pending[txHash]) return;
-      k9Pending[txHash] = { detectedAt: Date.now() };
-    } catch {}
+      const log = msg?.params?.result;
+      if (!log || log.removed) return;
+
+      const topics = log.topics || [];
+      if (topics.length < 4) return;
+
+      const txHash   = log.transactionHash;
+      const logMaker = '0x' + topics[2].slice(-40).toLowerCase();
+      const logTaker = '0x' + topics[3].slice(-40).toLowerCase();
+      if (logMaker !== K9_WALLET.toLowerCase() && logTaker !== K9_WALLET.toLowerCase()) return;
+
+      // Decode inline — no receipt fetch needed
+      const data   = (log.data || '0x').slice(2);
+      if (data.length < 256) return;
+      const chunks = [];
+      for (let i = 0; i < data.length; i += 64) chunks.push(data.slice(i, i + 64));
+
+      const makerAsset  = BigInt('0x' + chunks[0]);
+      const takerAsset  = BigInt('0x' + chunks[1]);
+      const makerAmount = BigInt('0x' + chunks[2]);
+      const takerAmount = BigInt('0x' + chunks[3]);
+      if (makerAsset !== 0n) return; // not a USDC buy
+
+      const usdcSize = Number(makerAmount) / 1e6;
+      const shares   = Number(takerAmount) / 1e6;
+      const price    = shares > 0 ? Math.round((usdcSize / shares) * 1e8) / 1e8 : 0;
+      const info     = k9TokenMap[takerAsset.toString()];
+      if (!info) return;
+
+      // Dedup
+      const dedup = `${txHash}:${info.outcome}:${shares}`;
+      if (k9SeenTx.has(dedup)) return;
+      k9SeenTx.add(dedup);
+      if (k9SeenTx.size > 10000) k9SeenTx = new Set([...k9SeenTx].slice(-5000));
+
+      await saveK9Trades([{ txHash, slug: info.slug, outcome: info.outcome,
+                            price, shares, usdcSize, coin: info.coin,
+                            tf: info.tf, timeframe: info.timeframe, ts: Math.floor(Date.now() / 1000) }]);
+    } catch (e) {
+      console.error('[k9-watcher] decode error:', e.message);
+    }
   });
 
   ws.on('close', () => {
@@ -889,23 +934,7 @@ function connectK9Watcher() {
   });
   ws.on('error', () => ws.close());
 
-  // Resolver loop — wait 500ms after detection then decode
-  setInterval(async () => {
-    const now = Date.now();
-    for (const [txHash, { detectedAt }] of Object.entries(k9Pending)) {
-      if (now - detectedAt < 500) continue;
-      delete k9Pending[txHash];
-      if (k9SeenTx.has(txHash)) continue;
-      k9SeenTx.add(txHash);
-      if (k9SeenTx.size > 5000) k9SeenTx = new Set([...k9SeenTx].slice(-2000));
-      try {
-        const trades = await decodeK9Receipt(txHash);
-        if (trades) await saveK9Trades(trades);
-      } catch (e) {
-        console.error('[k9-watcher] decode error:', e.message);
-      }
-    }
-  }, 300);
+  // No resolver loop needed — decoding inline from WS events
 }
 
 // ── Start ──────────────────────────────────────────────────────────────────
