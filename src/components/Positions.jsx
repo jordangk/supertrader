@@ -52,7 +52,7 @@ function toNum(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
-export default function Positions({ positions, eventSlug, fallbackOrders, prices }) {
+export default function Positions({ positions, eventSlug, dbEventId, fallbackOrders, prices, onSell, onMerge, selling }) {
   const filtered = eventSlug ? positions.filter(p => (p.eventSlug || p.slug) === eventSlug) : [];
   let upRaw = filtered.find(p => normalizeOutcome(p) === 'Up');
   let downRaw = filtered.find(p => normalizeOutcome(p) === 'Down');
@@ -99,14 +99,16 @@ export default function Positions({ positions, eventSlug, fallbackOrders, prices
     };
   })() : null;
 
-  const ordersForThisEvent = eventSlug && fallbackOrders?.length
-    ? fallbackOrders.filter(o => (o.polymarket_event_id || o.polymarket_event) === eventSlug)
+  const eid = dbEventId ? String(dbEventId) : null;
+  const ordersForThisEvent = eid && fallbackOrders?.length
+    ? fallbackOrders.filter(o => String(o.polymarket_event_id) === eid)
     : [];
 
-  if (filtered.length === 0 && ordersForThisEvent.length > 0) {
+  // Fill in any missing sides from orders (API may lag behind filled limit orders)
+  if (ordersForThisEvent.length > 0) {
     const derived = deriveFromOrders(ordersForThisEvent, prices);
-    upPos = derived.up;
-    downPos = derived.down;
+    if (!upPos && derived.up) upPos = derived.up;
+    if (!downPos && derived.down) downPos = derived.down;
   }
 
   const totalCost = (upPos?.initialValue || 0) + (downPos?.initialValue || 0);
@@ -144,7 +146,22 @@ export default function Positions({ positions, eventSlug, fallbackOrders, prices
   return (
     <div className="bg-gray-900 rounded-xl border border-gray-800 overflow-hidden">
       <div className="px-4 py-3 border-b border-gray-800 flex items-center justify-between">
-        <h3 className="text-sm font-semibold text-gray-300">Positions</h3>
+        <div className="flex items-center gap-2">
+          <h3 className="text-sm font-semibold text-gray-300">Positions</h3>
+          {onMerge && upPos && downPos && upPos.size > 0 && downPos.size > 0 && (() => {
+            const mergeable = Math.min(upPos.size, downPos.size);
+            const merge25 = Math.ceil(mergeable * 0.25 * 100) / 100;
+            return (
+              <button
+                onClick={() => onMerge(merge25)}
+                disabled={selling === 'merge'}
+                className="px-2 py-0.5 rounded text-[10px] font-bold bg-blue-600 hover:bg-blue-500 text-white transition-colors disabled:opacity-40"
+              >
+                {selling === 'merge' ? 'Merging...' : `Merge 25% (${merge25.toFixed(1)}sh)`}
+              </button>
+            );
+          })()}
+        </div>
         <div className="flex items-center gap-3 text-xs font-mono">
           <span className="text-gray-500">Invested</span>
           <span className="text-white font-bold">${totalCost.toFixed(2)}</span>
@@ -200,6 +217,24 @@ export default function Positions({ positions, eventSlug, fallbackOrders, prices
                       {upPos.percentPnl != null && ` (${(upPos.percentPnl >= 0 ? '+' : '')}${upPos.percentPnl.toFixed(1)}%)`}
                     </div>
                   )}
+                  {onSell && upPos.size >= 5 && upPrice > 0 && (
+                    <div className="flex gap-1 mt-1">
+                      <button
+                        onClick={() => onSell('up', Math.ceil(upPos.size * 0.25 * 100) / 100, Math.round(upPrice * 100) / 100)}
+                        disabled={selling === 'sell-up'}
+                        className="flex-1 px-2 py-1 rounded text-[10px] font-bold bg-green-900/30 hover:bg-green-800 text-green-400 border border-green-700/50 transition-colors disabled:opacity-40"
+                      >
+                        {selling === 'sell-up' ? '...' : `25%`}
+                      </button>
+                      <button
+                        onClick={() => onSell('up', upPos.size, Math.round(upPrice * 100) / 100)}
+                        disabled={selling === 'sell-up'}
+                        className="flex-1 px-2 py-1 rounded text-[10px] font-bold bg-green-900/50 hover:bg-green-800 text-green-300 border border-green-700/50 transition-colors disabled:opacity-40"
+                      >
+                        {selling === 'sell-up' ? '...' : `Sell All`}
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -226,10 +261,45 @@ export default function Positions({ positions, eventSlug, fallbackOrders, prices
                       {downPos.percentPnl != null && ` (${(downPos.percentPnl >= 0 ? '+' : '')}${downPos.percentPnl.toFixed(1)}%)`}
                     </div>
                   )}
+                  {onSell && downPos.size >= 5 && downPrice > 0 && (
+                    <div className="flex gap-1 mt-1">
+                      <button
+                        onClick={() => onSell('down', Math.ceil(downPos.size * 0.25 * 100) / 100, Math.round(downPrice * 100) / 100)}
+                        disabled={selling === 'sell-down'}
+                        className="flex-1 px-2 py-1 rounded text-[10px] font-bold bg-red-900/30 hover:bg-red-800 text-red-400 border border-red-700/50 transition-colors disabled:opacity-40"
+                      >
+                        {selling === 'sell-down' ? '...' : `25%`}
+                      </button>
+                      <button
+                        onClick={() => onSell('down', downPos.size, Math.round(downPrice * 100) / 100)}
+                        disabled={selling === 'sell-down'}
+                        className="flex-1 px-2 py-1 rounded text-[10px] font-bold bg-red-900/50 hover:bg-red-800 text-red-300 border border-red-700/50 transition-colors disabled:opacity-40"
+                      >
+                        {selling === 'sell-down' ? '...' : `Sell All`}
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
           </div>
+
+          {onMerge && upPos && downPos && upPos.size > 0 && downPos.size > 0 && (() => {
+            const mergeable = Math.min(upPos.size, downPos.size);
+            const merge25 = Math.ceil(mergeable * 0.25 * 100) / 100;
+            return (
+              <div className="px-4 py-2 border-t border-gray-800 flex items-center gap-2">
+                <button
+                  onClick={() => onMerge(merge25)}
+                  disabled={selling === 'merge'}
+                  className="px-3 py-1 rounded text-[10px] font-bold bg-blue-900/50 hover:bg-blue-800 text-blue-300 border border-blue-700/50 transition-colors disabled:opacity-40"
+                >
+                  {selling === 'merge' ? 'Merging...' : `Merge 25% (${merge25.toFixed(1)} sh)`}
+                </button>
+                <span className="text-[10px] text-gray-500">On-chain CTF merge → ${merge25.toFixed(2)} USDC</span>
+              </div>
+            );
+          })()}
 
           {(hedgeDownAmount != null || hedgeUpAmount != null || needUpForProfit != null || needDownForProfit != null) && (
             <div className="px-4 py-2 border-t border-gray-800 bg-green-950/20 space-y-1.5">
@@ -239,12 +309,12 @@ export default function Positions({ positions, eventSlug, fallbackOrders, prices
                   <div className="text-xs font-mono text-green-400 space-y-0.5">
                     {needDownForProfit != null && (
                       <p>
-                        Buy {needDownShares?.toFixed(1)} sh of DOWN at {(maxPriceDownForLock ?? 0.99) * 100}¢ or below · ${needDownForProfit.toFixed(2)} at current price
+                        Buy {needDownShares?.toFixed(1)} sh of DOWN at {((maxPriceDownForLock ?? 0.99) * 100).toFixed(1)}¢ or below · ${needDownForProfit.toFixed(2)}
                       </p>
                     )}
                     {needUpForProfit != null && (
                       <p>
-                        Buy {needUpShares?.toFixed(1)} sh of UP at {(maxPriceUpForLock ?? 0.99) * 100}¢ or below · ${needUpForProfit.toFixed(2)} at current price
+                        Buy {needUpShares?.toFixed(1)} sh of UP at {((maxPriceUpForLock ?? 0.99) * 100).toFixed(1)}¢ or below · ${needUpForProfit.toFixed(2)}
                       </p>
                     )}
                   </div>

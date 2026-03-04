@@ -35,7 +35,7 @@ export default function OrderHistory({ orders, prices }) {
             <tr className="text-[10px] text-gray-500 uppercase tracking-wider border-b border-gray-800">
               <th className="px-3 py-2 text-left">Side</th>
               <th className="px-3 py-2 text-right">Amount</th>
-              <th className="px-3 py-2 text-right">Buy Price</th>
+              <th className="px-3 py-2 text-right">Price</th>
               <th className="px-3 py-2 text-right">Shares</th>
               <th className="px-3 py-2 text-right">Up @Buy</th>
               <th className="px-3 py-2 text-right">Dn @Buy</th>
@@ -49,25 +49,26 @@ export default function OrderHistory({ orders, prices }) {
             {orders.map(o => {
               const isUp = o.direction === 'up';
               const notes = parseNotes(o.notes);
+              const isSell = notes.sell || notes.autoSell || parseFloat(o.shares || 0) < 0;
               const upAtBuy = notes.upPriceAtBuy;
               const downAtBuy = notes.downPriceAtBuy;
               const timeLeft = notes.timeLeftSecs;
               const pl = o.profit_loss;
-              const sharesNum = parseFloat(o.shares || 0);
+              const sharesNum = Math.abs(parseFloat(o.shares || 0));
               const currentPrice = isUp ? upNow : downNow;
-              const currentValue = currentPrice != null ? sharesNum * currentPrice : null;
-              const cost = parseFloat(o.purchase_amount || 0);
+              const currentValue = !isSell && currentPrice != null ? sharesNum * currentPrice : null;
+              const cost = Math.abs(parseFloat(o.purchase_amount || 0));
               const pnl = currentValue != null ? currentValue - cost : null;
 
               return (
                 <tr key={o.id} className="hover:bg-gray-800/40 transition-colors">
                   <td className="px-3 py-2">
-                    <span className={`font-bold ${isUp ? 'text-green-400' : 'text-red-400'}`}>
-                      {isUp ? '↑ UP' : '↓ DN'}
+                    <span className={`font-bold ${isSell ? 'text-yellow-400' : isUp ? 'text-green-400' : 'text-red-400'}`}>
+                      {isSell ? '💰 SELL' : isUp ? '↑ UP' : '↓ DN'}
                     </span>
                   </td>
                   <td className="px-3 py-2 text-right font-mono text-gray-300">
-                    ${cost.toFixed(2)}
+                    {isSell ? '+' : ''}${cost.toFixed(2)}
                   </td>
                   <td className="px-3 py-2 text-right font-mono text-gray-300">
                     {(parseFloat(o.purchase_price) * 100).toFixed(1)}¢

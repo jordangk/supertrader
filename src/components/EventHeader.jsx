@@ -1,9 +1,11 @@
 import React, { useState, useEffect } from 'react';
 
+const API_BASE = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
+
 export default function EventHeader({ event }) {
   const [now, setNow] = useState(Date.now());
+  const [refreshing, setRefreshing] = useState(false);
 
-  // Tick every second for countdown
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(t);
@@ -22,6 +24,15 @@ export default function EventHeader({ event }) {
   const secs = secsLeft !== null ? secsLeft % 60 : '?';
   const expired = secsLeft === 0;
 
+  async function loadNewEvent() {
+    setRefreshing(true);
+    try {
+      await fetch(`${API_BASE}/api/event/refresh`, { method: 'POST' });
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
   return (
     <div className={`bg-gray-900 rounded-xl p-4 border ${expired ? 'border-yellow-600' : 'border-gray-800'}`}>
       <div className="flex items-center justify-between">
@@ -36,13 +47,24 @@ export default function EventHeader({ event }) {
             {event.title || 'Bitcoin Up or Down – 5m'}
           </a>
         </div>
-        {secsLeft !== null && (
-          <span className={`text-sm font-mono font-bold ${
-            expired ? 'text-yellow-400' : secsLeft < 60 ? 'text-red-400' : 'text-gray-400'
-          }`}>
-            {expired ? 'ENDED' : `${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}`}
-          </span>
-        )}
+        <span className="flex items-center gap-2">
+          {expired && (
+            <button
+              onClick={loadNewEvent}
+              disabled={refreshing}
+              className="px-2 py-1 text-xs font-semibold bg-yellow-600 hover:bg-yellow-500 text-black rounded transition-colors disabled:opacity-50"
+            >
+              {refreshing ? '...' : 'New event'}
+            </button>
+          )}
+          {secsLeft !== null && (
+            <span className={`text-sm font-mono font-bold ${
+              expired ? 'text-yellow-400' : secsLeft < 60 ? 'text-red-400' : 'text-gray-400'
+            }`}>
+              {expired ? 'ENDED' : `${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}`}
+            </span>
+          )}
+        </span>
       </div>
       <p className="text-xs text-gray-500 mt-1">{event.slug}</p>
     </div>

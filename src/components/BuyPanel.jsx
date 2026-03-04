@@ -1,8 +1,9 @@
 import React from 'react';
 
-export default function BuyPanel({ side, price, amounts, buying, onBuy, expectedROI = 0 }) {
+export default function BuyPanel({ side, price, amounts, buying, onBuy, expectedROI = 0, showROIHint = false }) {
   const isUp = side === 'up';
-  const threshold = price != null ? price / (1 + expectedROI) : null;
+  const raw = price != null ? price / (1 + expectedROI) : null;
+  const threshold = raw != null ? Math.min(raw, 0.99) : null;
 
   return (
     <div className={`rounded-xl border p-4 space-y-3 ${isUp ? 'border-green-800 bg-green-950/20' : 'border-red-800 bg-red-950/20'}`}>
@@ -14,7 +15,7 @@ export default function BuyPanel({ side, price, amounts, buying, onBuy, expected
           {price ? `${(price * 100).toFixed(1)}¢` : '—'}
         </span>
       </div>
-      {threshold != null && (
+      {threshold != null && showROIHint && (
         <p className={`text-xs ${isUp ? 'text-green-400/80' : 'text-red-400/80'}`}>
           Buy below {(threshold * 100).toFixed(1)}¢ to increase expected ROI
         </p>

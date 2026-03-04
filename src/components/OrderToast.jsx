@@ -34,11 +34,15 @@ export default function OrderToast({ toast, onDismiss }) {
         }
       `}>
         <div className="flex items-center gap-2 flex-wrap">
-          <span>{isSuccess ? '✅' : '❌'}</span>
-          <span className="font-semibold">{isSuccess ? 'Filled' : 'Failed'}</span>
-          <span className="font-mono font-bold">{toast.side?.toUpperCase()}</span>
+          <span>{isSuccess ? (toast.isBuyBoth ? '⚡' : toast.isSell ? '💰' : toast.isLimit ? '📋' : '✅') : '❌'}</span>
+          <span className="font-semibold">{isSuccess ? (toast.isBuyBoth ? `Both: ${toast.filled || 0} filled, ${toast.live || 0} limits` : toast.isSell ? 'Sell listed' : toast.isLimit ? 'Limit set' : 'Filled') : (toast.isBuyBoth ? 'Both failed' : 'Failed')}</span>
+          {!toast.isBuyBoth && <span className="font-mono font-bold">{toast.side?.toUpperCase()}</span>}
           {isSuccess && (
-            <span className="font-mono">${parseFloat(toast.purchase_amount ?? toast.shares * toast.price ?? 0).toFixed(2)} · {parseFloat(toast.shares || 0).toFixed(1)} sh</span>
+            <span className="font-mono">
+              ${parseFloat(toast.purchase_amount ?? toast.shares * toast.price ?? 0).toFixed(2)}
+              {toast.price ? ` @ ${(parseFloat(toast.price) * 100).toFixed(1)}¢` : ''}
+              {' · '}{parseFloat(toast.shares || 0).toFixed(1)} sh
+            </span>
           )}
           {!isSuccess && toast.error && <span className="opacity-90">{toast.error}</span>}
         </div>
