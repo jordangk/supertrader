@@ -789,13 +789,11 @@ async function decodeK9Receipt(txHash) {
   return trades.length ? trades : null;
 }
 
-const COPY_PCT   = 0.01;
-const MIN_USDC   = 1.00;  // Polymarket $1 minimum
-const MIN_SHARES = 5.00;  // Polymarket 5 shares minimum
-// Fire when EITHER threshold is met (whichever comes first)
+const COPY_PCT  = 0.01;
+const MIN_USDC  = 1.00;  // Polymarket $1 minimum (matches bot logic exactly)
 
-// Accumulator per slug+side
-// key: `${slug}:${outcome}` -> { usdc, shares }
+// Accumulator per slug+side — mirrors bot's owed_usdc carry-over
+// key: `${slug}:${outcome}` -> usdc owed
 const owed = {};
 
 async function saveK9Trades(trades) {
@@ -809,32 +807,32 @@ async function saveK9Trades(trades) {
   const { error: e1 } = await supabase.from('k9_observed_trades').insert(obsRows);
   if (e1) console.error('[k9-watcher] observed insert error:', e1.message);
 
-  // Simulate carry-over with dual threshold ($1 OR 5 shares)
+  // Simulate bot carry-over: accumulate 1% of k9's usdc, fire at $1 min
   const simRows = [];
   for (const t of trades) {
     const key = `${t.slug}:${t.outcome}`;
-    if (!owed[key]) owed[key] = { usdc: 0, shares: 0 };
+    if (!owed[key]) owed[key] = 0;
+    owed[key] += t.usdcSize * COPY_PCT;
 
-    owed[key].usdc   += t.usdcSize * COPY_PCT;
-    owed[key].shares += (t.price > 0 ? (t.usdcSize * COPY_PCT) / t.price : 0);
-
-    const meetsUsdc   = owed[key].usdc   >= MIN_USDC;
-    const meetsShares = owed[key].shares >= MIN_SHARES;
-
-    if (meetsUsdc || meetsShares) {
-      const simUsdc   = owed[key].usdc;
-      const simShares = owed[key].shares;
-      const trigger   = meetsUsdc && meetsShares ? 'both' : meetsUsdc ? '$1' : '5sh';
+    if (owed[key] >= MIN_USDC) {
+      const simUsdc   = owed[key];
+      // shares = floor(owed / price) — same as bot's int floor
+      const simShares = t.price > 0 ? Math.floor(simUsdc / t.price) : 0;
+      if (simShares < 1) {
+        // Can't fill even 1 share — keep accumulating (price too high edge case)
+        console.log(`[sim] carry ${t.outcome} ${t.slug} $${simUsdc.toFixed(3)} @ ${t.price} < 1sh, keep accumulating`);
+        continue;
+      }
       simRows.push({
         slug: t.slug, outcome: t.outcome,
         k9_price: t.price, k9_usdc: t.usdcSize, k9_shares: t.shares,
         sim_usdc: simUsdc, sim_shares: simShares, sim_price: t.price,
         copy_pct: COPY_PCT, tx_hash: t.txHash, trade_timestamp: t.ts,
       });
-      console.log(`[sim] FILL ${t.outcome} ${t.slug} @ ${t.price} → $${simUsdc.toFixed(3)} / ${simShares.toFixed(2)}sh [trigger: ${trigger}]`);
-      owed[key] = { usdc: 0, shares: 0 };
+      console.log(`[sim] FILL ${t.outcome} ${t.slug} @ ${t.price} → $${simUsdc.toFixed(3)} / ${simShares}sh`);
+      owed[key] = 0;
     } else {
-      console.log(`[sim] carry ${t.outcome} ${t.slug} → $${owed[key].usdc.toFixed(3)} / ${owed[key].shares.toFixed(2)}sh`);
+      console.log(`[sim] carry ${t.outcome} ${t.slug} → $${owed[key].toFixed(3)} / $${MIN_USDC} needed`);
     }
   }
 
