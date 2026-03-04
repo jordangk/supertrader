@@ -776,6 +776,14 @@ async function decodeK9Receipt(txHash) {
       const takerAsset  = BigInt('0x' + chunks[1]);
       const makerAmount = BigInt('0x' + chunks[2]);
       const takerAmount = BigInt('0x' + chunks[3]);
+
+      // Only record fills where k9 is the maker or taker
+      const logMaker = topics[2] ? '0x' + topics[2].slice(-40).toLowerCase() : '';
+      const logTaker = topics[3] ? '0x' + topics[3].slice(-40).toLowerCase() : '';
+      const k9IsMaker = logMaker === K9_WALLET.toLowerCase();
+      const k9IsTaker = logTaker === K9_WALLET.toLowerCase();
+      if (!k9IsMaker && !k9IsTaker) continue; // fill not involving k9
+
       if (makerAsset !== 0n) continue; // not a USDC buy
       const usdcSize = Number(makerAmount) / 1e6;
       const shares   = Number(takerAmount) / 1e6;
