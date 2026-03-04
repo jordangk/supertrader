@@ -608,6 +608,7 @@ app.get('/api/sim-dashboard', async (req, res) => {
         k9Usdc: parseFloat(t.k9_usdc),
         simUsdc: parseFloat(t.sim_usdc),
         simShares: parseFloat(t.sim_shares),
+        simPrice: parseFloat(t.sim_price),
         ts: t.trade_timestamp,
       }));
 
@@ -788,7 +789,12 @@ async function decodeK9Receipt(txHash) {
   return trades.length ? trades : null;
 }
 
-const COPY_PCT = 0.01;
+const COPY_PCT  = 0.01;
+const MIN_ORDER = 1.00; // Polymarket minimum
+
+// Accumulator: owed_usdc per slug+side — mirrors bot's carry-over logic
+// key: `${slug}:${outcome}` -> { owed, triggerTxHash }
+const owedUsdc = {};
 
 async function saveK9Trades(trades) {
   if (!trades || !trades.length) return;
@@ -801,24 +807,45 @@ async function saveK9Trades(trades) {
   const { error: e1 } = await supabase.from('k9_observed_trades').insert(obsRows);
   if (e1) console.error('[k9-watcher] observed insert error:', e1.message);
 
-  // Save simulated trades at COPY_PCT
-  const simRows = trades.map(t => {
-    const simUsdc   = t.usdcSize * COPY_PCT;
-    const simShares = t.price > 0 ? simUsdc / t.price : 0;
-    return {
-      slug: t.slug, outcome: t.outcome,
-      k9_price: t.price, k9_usdc: t.usdcSize, k9_shares: t.shares,
-      sim_usdc: simUsdc, sim_shares: simShares, sim_price: t.price,
-      copy_pct: COPY_PCT, tx_hash: t.txHash, trade_timestamp: t.ts,
-    };
-  });
-  const { error: e2 } = await supabase.from('k9_sim_trades').insert(simRows);
-  if (e2) console.error('[k9-watcher] sim insert error:', e2.message);
+  // Simulate bot carry-over logic
+  const simRows = [];
+  for (const t of trades) {
+    const key = `${t.slug}:${t.outcome}`;
+    if (!owedUsdc[key]) owedUsdc[key] = 0;
 
-  if (!e1 && !e2) {
-    broadcast({ type: 'k9_trades', trades, simRows });
-    console.log(`[k9-watcher] ${trades.map(t => `${t.outcome} ${t.slug} @${t.price} k9=$${t.usdcSize.toFixed(2)} sim=$${(t.usdcSize*COPY_PCT).toFixed(2)}`).join(' | ')}`);
+    owedUsdc[key] += t.usdcSize * COPY_PCT;
+
+    // Only place a sim order when we cross the $1 minimum — use price at this moment
+    if (owedUsdc[key] >= MIN_ORDER) {
+      const simUsdc   = owedUsdc[key];
+      const simShares = t.price > 0 ? simUsdc / t.price : 0;
+      simRows.push({
+        slug:      t.slug,
+        outcome:   t.outcome,
+        k9_price:  t.price,
+        k9_usdc:   t.usdcSize,
+        k9_shares: t.shares,
+        sim_usdc:  simUsdc,
+        sim_shares: simShares,
+        sim_price:  t.price,   // price at the moment carry-over fires
+        copy_pct:   COPY_PCT,
+        tx_hash:    t.txHash,
+        trade_timestamp: t.ts,
+      });
+      console.log(`[sim] FILL ${t.outcome} ${t.slug} @ ${t.price} sim=$${simUsdc.toFixed(4)} (carried over, ${simShares.toFixed(2)}sh)`);
+      owedUsdc[key] = 0; // reset accumulator
+    } else {
+      console.log(`[sim] carry ${t.outcome} ${t.slug} owed=$${owedUsdc[key].toFixed(4)} (need $${MIN_ORDER})`);
+    }
   }
+
+  if (simRows.length) {
+    const { error: e2 } = await supabase.from('k9_sim_trades').insert(simRows);
+    if (e2) console.error('[k9-watcher] sim insert error:', e2.message);
+  }
+
+  broadcast({ type: 'k9_trades', trades, simFills: simRows });
+  console.log(`[k9-watcher] ${trades.map(t => `${t.outcome} ${t.slug} @${t.price} k9=$${t.usdcSize.toFixed(2)}`).join(' | ')}`);
 }
 
 let k9WsRetryDelay = 2000;

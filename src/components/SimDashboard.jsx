@@ -95,26 +95,31 @@ function EventCard({ ev }) {
             })}
           </div>
 
-          {/* Trade feed */}
+          {/* Trade feed — sim fills only (carry-over resolved) */}
           <div className="mt-4">
-            <div className="text-xs text-gray-600 mb-2">Simulated trade feed</div>
+            <div className="text-xs text-gray-600 mb-2">
+              Sim fills <span className="text-gray-700">(carry-over → $1 min order)</span>
+            </div>
             <div className="max-h-48 overflow-y-auto space-y-0.5">
               {[...(feed||[])].reverse().map((t, i) => {
                 const isUp = t.outcome === 'Up';
                 const time = t.ts ? new Date(t.ts*1000).toLocaleTimeString('en-US',{hour12:false}) : '';
                 return (
-                  <div key={i} className="flex gap-3 text-xs font-mono items-center">
+                  <div key={i} className="flex gap-3 text-xs font-mono items-center py-0.5 border-b border-gray-800/50">
                     <span className="text-gray-600 w-16">{time}</span>
                     <span className={`w-8 font-medium ${isUp ? 'text-green-400' : 'text-red-400'}`}>{t.outcome}</span>
-                    <span className="text-gray-400 w-10">{pri(t.k9Price)}</span>
-                    <div className="flex-1 grid grid-cols-3 gap-2">
-                      <span className="text-gray-600">k9: {usd(t.k9Usdc)}</span>
-                      <span className="text-white">→ sim: {usd(t.simUsdc)}</span>
-                      <span className="text-gray-500">{t.simShares.toFixed(2)}sh</span>
-                    </div>
+                    <span className="text-gray-500 w-10">{pri(t.k9Price)}</span>
+                    <span className="text-gray-600 w-18">k9 {usd(t.k9Usdc)}</span>
+                    <span className="text-orange-400 w-4">→</span>
+                    <span className="text-white font-medium">{usd(t.simUsdc)}</span>
+                    <span className="text-gray-500">@ {pri(t.simPrice)}</span>
+                    <span className="text-gray-600">{t.simShares.toFixed(2)}sh</span>
                   </div>
                 );
               })}
+              {!(feed||[]).length && (
+                <div className="text-gray-600 py-2">No fills yet — accumulating carry-over…</div>
+              )}
             </div>
           </div>
         </div>
