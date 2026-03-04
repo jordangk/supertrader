@@ -150,7 +150,7 @@ export default function App() {
 
       {/* Tab bar */}
       <div className="bg-gray-900 border-b border-gray-800 px-4 flex gap-1">
-        {[['trade', '⚡ Trade'], ['sim', '📊 Sim'], ['k9', '👁 k9 Raw']].map(([t, label]) => (
+        {[['trade', '⚡ Trade'], ['sim', '📊 k9 Simulator'], ['k9', '👁 k9 Raw']].map(([t, label]) => (
           <button key={t} onClick={() => setTab(t)}
             className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
               tab === t ? 'border-orange-500 text-orange-400' : 'border-transparent text-gray-500 hover:text-gray-300'
@@ -161,6 +161,22 @@ export default function App() {
       <div className="flex-1 p-4 max-w-2xl mx-auto w-full space-y-4">
         {tab === 'k9' && <K9Trades />}
         {tab === 'sim' && <SimDashboard />}
+        {tab === 'trade' && <>
+        {/* Sim shortcut banner */}
+        <button
+          onClick={() => setTab('sim')}
+          className="w-full flex items-center justify-between bg-gray-900 border border-orange-900/50 hover:border-orange-500/50 rounded-lg px-4 py-3 transition-colors group"
+        >
+          <div className="flex items-center gap-3">
+            <span className="text-orange-400 text-lg">📊</span>
+            <div className="text-left">
+              <div className="text-sm font-medium text-gray-200">k9 Simulator</div>
+              <div className="text-xs text-gray-500">Live sim of what we'd trade at 1% of k9</div>
+            </div>
+          </div>
+          <span className="text-gray-600 group-hover:text-orange-400 transition-colors">→</span>
+        </button>
+        </>}
         {tab === 'trade' && <>
         {/* Event */}
         <EventHeader event={event} />
