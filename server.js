@@ -557,35 +557,133 @@ app.get('/api/positions', async (req, res) => {
 // ── Active event ───────────────────────────────────────────────────────────
 app.get('/api/event', (req, res) => res.json({ event: activeEvent, liveState }));
 
+// ── Resolution cache (resolved events never change) ────────────────────────
+const resolutionCache = {};
+async function getResolution(slug) {
+  if (resolutionCache[slug] !== undefined) return resolutionCache[slug];
+  try {
+    const r = await fetch(`https://gamma-api.polymarket.com/events?slug=${slug}`);
+    const data = await r.json();
+    const m = data?.[0]?.markets?.[0];
+    if (!m) { resolutionCache[slug] = null; return null; }
+    const prices = JSON.parse(m.outcomePrices || '[]');
+    const outcomes = JSON.parse(m.outcomes || '[]');
+    const closed = !!m.closed;
+    let winner = null;
+    if (closed && prices.length === 2) {
+      if (prices[0] === '1') winner = outcomes[0];
+      else if (prices[1] === '1') winner = outcomes[1];
+    }
+    const result = { closed, winner, title: data[0]?.title || slug };
+    if (closed && winner) resolutionCache[slug] = result; // only cache resolved
+    return result;
+  } catch { resolutionCache[slug] = null; return null; }
+}
+
 // ── Sim dashboard ──────────────────────────────────────────────────────────
 app.get('/api/sim-dashboard', async (req, res) => {
-  const limit = parseInt(req.query.limit || '10');
+  const limit    = parseInt(req.query.limit || '10');
+  const pctParam = parseFloat(req.query.pct || '1');
+  const useStored = Math.abs(pctParam - 1) < 0.01; // use real data for 1%
+  const copyPct  = Math.max(0.1, Math.min(50, pctParam)) / 100;
+  const minUsdc  = 1.00;
+
   try {
-    // Get recent slugs from sim trades
-    const { data: slugRows } = await supabase
-      .from('k9_sim_trades').select('slug')
-      .order('trade_timestamp', { ascending: false }).limit(5000);
+    if (useStored) {
+      // ── 1% → use actual recorded sim trades (ground truth) ──
+      const { data: slugRows } = await supabase
+        .from('k9_sim_trades').select('slug')
+        .order('trade_timestamp', { ascending: false }).limit(5000);
 
-    const slugSet = [...new Set((slugRows || []).map(r => r.slug))].slice(0, limit);
-    if (!slugSet.length) return res.json({ events: [], totals: {} });
+      const slugSet = [...new Set((slugRows || []).map(r => r.slug))].slice(0, limit);
+      if (!slugSet.length) return res.json({ events: [], totals: {} });
 
-    const { data: sim } = await supabase.from('k9_sim_trades')
-      .select('*').in('slug', slugSet).order('trade_timestamp', { ascending: true });
+      const { data: sim } = await supabase.from('k9_sim_trades')
+        .select('*').in('slug', slugSet).order('trade_timestamp', { ascending: true });
+      const { data: obs } = await supabase.from('k9_observed_trades')
+        .select('*').in('slug', slugSet).order('trade_timestamp', { ascending: true });
 
-    const { data: obs } = await supabase.from('k9_observed_trades')
-      .select('*').in('slug', slugSet).order('trade_timestamp', { ascending: true });
+      const events = slugSet.map(slug => {
+        const simTrades = (sim || []).filter(t => t.slug === slug);
+        const k9Trades  = (obs || []).filter(t => t.slug === slug);
+        const summary = {};
+        for (const side of ['Up', 'Down']) {
+          const st = simTrades.filter(t => t.outcome === side);
+          const kt = k9Trades.filter(t => t.outcome === side);
+          const simUsdc   = st.reduce((s,t) => s + parseFloat(t.sim_usdc), 0);
+          const simShares = st.reduce((s,t) => s + parseFloat(t.sim_shares), 0);
+          const k9Usdc    = kt.reduce((s,t) => s + parseFloat(t.usdc_size), 0);
+          const k9Shares  = kt.reduce((s,t) => s + parseFloat(t.shares), 0);
+          summary[side] = {
+            simUsdc, simShares,
+            simAvgPrice: simShares > 0 ? simUsdc / simShares : 0,
+            k9Usdc, k9Shares,
+            k9AvgPrice: k9Shares > 0 ? k9Usdc / k9Shares : 0,
+            k9LastPrice: kt.length ? parseFloat(kt[kt.length-1].price) : 0,
+            tradeCount: st.length,
+          };
+        }
+        const totalSimUsdc = (summary.Up?.simUsdc||0) + (summary.Down?.simUsdc||0);
+        const totalK9Usdc  = (summary.Up?.k9Usdc||0)  + (summary.Down?.k9Usdc||0);
+        const feed = simTrades.slice(-50).map(t => ({
+          outcome: t.outcome,
+          k9Price: parseFloat(t.k9_price), k9Usdc: parseFloat(t.k9_usdc),
+          simUsdc: parseFloat(t.sim_usdc), simShares: parseFloat(t.sim_shares),
+          simPrice: parseFloat(t.sim_price), ts: t.trade_timestamp,
+        }));
+        return { slug, summary, feed, totalSimUsdc, totalK9Usdc };
+      });
+      // Fetch resolution data for all events
+      const resolutions = await Promise.all(slugSet.map(s => getResolution(s)));
+      events.forEach((ev, i) => { ev.resolution = resolutions[i]; });
+
+      const allSim = sim || [];
+      const totals = {
+        totalSimUsdc: allSim.reduce((s,t) => s + parseFloat(t.sim_usdc), 0),
+        totalK9Usdc:  (obs||[]).reduce((s,t) => s + parseFloat(t.usdc_size), 0),
+        tradeCount:   allSim.length,
+        eventCount:   slugSet.length,
+      };
+      return res.json({ events, totals, copyPct: 1 });
+    }
+
+    // ── Other %s → re-simulate from k9 observed trades ──
+    const { data: allObs } = await supabase.from('k9_observed_trades')
+      .select('*').order('trade_timestamp', { ascending: true });
+
+    if (!allObs?.length) return res.json({ events: [], totals: {} });
+
+    const slugSet = [...new Set(allObs.map(r => r.slug).reverse())].slice(0, limit);
 
     const events = slugSet.map(slug => {
-      const simTrades = (sim || []).filter(t => t.slug === slug);
-      const k9Trades  = (obs || []).filter(t => t.slug === slug);
+      const k9Trades = allObs.filter(t => t.slug === slug);
+      const simFills = [];
+      const carry = { Up: 0, Down: 0 };
 
-      const sides = ['Up', 'Down'];
+      for (const t of k9Trades) {
+        const side  = t.outcome;
+        const price = parseFloat(t.price);
+        const usdc  = parseFloat(t.usdc_size);
+        carry[side] += usdc * copyPct;
+
+        if (carry[side] >= minUsdc) {
+          const simUsdc   = carry[side];
+          const simShares = price > 0 ? Math.floor(simUsdc / price) : 0;
+          if (simShares < 1) continue;
+          simFills.push({
+            outcome: side, k9Price: price, k9Usdc: usdc,
+            simUsdc, simShares, simPrice: price, ts: t.trade_timestamp,
+          });
+          carry[side] = 0;
+        }
+      }
+
       const summary = {};
-      for (const side of sides) {
-        const st = simTrades.filter(t => t.outcome === side);
+      for (const side of ['Up', 'Down']) {
+        const sf = simFills.filter(f => f.outcome === side);
         const kt = k9Trades.filter(t => t.outcome === side);
-        const simUsdc   = st.reduce((s,t) => s + parseFloat(t.sim_usdc), 0);
-        const simShares = st.reduce((s,t) => s + parseFloat(t.sim_shares), 0);
+        const simUsdc   = sf.reduce((s,f) => s + f.simUsdc, 0);
+        const simShares = sf.reduce((s,f) => s + f.simShares, 0);
         const k9Usdc    = kt.reduce((s,t) => s + parseFloat(t.usdc_size), 0);
         const k9Shares  = kt.reduce((s,t) => s + parseFloat(t.shares), 0);
         summary[side] = {
@@ -594,37 +692,27 @@ app.get('/api/sim-dashboard', async (req, res) => {
           k9Usdc, k9Shares,
           k9AvgPrice: k9Shares > 0 ? k9Usdc / k9Shares : 0,
           k9LastPrice: kt.length ? parseFloat(kt[kt.length-1].price) : 0,
-          tradeCount: st.length,
+          tradeCount: sf.length,
         };
       }
 
       const totalSimUsdc = (summary.Up?.simUsdc||0) + (summary.Down?.simUsdc||0);
       const totalK9Usdc  = (summary.Up?.k9Usdc||0)  + (summary.Down?.k9Usdc||0);
-
-      // Trade feed (last 50)
-      const feed = simTrades.slice(-50).map(t => ({
-        outcome: t.outcome,
-        k9Price: parseFloat(t.k9_price),
-        k9Usdc: parseFloat(t.k9_usdc),
-        simUsdc: parseFloat(t.sim_usdc),
-        simShares: parseFloat(t.sim_shares),
-        simPrice: parseFloat(t.sim_price),
-        ts: t.trade_timestamp,
-      }));
-
-      return { slug, summary, feed, totalSimUsdc, totalK9Usdc };
+      return { slug, summary, feed: simFills.slice(-50), totalSimUsdc, totalK9Usdc };
     });
 
-    // Overall totals
-    const allSim = sim || [];
     const totals = {
-      totalSimUsdc: allSim.reduce((s,t) => s + parseFloat(t.sim_usdc), 0),
-      totalK9Usdc:  (obs||[]).reduce((s,t) => s + parseFloat(t.usdc_size), 0),
-      tradeCount:   allSim.length,
-      eventCount:   slugSet.length,
+      totalSimUsdc: events.reduce((s,ev) => s + ev.totalSimUsdc, 0),
+      totalK9Usdc:  events.reduce((s,ev) => s + ev.totalK9Usdc, 0),
+      tradeCount:   events.reduce((s,ev) => s + (ev.feed||[]).length, 0),
+      eventCount:   events.length,
     };
 
-    res.json({ events, totals });
+    // Fetch resolution data for all events
+    const resolutions = await Promise.all(slugSet.map(s => getResolution(s)));
+    events.forEach((ev, i) => { ev.resolution = resolutions[i]; });
+
+    res.json({ events, totals, copyPct: pctParam });
   } catch(e) {
     console.error('/api/sim-dashboard error:', e.message);
     res.json({ events: [], totals: {}, error: e.message });
