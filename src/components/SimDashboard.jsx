@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useRef } from 'react';
 
-const REFRESH_MS = 3000;
+const REFRESH_MS = 30000; // 30s — sim-dashboard is heavy
 const API_BASE   = (import.meta.env.VITE_API_URL || (typeof window !== 'undefined' ? `${window.location.protocol}//${window.location.hostname}:3001` : '')).replace(/\/$/, '');
 const SIM_MODES  = [
   '1pct_070',
@@ -382,15 +382,34 @@ function SimCard({ ev, simMode }) {
 
 /* ── Detail view ───────────────────────────────────────────────── */
 function DetailView({ event, onBack, simMode }) {
-  const { slug, summary, feed, totalK9Usdc, resolution } = event;
+  const { slug, summary, totalK9Usdc, resolution } = event;
   const parsed = parseSlug(slug);
   const up = summary?.Up || {};
   const dn = summary?.Down || {};
+
+  const [detail, setDetail] = useState(null);
+  const [detailLoading, setDetailLoading] = useState(true);
+  const [feedFilter, setFeedFilter] = useState('all'); // all | k9 | us
+
+  useEffect(() => {
+    setDetailLoading(true);
+    const base = API_BASE || `http://${window.location.hostname}:3001`;
+    fetch(`${base}/api/event-detail/${encodeURIComponent(slug)}`)
+      .then(r => r.json())
+      .then(d => { setDetail(d); setDetailLoading(false); })
+      .catch(() => setDetailLoading(false));
+  }, [slug]);
 
   const k9UpPnl = computePnl(up.k9Shares, up.k9Usdc, 'Up', resolution);
   const k9DnPnl = computePnl(dn.k9Shares, dn.k9Usdc, 'Down', resolution);
   const k9TotalPnl = k9UpPnl && k9DnPnl ? (k9UpPnl.pnl + k9DnPnl.pnl) : null;
   const k9SellPnl = (up.k9SellPnl || 0) + (dn.k9SellPnl || 0);
+
+  const feed = detail?.feed || event.feed || [];
+  const filteredFeed = feedFilter === 'all' ? feed : feed.filter(t => t.who === feedFilter);
+  const ourPnl = detail?.ourPnl;
+  const ourSummary = detail?.ourSummary;
+  const hasOurTrades = (detail?.ourTradeCount || 0) > 0;
 
   return (
     <div className="space-y-4">
@@ -415,6 +434,75 @@ function DetailView({ event, onBack, simMode }) {
         </div>
       </div>
 
+      {/* P&L Comparison: k9 vs Us vs Sim */}
+      <div className="bg-gray-900 rounded-xl border border-gray-800 p-4">
+        <div className="text-[10px] uppercase tracking-wider text-gray-500 font-bold mb-3">P&L Comparison</div>
+        <div className="grid grid-cols-3 gap-4">
+          {/* k9 */}
+          <div className="space-y-1">
+            <div className="text-[10px] text-gray-500 uppercase">k9</div>
+            <div className="text-xs font-mono text-gray-400">Spent: {usd(totalK9Usdc)}</div>
+            <div className="text-xs font-mono text-gray-400">Trades: {(up.tradeCount||0)+(dn.tradeCount||0)}</div>
+            {k9TotalPnl !== null ? (
+              <div className={`text-sm font-bold font-mono ${k9TotalPnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                {k9TotalPnl >= 0 ? '+' : ''}{usd(k9TotalPnl)}
+              </div>
+            ) : (
+              <div className="text-xs text-gray-500">Pending...</div>
+            )}
+          </div>
+          {/* Us */}
+          <div className="space-y-1">
+            <div className="text-[10px] text-blue-400 uppercase">Us</div>
+            {detailLoading ? (
+              <div className="text-xs text-gray-600 animate-pulse">Loading...</div>
+            ) : hasOurTrades ? (
+              <>
+                <div className="text-xs font-mono text-gray-400">
+                  Spent: {usd((ourSummary?.Up?.buyUsdc||0)+(ourSummary?.Down?.buyUsdc||0))}
+                </div>
+                <div className="text-xs font-mono text-gray-400">Trades: {detail?.ourTradeCount||0}</div>
+                {ourPnl !== null ? (
+                  <div className={`text-sm font-bold font-mono ${ourPnl >= 0 ? 'text-blue-400' : 'text-red-400'}`}>
+                    {ourPnl >= 0 ? '+' : ''}{usd(ourPnl)}
+                  </div>
+                ) : (
+                  <div className="text-xs text-gray-500">Pending...</div>
+                )}
+              </>
+            ) : (
+              <div className="text-xs text-gray-600">No trades</div>
+            )}
+          </div>
+          {/* Sim */}
+          {(() => {
+            const sp = getSimPnl(event, simMode);
+            return (
+              <div className="space-y-1">
+                <div className="text-[10px] text-purple-400 uppercase">Sim ({SIM_LABELS[simMode]})</div>
+                {sp ? (
+                  <>
+                    <div className="text-xs font-mono text-gray-400">Cost: {usd(sp.cost)}</div>
+                    <div className="text-xs font-mono text-gray-400">Triggers: {event.sim?.[simMode]?.triggerCount||0}</div>
+                    {sp.resolved ? (
+                      <div className={`text-sm font-bold font-mono ${sp.pnl >= 0 ? 'text-purple-400' : 'text-red-400'}`}>
+                        {sp.pnl >= 0 ? '+' : ''}{usd(sp.pnl)}
+                      </div>
+                    ) : (
+                      <div className="text-xs text-gray-500">
+                        If Up: {usd(sp.ifUpPnl)} / Dn: {usd(sp.ifDnPnl)}
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <div className="text-xs text-gray-600">No sim data</div>
+                )}
+              </div>
+            );
+          })()}
+        </div>
+      </div>
+
       {/* Sim positions */}
       <SimCard ev={event} simMode={simMode} />
 
@@ -423,95 +511,103 @@ function DetailView({ event, onBack, simMode }) {
         {(up.k9BuyShares > 0 || up.k9SellShares > 0) && <PositionCard side="Up" data={up} resolution={resolution} otherUsdc={dn.k9Usdc||0} />}
         {(dn.k9BuyShares > 0 || dn.k9SellShares > 0) && <PositionCard side="Down" data={dn} resolution={resolution} otherUsdc={up.k9Usdc||0} />}
         {!up.k9BuyShares && !dn.k9BuyShares && !up.k9SellShares && !dn.k9SellShares && (
-          <div className="bg-gray-900 rounded-xl border border-gray-800 p-4 text-gray-600 text-sm text-center">No positions</div>
+          <div className="bg-gray-900 rounded-xl border border-gray-800 p-4 text-gray-600 text-sm text-center">No k9 positions</div>
         )}
       </div>
 
-      {/* Summary */}
-      <div className="bg-gray-900 rounded-xl border border-gray-800 p-4">
-        <div className="text-[10px] uppercase tracking-wider text-gray-500 font-bold mb-3">
-          {resolution?.closed && resolution?.winner ? 'Results' : 'Summary'}
-        </div>
-        <div className="grid grid-cols-4 gap-4 text-xs">
-          <div>
-            <div className="text-gray-500 mb-1">Net Spent</div>
-            <div className="font-mono text-white font-bold">{usd(totalK9Usdc)}</div>
-          </div>
-          <div>
-            <div className="text-gray-500 mb-1">Sell P&L</div>
-            <div className={`font-mono font-bold ${k9SellPnl >= 0 ? 'text-cyan-400' : 'text-red-400'}`}>
-              {k9SellPnl !== 0 ? (k9SellPnl >= 0 ? '+' : '') + usd(k9SellPnl) : '--'}
-            </div>
-          </div>
-          {k9TotalPnl !== null ? (
-            <div>
-              <div className="text-gray-500 mb-1">Resolution P&L</div>
-              <div className={`font-mono font-bold ${k9TotalPnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                {k9TotalPnl >= 0 ? '+' : ''}{usd(k9TotalPnl)}
-              </div>
-            </div>
-          ) : (
-            <>
-              {(() => {
-                const ifUpPnl = (up.k9Shares||0) - (up.k9Usdc||0) - (dn.k9Usdc||0);
-                const ifDnPnl = (dn.k9Shares||0) - (dn.k9Usdc||0) - (up.k9Usdc||0);
-                return (
-                  <>
-                    <div>
-                      <div className="text-gray-500 mb-1">If Up Wins</div>
-                      <div className={`font-mono font-bold ${ifUpPnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                        {ifUpPnl >= 0 ? '+' : ''}{usd(ifUpPnl)}
-                      </div>
+      {/* Our positions (if any) */}
+      {hasOurTrades && ourSummary && (
+        <div className="space-y-2">
+          <div className="text-[10px] uppercase tracking-wider text-blue-400 font-bold">Our Positions</div>
+          {['Up', 'Down'].map(side => {
+            const s = ourSummary[side];
+            if (!s || (!s.buyShares && !s.sellShares)) return null;
+            return (
+              <div key={side} className={`bg-gray-900 rounded-xl border border-blue-900/30 p-4`}>
+                <div className="flex items-center gap-2 mb-3">
+                  <span className={`${side === 'Up' ? 'bg-green-500/10 text-green-400' : 'bg-red-500/10 text-red-400'} text-xs font-bold px-2 py-0.5 rounded`}>
+                    {side} {pri(s.avgBuyPrice)}
+                  </span>
+                  <span className="text-gray-400 text-xs font-mono">net {(s.netShares||0).toFixed(1)} shares</span>
+                  <span className="bg-blue-500/10 text-blue-400 text-[10px] px-1.5 py-0.5 rounded">OURS</span>
+                </div>
+                <div className="grid grid-cols-3 gap-3 text-xs font-mono">
+                  <div>
+                    <div className="text-gray-500 text-[10px]">Bought</div>
+                    <div className="text-white">{(s.buyShares||0).toFixed(1)} sh</div>
+                    <div className="text-gray-500">{usd(s.buyUsdc)}</div>
+                  </div>
+                  <div>
+                    <div className="text-gray-500 text-[10px]">Sold</div>
+                    <div className="text-white">{(s.sellShares||0).toFixed(1)} sh</div>
+                    <div className="text-gray-500">{usd(s.sellUsdc)}</div>
+                  </div>
+                  <div>
+                    <div className="text-gray-500 text-[10px]">Sell P&L</div>
+                    <div className={s.sellPnl >= 0 ? 'text-cyan-400' : 'text-red-400'}>
+                      {s.sellPnl !== 0 ? (s.sellPnl >= 0 ? '+' : '') + usd(s.sellPnl) : '--'}
                     </div>
-                    <div>
-                      <div className="text-gray-500 mb-1">If Down Wins</div>
-                      <div className={`font-mono font-bold ${ifDnPnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                        {ifDnPnl >= 0 ? '+' : ''}{usd(ifDnPnl)}
-                      </div>
-                    </div>
-                  </>
-                );
-              })()}
-            </>
-          )}
-          {k9TotalPnl !== null && (
-            <div>
-              <div className="text-gray-500 mb-1">Total P&L</div>
-              <div className={`font-mono font-bold ${(k9TotalPnl + k9SellPnl) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                {(k9TotalPnl + k9SellPnl) >= 0 ? '+' : ''}{usd(k9TotalPnl + k9SellPnl)}
+                  </div>
+                </div>
               </div>
-            </div>
-          )}
+            );
+          })}
         </div>
-      </div>
+      )}
 
-      {/* Trade feed */}
+      {/* Combined trade feed */}
       <div className="bg-gray-900 rounded-xl border border-gray-800 overflow-hidden">
         <div className="flex items-center justify-between px-4 py-3 border-b border-gray-800">
-          <span className="text-sm font-semibold text-gray-300">Trade Feed</span>
-          <span className="text-xs text-gray-600">{(feed||[]).length} fills</span>
+          <div className="flex items-center gap-3">
+            <span className="text-sm font-semibold text-gray-300">All Transactions</span>
+            <div className="flex gap-0.5 bg-gray-800 rounded-lg p-0.5">
+              {[
+                { val: 'all', label: 'All' },
+                { val: 'k9', label: 'k9' },
+                { val: 'us', label: 'Ours' },
+              ].map(f => (
+                <button key={f.val} onClick={() => setFeedFilter(f.val)}
+                  className={`px-2 py-0.5 text-[10px] rounded-md transition-colors ${
+                    feedFilter === f.val ? 'bg-gray-700 text-white' : 'text-gray-500 hover:text-gray-300'
+                  }`}>{f.label}</button>
+              ))}
+            </div>
+          </div>
+          <span className="text-xs text-gray-600">
+            {detailLoading ? '...' : `${filteredFeed.length} fills`}
+            {detail && ` (k9: ${detail.k9TradeCount}, us: ${detail.ourTradeCount})`}
+          </span>
         </div>
         <div className="px-4">
-          <div className="grid grid-cols-5 gap-2 text-[10px] text-gray-600 uppercase tracking-wider py-2 border-b border-gray-800">
-            <div>Time</div><div>Side</div><div>Type</div><div>Price</div><div className="text-right">Shares / USDC</div>
+          <div className="grid grid-cols-6 gap-2 text-[10px] text-gray-600 uppercase tracking-wider py-2 border-b border-gray-800">
+            <div>Time</div><div>Who</div><div>Side</div><div>Type</div><div>Price</div><div className="text-right">Shares / USDC</div>
           </div>
-          <div className="max-h-64 overflow-y-auto">
-            {[...(feed||[])].reverse().map((t, i) => {
+          <div className="max-h-80 overflow-y-auto">
+            {detailLoading && !feed.length && (
+              <div className="text-gray-600 text-xs py-4 text-center animate-pulse">Loading transactions...</div>
+            )}
+            {[...filteredFeed].reverse().map((t, i) => {
               const isUp = t.outcome === 'Up';
               const isBuy = t.side === 'buy';
+              const isUs = t.who === 'us';
               const time = t.ts ? new Date(t.ts * 1000).toLocaleTimeString('en-US', { hour12: false }) : '';
               return (
-                <div key={i} className="grid grid-cols-5 gap-2 text-xs font-mono py-1.5 border-b border-gray-800/50 items-center">
+                <div key={i} className={`grid grid-cols-6 gap-2 text-xs font-mono py-1.5 border-b border-gray-800/50 items-center ${
+                  isUs ? 'bg-blue-950/20' : ''
+                }`}>
                   <span className="text-gray-500">{time}</span>
+                  <span className={isUs ? 'text-blue-400 font-bold' : 'text-gray-500'}>{isUs ? 'US' : 'k9'}</span>
                   <span className={`font-bold ${isUp ? 'text-green-400' : 'text-red-400'}`}>{t.outcome}</span>
                   <span className={isBuy ? 'text-blue-400' : 'text-orange-400'}>{t.side}</span>
                   <span className="text-gray-400">{pri(t.price)}</span>
-                  <span className="text-white text-right">{t.shares.toFixed(1)}sh / {usd(t.usdc)}</span>
+                  <span className="text-white text-right">{(t.shares||0).toFixed(1)}sh / {usd(t.usdc)}</span>
                 </div>
               );
             })}
-            {!(feed||[]).length && (
-              <div className="text-gray-600 text-sm py-4 text-center">No fills yet</div>
+            {!detailLoading && !filteredFeed.length && (
+              <div className="text-gray-600 text-sm py-4 text-center">
+                {feedFilter === 'us' ? 'No trades from us on this event' : 'No fills yet'}
+              </div>
             )}
           </div>
         </div>
@@ -535,7 +631,7 @@ export default function SimDashboard() {
   async function load(dur, dt) {
     try {
       const base = API_BASE || (typeof window !== 'undefined' ? `http://${window.location.hostname}:3001` : '');
-      const params = new URLSearchParams({ limit: '200' });
+      const params = new URLSearchParams({ limit: '30' });
       if (dur) params.set('duration', dur);
       if (dt) params.set('date', dt);
       const r = await fetch(`${base}/api/sim-dashboard?${params}`);

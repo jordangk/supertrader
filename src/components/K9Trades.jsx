@@ -70,7 +70,19 @@ export default function K9Trades() {
   const [expanded, setExpanded] = useState({});
   const [lastUpdate, setLastUpdate] = useState(null);
   const [liveCount, setLiveCount] = useState(0);
+  const [compareData, setCompareData] = useState(null);
+  const [compareLoading, setCompareLoading] = useState(false);
   const ws = useRef(null);
+
+  async function loadCompare() {
+    setCompareLoading(true);
+    try {
+      const r = await fetch(`${API_BASE || ''}/api/k9-compare?slugs=auto`);
+      const d = await r.json();
+      setCompareData(d.events || []);
+    } catch { setCompareData([]); }
+    setCompareLoading(false);
+  }
 
   async function load() {
     try {
@@ -127,9 +139,16 @@ export default function K9Trades() {
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between flex-wrap gap-2">
         <h2 className="text-sm font-semibold text-gray-300">k9 Live Trades <span className="text-gray-600 font-normal">(15m)</span></h2>
         <div className="flex items-center gap-3">
+          <button
+            onClick={loadCompare}
+            disabled={compareLoading}
+            className="text-xs px-2 py-1 rounded bg-cyan-600 hover:bg-cyan-500 text-white disabled:opacity-50"
+          >
+            {compareLoading ? '…' : 'Compare my copy'}
+          </button>
           {lastUpdate && (
             <span className="text-xs text-gray-600">
               updated {lastUpdate.toLocaleTimeString('en-US', { hour12: false })}
@@ -142,6 +161,53 @@ export default function K9Trades() {
           )}
         </div>
       </div>
+
+      {compareData && compareData.length > 0 && (
+        <div className="bg-gray-900 rounded-lg border border-cyan-800/50 p-4">
+          <div className="text-xs font-semibold text-cyan-400 mb-3">k9 vs your copy (events you traded)</div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="text-gray-500 border-b border-gray-800">
+                  <th className="text-left py-1">Event</th>
+                  <th className="text-right py-1">Winner</th>
+                  <th className="text-right py-1">k9 $</th>
+                  <th className="text-right py-1">k9 PnL</th>
+                  <th className="text-right py-1">You $</th>
+                  <th className="text-right py-1">You PnL</th>
+                  <th className="text-right py-1">%</th>
+                </tr>
+              </thead>
+              <tbody>
+                {compareData.map(ev => {
+                  const epoch = ev.slug?.split('-').pop();
+                  const time = epoch ? new Date(parseInt(epoch) * 1000).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false }) : ev.slug;
+                  const k9Pnl = ev.k9?.pnl;
+                  const ourPnl = ev.ours?.pnl;
+                  return (
+                    <tr key={ev.slug} className="border-b border-gray-800/50">
+                      <td className="py-1.5 text-gray-400 truncate max-w-36">{time}</td>
+                      <td className="text-right py-1.5 font-mono">{ev.winner || '—'}</td>
+                      <td className="text-right py-1.5">{usd(ev.k9?.usdc || 0)}</td>
+                      <td className={`text-right py-1.5 ${k9Pnl != null ? (k9Pnl >= 0 ? 'text-green-400' : 'text-red-400') : 'text-gray-500'}`}>
+                        {k9Pnl != null ? (k9Pnl >= 0 ? '+' : '') + usd(k9Pnl) : '—'}
+                      </td>
+                      <td className="text-right py-1.5">{usd(ev.ours?.usdc || 0)}</td>
+                      <td className={`text-right py-1.5 ${ourPnl != null ? (ourPnl >= 0 ? 'text-green-400' : 'text-red-400') : 'text-gray-500'}`}>
+                        {ourPnl != null ? (ourPnl >= 0 ? '+' : '') + usd(ourPnl) : '—'}
+                      </td>
+                      <td className="text-right py-1.5 text-cyan-400">{ev.ratio != null ? ev.ratio.toFixed(1) + '%' : '—'}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <div className="mt-2 text-[10px] text-gray-500">
+            % = your size as % of k9&apos;s. PnL at resolution.
+          </div>
+        </div>
+      )}
 
       {events.map(ev => {
         const { slug, summary, recent, totalTrades } = ev;

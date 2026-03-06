@@ -9,6 +9,7 @@ import OrderHistory from './components/OrderHistory.jsx';
 import Positions from './components/Positions.jsx';
 import OrderToast from './components/OrderToast.jsx';
 import K9Trades from './components/K9Trades.jsx';
+import MyTrades from './components/MyTrades.jsx';
 import LiveBetsConfig from './components/LiveBetsConfig.jsx';
 import SimDashboard from './components/SimDashboard.jsx';
 import PriceTracker from './components/PriceTracker.jsx';
@@ -20,7 +21,7 @@ const FEE_PCT = 0.02; // 2% Polymarket fee
 const API_BASE = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
 
 export default function App() {
-  const { prices, btc, binanceBtc, event, refreshTrigger } = useWebSocket();
+  const { prices, btc, binanceBtc, event, refreshTrigger, copyFeed } = useWebSocket();
   const [wallet, setWallet] = useState(null);
   const [orders, setOrders] = useState([]);
   const [positions, setPositions] = useState([]);
@@ -345,6 +346,20 @@ export default function App() {
     } catch (e) { setToast({ success: false, error: e.message }); } finally { setBuying(null); }
   }
 
+  async function handleSplit() {
+    setBuying('split');
+    try {
+      const res = await fetch(`${API_BASE}/api/split`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ amount: 150 }),
+      });
+      const data = await res.json();
+      setToast({ ...data, type: 'split', message: data.success ? `Split $150 → 150 Up + 150 Down (tx: ${data.txHash?.slice(0,10)}...)` : data.error });
+      const refresh = () => { fetchOrders(); fetchOpenOrders(); fetch(`${API_BASE}/api/wallet`).then(r => r.json()).then(setWallet).catch(() => {}); };
+      refresh(); setTimeout(refresh, 3000); setTimeout(refresh, 10000);
+    } catch (e) { setToast({ success: false, error: e.message }); } finally { setBuying(null); }
+  }
+
   async function handleCancelOrder(orderID) {
     try {
       await fetch(`${API_BASE}/api/cancel`, {
@@ -433,7 +448,7 @@ export default function App() {
 
       {/* Tab bar */}
       <div className="bg-gray-900 border-b border-gray-800 px-4 flex gap-1">
-        {[['trade', '⚡ Trade'], ['trades', '🔥 Live Trades'], ['prices', '📈 Prices'], ['sim', '📊 k9 Simulator'], ['k9', '👁 k9 Raw']].map(([t, label]) => (
+        {[['trade', '⚡ Trade'], ['trades', '🔥 Live Trades'], ['mytrades', '📋 My Trades'], ['prices', '📈 Prices'], ['sim', '📊 k9 Simulator'], ['k9', '👁 k9 Raw']].map(([t, label]) => (
           <button key={t} onClick={() => setTab(t)}
             className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
               tab === t ? 'border-orange-500 text-orange-400' : 'border-transparent text-gray-500 hover:text-gray-300'
@@ -448,12 +463,13 @@ export default function App() {
               <h2 className="text-lg font-bold text-gray-200">Live Trades</h2>
               <p className="text-xs text-gray-500 mt-0.5">Copy k9&apos;s BTC Up/Down trades in real time. Select %, event time, and enable.</p>
             </div>
-            <LiveBetsConfig />
+            <LiveBetsConfig copyFeed={copyFeed} />
           </div>
         )}
+        {tab === 'mytrades' && <MyTrades />}
         {tab === 'k9' && (
           <>
-            <LiveBetsConfig />
+            <LiveBetsConfig copyFeed={copyFeed} />
             <K9Trades />
           </>
         )}
@@ -556,7 +572,7 @@ export default function App() {
               buying === 'buy-both' ? 'opacity-50 cursor-wait' : ''
             } bg-blue-700/40 hover:bg-blue-600/40 border border-blue-500/40 text-blue-300 disabled:opacity-30`}
           >
-            {buying === 'buy-both' ? '...' : 'Buy Both 10 (-1¢)'}
+            {buying === 'buy-both' ? '...' : 'Buy Both 10 (@ mid)'}
           </button>
           <button
             disabled={buying === 'sell-both' || !prices.upPrice || !prices.downPrice}
@@ -574,7 +590,16 @@ export default function App() {
               buying === 'buy-then-sell-both' ? 'opacity-50 cursor-wait' : ''
             } bg-cyan-700/40 hover:bg-cyan-600/40 border border-cyan-500/40 text-cyan-300 disabled:opacity-30`}
           >
-            {buying === 'buy-then-sell-both' ? '...' : 'Buy 10 Both @ p-1¢ → Sell @ p+1¢ when filled'}
+            {buying === 'buy-then-sell-both' ? '...' : 'Buy 10 Both @ mid → Sell @ p+1¢ when filled'}
+          </button>
+          <button
+            disabled={buying === 'split' || !event}
+            onClick={handleSplit}
+            className={`col-span-2 py-2 rounded-lg text-sm font-bold transition-all ${
+              buying === 'split' ? 'opacity-50 cursor-wait' : ''
+            } bg-orange-700/40 hover:bg-orange-600/40 border border-orange-500/40 text-orange-300 disabled:opacity-30`}
+          >
+            {buying === 'split' ? 'Splitting...' : 'Split $150 → 150 Up + 150 Down'}
           </button>
         </div>
 

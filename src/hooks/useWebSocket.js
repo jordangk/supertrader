@@ -7,6 +7,7 @@ export function useWebSocket() {
   const [event, setEvent] = useState(null);
   const [autoSell, setAutoSell] = useState(null);
   const [refreshTrigger, setRefreshTrigger] = useState(0);
+  const [copyFeed, setCopyFeed] = useState([]); // combined k9 + our copy orders
   const ws = useRef(null);
 
   useEffect(() => {
@@ -47,6 +48,23 @@ export function useWebSocket() {
             setAutoSell(msg);
           } else if (msg.type === 'refresh') {
             setRefreshTrigger(t => t + 1);
+          } else if (msg.type === 'k9_trades') {
+            setCopyFeed(prev => {
+              const entries = (msg.trades || []).map(t => ({
+                ts: Date.now(), who: 'k9', side: t.side, outcome: t.outcome,
+                shares: t.shares, price: t.price, usdc: t.usdcSize, slug: t.slug,
+              }));
+              return [...entries, ...prev].slice(0, 100);
+            });
+          } else if (msg.type === 'k9_copy') {
+            setCopyFeed(prev => {
+              const entry = {
+                ts: msg.ts || Date.now(), who: 'us', side: msg.side || msg.action,
+                outcome: msg.outcome, shares: msg.shares, price: msg.price,
+                usdc: msg.usdc, error: msg.error, orderId: msg.orderId,
+              };
+              return [entry, ...prev].slice(0, 100);
+            });
           }
         } catch {}
       };
@@ -58,5 +76,5 @@ export function useWebSocket() {
     return () => ws.current?.close();
   }, []);
 
-  return { prices, btc, binanceBtc, event, autoSell, refreshTrigger };
+  return { prices, btc, binanceBtc, event, autoSell, refreshTrigger, copyFeed };
 }

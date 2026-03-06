@@ -11,6 +11,7 @@ import { Contract } from '@ethersproject/contracts';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { execFile } from 'child_process';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -138,6 +139,7 @@ let k9Copy = {
   eventTime: '',          // '' | '5m' | '15m' | '1h' — filter by event timeframe
   pct: 0.01,              // 1% of k9's volume
   batchMode: 'min5',      // 'min5' = 5 units min (Polymarket min) | 'cum50' = batch to 50 units
+  orderType: 'FAK',       // 'FAK' = Fill and Kill (immediate) | 'GTC' = Good Till Cancel (resting)
   minShares: 5,           // Polymarket minimum order size
   pending: false,         // lock to prevent nonce collision
   queue: [],              // queued orders while one is in-flight
@@ -155,7 +157,7 @@ resetCopyBuffer();
 // Persist copy state to disk so it survives server restarts
 function saveK9CopyState() {
   try {
-    const state = { enabled: k9Copy.enabled, targetSlug: k9Copy.targetSlug, eventTime: k9Copy.eventTime, pct: k9Copy.pct, batchMode: k9Copy.batchMode, tokenIds: k9Copy.tokenIds };
+    const state = { enabled: k9Copy.enabled, targetSlug: k9Copy.targetSlug, eventTime: k9Copy.eventTime, pct: k9Copy.pct, batchMode: k9Copy.batchMode, orderType: k9Copy.orderType, tokenIds: k9Copy.tokenIds };
     fs.writeFileSync(K9_COPY_STATE_FILE, JSON.stringify(state), 'utf8');
   } catch (e) { console.error('[k9-copy] Failed to save state:', e.message); }
 }
@@ -171,9 +173,10 @@ function loadK9CopyState() {
       k9Copy.eventTime = state.eventTime || '';
       k9Copy.pct = state.pct || 0.01;
       k9Copy.batchMode = state.batchMode || 'min5';
+      k9Copy.orderType = state.orderType || 'FAK';
       k9Copy.tokenIds = state.tokenIds || {};
       resetCopyBuffer();
-      console.log(`[k9-copy] RESTORED from disk — target: ${k9Copy.targetSlug || 'ALL'}, eventTime: ${k9Copy.eventTime || 'all'}, pct: ${k9Copy.pct * 100}%, batch: ${k9Copy.batchMode}`);
+      console.log(`[k9-copy] RESTORED from disk — target: ${k9Copy.targetSlug || 'ALL'}, eventTime: ${k9Copy.eventTime || 'all'}, pct: ${k9Copy.pct * 100}%, order: ${k9Copy.orderType}`);
     }
   } catch (e) { console.error('[k9-copy] Failed to load state:', e.message); }
 }
@@ -200,9 +203,12 @@ async function resolveCopyTokens(slug) {
 }
 
 // Get current market price for a token
-async function getCopyPrice(tokenId) {
+async function getCopyPrice(tokenId, orderSide) {
+  // For BUY orders: fetch ASK price (side=sell) so we cross the spread
+  // For SELL orders: fetch BID price (side=buy) so we hit bids
+  const bookSide = orderSide === 'buy' ? 'sell' : 'buy';
   try {
-    const res = await fetch(`https://clob.polymarket.com/price?token_id=${tokenId}&side=buy`);
+    const res = await fetch(`https://clob.polymarket.com/price?token_id=${tokenId}&side=${bookSide}`);
     const data = await res.json();
     return data.price ? parseFloat(data.price) : null;
   } catch { return null; }
@@ -241,15 +247,29 @@ function accumulateCopyTrades(trades) {
     if (!k9Copy.buffer[outcome]) k9Copy.buffer[outcome] = { buy: 0, sell: 0 };
     k9Copy.buffer[outcome][side] += copyShares;
 
-    const buffered = k9Copy.buffer[outcome][side];
-    const threshold = k9Copy.batchMode === 'cum50' ? 50 : k9Copy.minShares;
-    if (buffered >= threshold) {
-      const shares = Math.floor(buffered * 100) / 100;
-      k9Copy.buffer[outcome][side] = buffered - shares;
-      enqueueCopyOrder(outcome, side, shares, agg.slug);
-    }
+    // Buffer accumulates — flushed every 1s by the interval below
   }
 }
+
+// Flush buffer every 1 second — fire when ≥$1 worth (FAK minimum)
+setInterval(() => {
+  if (!k9Copy.enabled) return;
+  for (const [outcome, buf] of Object.entries(k9Copy.buffer)) {
+    for (const side of ['buy', 'sell']) {
+      if (buf[side] > 0) {
+        const livePrice = (outcome === 'Up')
+          ? parseFloat(liveState.yesPrice || 0.5)
+          : parseFloat(liveState.noPrice || 0.5);
+        const shares = Math.floor(buf[side] * 100) / 100; // 2dp
+        const estUsdc = Number((shares * livePrice).toFixed(2));
+        if (shares >= 0.01 && estUsdc >= 1.0) {
+          buf[side] -= shares;
+          enqueueCopyOrder(outcome, side, shares, k9Copy.targetSlug || liveState.eventSlug || '');
+        }
+      }
+    }
+  }
+}, 1000);
 
 // Queue a copy order (sequential to avoid nonce collisions)
 function enqueueCopyOrder(outcome, side, shares, slug) {
@@ -288,8 +308,8 @@ async function executeCopyOrder({ outcome, side, shares, slug }) {
   }
   if (!tokenId) { console.error(`[k9-copy] No tokenId for ${outcome} on ${slug}`); return; }
 
-  // Get market price
-  let price = await getCopyPrice(tokenId);
+  // Get market price — ask for buys, bid for sells
+  let price = await getCopyPrice(tokenId, side);
   if (!price || price <= 0 || price >= 1) {
     console.error(`[k9-copy] Bad price ${price} for ${outcome}`);
     k9Copy.stats.skipped++;
@@ -300,58 +320,111 @@ async function executeCopyOrder({ outcome, side, shares, slug }) {
   const tick = parseFloat(tickSize);
 
   if (side === 'buy') {
-    // Limit buy at price - 1¢
-    const buyPrice = Math.max(Math.round((price - 0.01) / tick) * tick, 0.01);
-    const sizeUsd = Math.round(shares * buyPrice * 100) / 100;
-    if (sizeUsd < 1) { k9Copy.stats.skipped++; return; }
+    const buyPrice = Math.max(Number((Math.round(price / tick) * tick).toFixed(2)), 0.01);
+    // Use createMarketOrder — pass USDC amount directly (avoids 2dp mismatch)
+    const sizeUsd = Number((shares * buyPrice).toFixed(2));
+    if (sizeUsd < 1.0) { k9Copy.stats.skipped++; return; }
 
-    console.log(`[k9-copy] BUY ${outcome} ${shares.toFixed(1)}sh @ ${buyPrice} (-1¢) ($${sizeUsd.toFixed(2)}) [${slug}]`);
-    const signed = await clobClient.createOrder(
-      { tokenID: tokenId, price: buyPrice, size: sizeUsd, side: 'BUY' },
-      { tickSize, negRisk: false }
-    );
-    const result = await clobClient.postOrder(signed, 'GTC');
-    console.log(`[k9-copy] BUY posted: ${result?.orderID || JSON.stringify(result)}`);
+    console.log(`[k9-copy] BUY ${outcome} ~${shares.toFixed(2)}sh @ ${buyPrice} FAK ($${sizeUsd.toFixed(2)}) [${slug}]`);
+    try {
+      const signed = await clobClient.createMarketOrder(
+        { tokenID: tokenId, price: buyPrice, amount: sizeUsd, side: 'BUY' },
+        { tickSize, negRisk: false }
+      );
+      const result = await clobClient.postOrder(signed, 'FAK');
+      const orderId = result?.orderID || result?.orderIds?.[0];
+      const apiErr = result?.error || result?.errorMsg;
+      const httpStatus = result?.status;
 
-    k9Copy.stats.buys++;
-    k9Copy.stats.usdcSpent += sizeUsd;
-    const logEntry = { ts: Date.now(), side: 'buy', outcome, shares, price: buyPrice, usdc: sizeUsd, orderId: result?.orderID };
-    k9Copy.log.push(logEntry);
-    if (k9Copy.log.length > 50) k9Copy.log.shift();
-    broadcast({ type: 'k9_copy', action: 'buy', ...logEntry });
+      // Detect failed orders (400, error field, or no orderId)
+      if (apiErr || (httpStatus && httpStatus >= 400) || (!orderId && !result?.success)) {
+        const errMsg = apiErr || `HTTP ${httpStatus}` || 'No orderID returned';
+        console.error(`[k9-copy] BUY rejected: ${errMsg} (full: ${JSON.stringify(result)})`);
+        k9Copy.stats.errors = (k9Copy.stats.errors || 0) + 1;
+        const logEntry = { ts: Date.now(), side: 'buy', outcome, shares, price: buyPrice, usdc: sizeUsd, error: String(errMsg), status: httpStatus };
+        k9Copy.log.push(logEntry);
+        if (k9Copy.log.length > 100) k9Copy.log.shift();
+        broadcast({ type: 'k9_copy', action: 'error', ...logEntry });
+        return;
+      }
+
+      console.log(`[k9-copy] BUY ${k9Copy.orderType}: ${orderId}`);
+      k9Copy.stats.buys++;
+      k9Copy.stats.usdcSpent += sizeUsd;
+      const logEntry = { ts: Date.now(), side: 'buy', outcome, shares, price: buyPrice, usdc: sizeUsd, orderId, status: 'ok' };
+      k9Copy.log.push(logEntry);
+      if (k9Copy.log.length > 100) k9Copy.log.shift();
+      broadcast({ type: 'k9_copy', action: 'buy', ...logEntry });
+    } catch (e) {
+      const errMsg = e.message || String(e);
+      console.error(`[k9-copy] BUY error: ${errMsg}`);
+      k9Copy.stats.errors = (k9Copy.stats.errors || 0) + 1;
+      const logEntry = { ts: Date.now(), side: 'buy', outcome, shares, price: buyPrice, usdc: sizeUsd, error: errMsg };
+      k9Copy.log.push(logEntry);
+      if (k9Copy.log.length > 100) k9Copy.log.shift();
+      broadcast({ type: 'k9_copy', action: 'error', ...logEntry });
+    }
 
   } else {
-    // Limit sell at price + 1¢
-    const sellPrice = Math.min(Math.round((price + 0.01) / tick) * tick, 0.99);
+    const sellPrice = Math.min(Number((Math.round((price + 0.01) / tick) * tick).toFixed(2)), 0.99);
 
     // Check how many we actually hold
     try {
       const bal = await clobClient.getBalanceAllowance({ asset_type: 'CONDITIONAL', token_id: tokenId });
       const held = parseFloat(bal?.balance || '0') / 1e6;
-      if (held < k9Copy.minShares) {
-        console.log(`[k9-copy] SELL skip ${outcome}: only hold ${held.toFixed(1)} (need ${shares.toFixed(1)})`);
+      if (held < 0.01) {
+        console.log(`[k9-copy] SELL skip ${outcome}: hold ${held.toFixed(2)}`);
         k9Copy.stats.skipped++;
         return;
       }
-      shares = Math.min(shares, held); // don't sell more than we have
+      shares = Math.min(shares, held);
     } catch (e) {
       console.error(`[k9-copy] Balance check error: ${e.message}`);
     }
 
-    console.log(`[k9-copy] SELL ${outcome} ${shares.toFixed(1)}sh @ ${sellPrice} (+1¢) [${slug}]`);
-    const signed = await clobClient.createOrder(
-      { tokenID: tokenId, price: sellPrice, size: shares, side: 'SELL' },
-      { tickSize, negRisk: false }
-    );
-    const result = await clobClient.postOrder(signed, 'GTC');
-    console.log(`[k9-copy] SELL posted: ${result?.orderID || JSON.stringify(result)}`);
+    shares = Math.floor(shares * 100) / 100; // 2dp
+    const sellUsdc = Number((shares * sellPrice).toFixed(2));
+    if (sellUsdc < 1.0 || shares < 0.01) { k9Copy.stats.skipped++; return; }
 
-    k9Copy.stats.sells++;
-    k9Copy.stats.usdcReceived += shares * sellPrice;
-    const logEntry = { ts: Date.now(), side: 'sell', outcome, shares, price: sellPrice, orderId: result?.orderID };
-    k9Copy.log.push(logEntry);
-    if (k9Copy.log.length > 50) k9Copy.log.shift();
-    broadcast({ type: 'k9_copy', action: 'sell', ...logEntry });
+    console.log(`[k9-copy] SELL ${outcome} ${shares.toFixed(2)}sh @ ${sellPrice} FAK ($${sellUsdc.toFixed(2)}) [${slug}]`);
+    try {
+      // Use createMarketOrder for sells too — pass shares as amount
+      const signed = await clobClient.createMarketOrder(
+        { tokenID: tokenId, price: sellPrice, amount: shares, side: 'SELL' },
+        { tickSize, negRisk: false }
+      );
+      const result = await clobClient.postOrder(signed, 'FAK');
+      const orderId = result?.orderID || result?.orderIds?.[0];
+      const apiErr = result?.error || result?.errorMsg;
+      const httpStatus = result?.status;
+
+      if (apiErr || (httpStatus && httpStatus >= 400) || (!orderId && !result?.success)) {
+        const errMsg = apiErr || `HTTP ${httpStatus}` || 'No orderID returned';
+        console.error(`[k9-copy] SELL rejected: ${errMsg} (full: ${JSON.stringify(result)})`);
+        k9Copy.stats.errors = (k9Copy.stats.errors || 0) + 1;
+        const logEntry = { ts: Date.now(), side: 'sell', outcome, shares, price: sellPrice, error: String(errMsg), status: httpStatus };
+        k9Copy.log.push(logEntry);
+        if (k9Copy.log.length > 100) k9Copy.log.shift();
+        broadcast({ type: 'k9_copy', action: 'error', ...logEntry });
+        return;
+      }
+
+      console.log(`[k9-copy] SELL ${k9Copy.orderType}: ${orderId}`);
+      k9Copy.stats.sells++;
+      k9Copy.stats.usdcReceived += shares * sellPrice;
+      const logEntry = { ts: Date.now(), side: 'sell', outcome, shares, price: sellPrice, orderId, status: 'ok' };
+      k9Copy.log.push(logEntry);
+      if (k9Copy.log.length > 100) k9Copy.log.shift();
+      broadcast({ type: 'k9_copy', action: 'sell', ...logEntry });
+    } catch (e) {
+      const errMsg = e.message || String(e);
+      console.error(`[k9-copy] SELL error: ${errMsg}`);
+      k9Copy.stats.errors = (k9Copy.stats.errors || 0) + 1;
+      const logEntry = { ts: Date.now(), side: 'sell', outcome, shares, price: sellPrice, error: errMsg };
+      k9Copy.log.push(logEntry);
+      if (k9Copy.log.length > 100) k9Copy.log.shift();
+      broadcast({ type: 'k9_copy', action: 'error', ...logEntry });
+    }
   }
 }
 
@@ -608,16 +681,203 @@ let eventTimer = null;
 
 let manualEventOverride = false; // when true, skip auto-refresh to preserve user's manual selection
 
+// ── CTF Split/Merge: Python scripts via Safe wallet execTransaction ────────
+const SPLIT_SCRIPT = path.join(__dirname, 'scripts', 'split-position.py');
+const MERGE_SCRIPT = path.join(__dirname, 'scripts', 'merge-positions.py');
+
+let autoSplit = { enabled: true, amount: 200 }; // $200 USDC → 200 Up + 200 Down = 400 shares total
+
+function runPythonScript(scriptPath, args) {
+  return new Promise((resolve, reject) => {
+    execFile('python3', [scriptPath, ...args], {
+      timeout: 180_000, // 3 min max (approve + split can take time)
+      env: { ...process.env, POLYGON_RPC_URL: POLYGON_RPC },
+    }, (err, stdout, stderr) => {
+      if (stderr) console.error(`[PYTHON] stderr: ${stderr}`);
+      if (err) {
+        // Try to parse JSON error from stdout
+        try {
+          const result = JSON.parse(stdout);
+          return reject(new Error(result.error || err.message));
+        } catch (_) {}
+        return reject(err);
+      }
+      try {
+        const result = JSON.parse(stdout);
+        if (!result.success) return reject(new Error(result.error || 'Script failed'));
+        resolve(result);
+      } catch (e) {
+        reject(new Error(`Failed to parse script output: ${stdout}`));
+      }
+    });
+  });
+}
+
+async function executeSplit(amountUsd) {
+  if (!activeEvent?.conditionId) throw new Error('No conditionId for active event');
+
+  const safeAddr = FUNDER_ADDRESS;
+  if (!safeAddr) throw new Error('FUNDER_ADDRESS not set');
+  const privateKey = process.env.PRIVATE_KEY;
+  if (!privateKey) throw new Error('PRIVATE_KEY not set');
+
+  console.log(`[SPLIT] Splitting $${amountUsd} USDC → ${amountUsd} Up + ${amountUsd} Down on ${activeEvent.slug}`);
+  console.log(`[SPLIT] conditionId=${activeEvent.conditionId}, safe=${safeAddr?.slice(0, 10)}...`);
+
+  const result = await runPythonScript(SPLIT_SCRIPT, [
+    privateKey, safeAddr, activeEvent.conditionId, String(amountUsd),
+  ]);
+
+  console.log(`[SPLIT] Done! tx=${result.tx_hash}`);
+
+  // Record in DB — use activeEvent.slug (NOT liveState) so pre-split records under upcoming event
+  const slugForDb = activeEvent.slug || liveState.eventSlug;
+  const match = String(slugForDb).match(/(\d{10,})/);
+  const eventIdForDb = match ? parseInt(match[1]) : eventDbId();
+
+  const now = new Date().toISOString();
+  for (const dir of ['up', 'down']) {
+    await supabase.from('polymarket_trades').insert({
+      purchase_time: now,
+      polymarket_event_id: eventIdForDb,
+      direction: dir,
+      purchase_price: 0.50, // split = $1 per pair = $0.50 each
+      purchase_amount: amountUsd * 0.5,
+      shares: amountUsd,
+      order_status: 'filled',
+      order_type: 'live',
+      btc_price_at_purchase: liveState.btcCurrent,
+      notes: JSON.stringify({ type: 'ctf-split', txHash: result.tx_hash, amount: amountUsd }),
+    }).then(({ error }) => {
+      if (error) console.error(`[SPLIT] DB insert ${dir} error:`, error.message);
+    });
+  }
+
+  broadcast({ type: 'split', slug: activeEvent.slug, amount: amountUsd, txHash: result.tx_hash });
+
+  return {
+    txHash: result.tx_hash,
+    amount: amountUsd,
+    upShares: amountUsd,
+    downShares: amountUsd,
+  };
+}
+
+async function executeMerge(amountUsd) {
+  if (!activeEvent?.conditionId) throw new Error('No conditionId for active event');
+
+  const safeAddr = FUNDER_ADDRESS;
+  if (!safeAddr) throw new Error('FUNDER_ADDRESS not set');
+  const privateKey = process.env.PRIVATE_KEY;
+  if (!privateKey) throw new Error('PRIVATE_KEY not set');
+
+  console.log(`[MERGE] Merging ${amountUsd} pairs → $${amountUsd} USDC on ${activeEvent.slug}`);
+  console.log(`[MERGE] conditionId=${activeEvent.conditionId}, safe=${safeAddr}`);
+
+  const result = await runPythonScript(MERGE_SCRIPT, [
+    privateKey, safeAddr, activeEvent.conditionId, String(amountUsd),
+  ]);
+
+  console.log(`[MERGE] Done! tx=${result.tx_hash}`);
+
+  broadcast({ type: 'merge', slug: activeEvent.slug, amount: amountUsd, txHash: result.tx_hash });
+
+  return { txHash: result.tx_hash, amount: amountUsd };
+}
+
+let preSplitTimer = null;
+
 function scheduleNextEvent() {
   if (eventTimer) clearTimeout(eventTimer);
-  // Next 5-min boundary + 2s buffer for Polymarket to create it
+  if (preSplitTimer) clearTimeout(preSplitTimer);
+
   const now = Date.now();
   const nowSecs = Math.floor(now / 1000);
   const nextSlot = (Math.floor(nowSecs / 300) + 1) * 300;
+
+  // Pre-split: 15s BEFORE the next 5m boundary — retry every 2s until event is available
+  const PRE_SPLIT_START_SECONDS = 15;
+  const PRE_SPLIT_RETRY_MS = 2000;
+  const preSplitStartDelay = (nextSlot * 1000) - now - (PRE_SPLIT_START_SECONDS * 1000);
+
+  const runPreSplit = async () => {
+    const upcomingSlug = `btc-updown-5m-${nextSlot}`;
+    for (let attempt = 1; attempt <= 10; attempt++) {
+      try {
+        console.log(`[PRE-SPLIT] Attempt ${attempt}: fetching ${upcomingSlug}`);
+        const r = await fetch(`https://gamma-api.polymarket.com/events?slug=${upcomingSlug}`);
+        const data = await r.json();
+        const ev = Array.isArray(data) ? data[0] : data;
+        const cid = ev?.markets?.[0]?.conditionId;
+        if (cid) {
+          console.log(`[PRE-SPLIT] Found conditionId=${cid}, splitting $${autoSplit.amount}...`);
+          const prevConditionId = activeEvent?.conditionId;
+          const prevSlug = activeEvent?.slug;
+          if (activeEvent) activeEvent.conditionId = cid;
+          else activeEvent = { conditionId: cid, slug: upcomingSlug };
+          activeEvent.slug = upcomingSlug;
+          const result = await executeSplit(autoSplit.amount);
+          console.log(`[PRE-SPLIT] Success: $${result.amount} → ${result.upShares} Up + ${result.downShares} Down, tx=${result.txHash}`);
+          activeEvent._preSplitDone = nextSlot;
+          if (prevSlug && prevSlug !== upcomingSlug) {
+            activeEvent.conditionId = prevConditionId;
+            activeEvent.slug = prevSlug;
+          }
+          return;
+        }
+      } catch (e) {
+        console.error(`[PRE-SPLIT] Attempt ${attempt} failed:`, e.message);
+      }
+      const msToBoundary = (nextSlot * 1000) - Date.now();
+      if (msToBoundary < 2000) break; // too close, let fallback handle
+      await new Promise(r => setTimeout(r, PRE_SPLIT_RETRY_MS));
+    }
+    console.log(`[PRE-SPLIT] Event ${upcomingSlug} not available or split failed — fallback will try after refresh`);
+  };
+
+  // Pre-split always runs when enabled (even with manual override — split is for copy-trading)
+  if (autoSplit.enabled) {
+    if (preSplitStartDelay > 0) {
+      preSplitTimer = setTimeout(runPreSplit, preSplitStartDelay);
+      console.log(`[EVENT] Pre-split in ${Math.round(preSplitStartDelay / 1000)}s, refresh in ${Math.round((nextSlot * 1000 - now + 2000) / 1000)}s${manualEventOverride ? ' (manual override)' : ''}`);
+    } else if (preSplitStartDelay > -PRE_SPLIT_START_SECONDS * 1000) {
+      console.log(`[EVENT] Within ${PRE_SPLIT_START_SECONDS}s of boundary, pre-split now`);
+      runPreSplit();
+    }
+  }
+
+  // Main refresh: boundary + 2s (always schedule next)
   const delay = (nextSlot * 1000) - now + 2000;
-  console.log(`[EVENT] Next event in ${Math.round(delay / 1000)}s`);
   eventTimer = setTimeout(async () => {
-    if (!manualEventOverride) await refreshEvent();
+    if (!manualEventOverride) {
+      await refreshEvent();
+    } else {
+      // Manual override: don't switch UI, but still run split for the new event if needed
+      const upcomingSlug = `btc-updown-5m-${nextSlot}`;
+      const { data: rows } = await supabase.from('polymarket_trades').select('notes').eq('polymarket_event_id', nextSlot);
+      const ctfCount = (rows || []).filter(r => { try { return r.notes && JSON.parse(r.notes).type === 'ctf-split'; } catch { return false; } }).length;
+      if (autoSplit.enabled && ctfCount < 2) {
+        try {
+          const r = await fetch(`https://gamma-api.polymarket.com/events?slug=${upcomingSlug}`);
+          const j = await r.json();
+          const ev = Array.isArray(j) ? j[0] : j;
+          const cid = ev?.markets?.[0]?.conditionId;
+          if (cid) {
+            console.log(`[AUTO-SPLIT] Manual override: splitting for ${upcomingSlug}...`);
+            const prevCid = activeEvent?.conditionId;
+            const prevSlug = activeEvent?.slug;
+            if (activeEvent) activeEvent.conditionId = cid;
+            else activeEvent = { conditionId: cid, slug: upcomingSlug };
+            activeEvent.slug = upcomingSlug;
+            const result = await executeSplit(autoSplit.amount);
+            console.log(`[AUTO-SPLIT] Success: $${result.amount} → ${result.upShares} Up + ${result.downShares} Down, tx=${result.txHash}`);
+            if (prevSlug) { activeEvent.conditionId = prevCid; activeEvent.slug = prevSlug; }
+          }
+        } catch (e) {
+          console.error('[AUTO-SPLIT] Manual-override split failed:', e.message);
+        }
+      }
+    }
     scheduleNextEvent();
   }, delay);
 }
@@ -691,6 +951,36 @@ async function refreshEvent() {
     // Then connect WS for live streaming
     if (event.tokenUp && event.tokenDown) {
       connectClobStream([event.tokenUp, event.tokenDown]);
+    }
+    // Auto-split fallback: split if pre-split didn't run or we have no DB records
+    const slotMatch = event.slug?.match(/(\d{10,})/);
+    const eventSlot = slotMatch ? parseInt(slotMatch[1]) : 0;
+    const preSplitClaimed = activeEvent?._preSplitDone === eventSlot;
+
+    let shouldSplit = autoSplit.enabled && event.conditionId;
+    if (shouldSplit && preSplitClaimed) {
+      // Verify we actually have split records (pre-split may have recorded under wrong event before fix)
+      const { data: allForSlot } = await supabase
+        .from('polymarket_trades')
+        .select('notes')
+        .eq('polymarket_event_id', eventSlot);
+      const ctfSplitCount = (allForSlot || []).filter(r => {
+        try { return r.notes && JSON.parse(r.notes).type === 'ctf-split'; } catch { return false; }
+      }).length;
+      if (ctfSplitCount >= 2) {
+        console.log('[AUTO-SPLIT] Skipped — split already recorded for this event');
+        shouldSplit = false;
+      }
+    }
+
+    if (shouldSplit) {
+      console.log('[AUTO-SPLIT] Splitting now (pre-split missed or unverified)...');
+      try {
+        const result = await executeSplit(autoSplit.amount);
+        console.log(`[AUTO-SPLIT] Success: $${result.amount} → ${result.upShares} Up + ${result.downShares} Down, tx=${result.txHash}`);
+      } catch (e) {
+        console.error('[AUTO-SPLIT] Failed:', e.message);
+      }
     }
   }
 }
@@ -958,7 +1248,96 @@ app.post('/api/sell-all', async (req, res) => {
   }
 });
 
-// ── Buy Both (buy 10 UP + 10 DOWN at price - 1¢, GTC limits) ────────────────
+// ── CTF Split (convert USDC → Up + Down tokens) ──────────────────────────────
+app.post('/api/split', async (req, res) => {
+  const amount = parseFloat(req.body.amount) || autoSplit.amount;
+  if (!activeEvent) return res.status(400).json({ error: 'No active event' });
+  if (!activeEvent.conditionId) return res.status(400).json({ error: 'No conditionId for this event' });
+
+  try {
+    const result = await executeSplit(amount);
+    res.json({ success: true, ...result });
+  } catch (e) {
+    console.error('[SPLIT] Error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.get('/api/auto-split', (req, res) => {
+  res.json(autoSplit);
+});
+
+// Next-split status: when will pre-split fire, is everything ready?
+app.get('/api/split-status', (req, res) => {
+  const now = Date.now();
+  const nowSecs = Math.floor(now / 1000);
+  const nextSlot = (Math.floor(nowSecs / 300) + 1) * 300;
+  const preSplitStartDelay = (nextSlot * 1000) - now - (15 * 1000);
+  const refreshDelay = (nextSlot * 1000) - now + 2000;
+  const upcomingSlug = `btc-updown-5m-${nextSlot}`;
+  const nextSlotTime = new Date(nextSlot * 1000).toISOString();
+  const hasFunder = !!FUNDER_ADDRESS;
+  const hasKey = !!process.env.PRIVATE_KEY;
+  const scriptOk = fs.existsSync(SPLIT_SCRIPT);
+  res.json({
+    autoSplit: autoSplit.enabled,
+    amount: autoSplit.amount,
+    manualOverride: manualEventOverride,
+    nextSlot,
+    upcomingSlug,
+    nextSlotTime,
+    preSplitInSec: preSplitStartDelay > 0 ? Math.round(preSplitStartDelay / 1000) : 0,
+    refreshInSec: Math.round(refreshDelay / 1000),
+    ready: hasFunder && hasKey && scriptOk,
+    checks: { hasFunder, hasKey, scriptOk },
+  });
+});
+
+app.post('/api/auto-split', (req, res) => {
+  if (req.body.enabled !== undefined) autoSplit.enabled = !!req.body.enabled;
+  if (req.body.amount !== undefined) autoSplit.amount = parseFloat(req.body.amount) || 150;
+  console.log(`[AUTO-SPLIT] ${autoSplit.enabled ? 'ENABLED' : 'DISABLED'}, amount=$${autoSplit.amount}`);
+  res.json(autoSplit);
+});
+
+// Check if we split for a given event (from polymarket_trades with type: ctf-split)
+app.get('/api/split-check/:slug', async (req, res) => {
+  const slug = req.params.slug;
+  const match = slug?.match(/(\d{10,})/);
+  const eventId = match ? parseInt(match[1]) : null;
+  if (!eventId) return res.json({ slug, split: false, error: 'Invalid slug' });
+  const { data } = await supabase
+    .from('polymarket_trades')
+    .select('id, direction, shares, purchase_amount, purchase_time, notes')
+    .eq('polymarket_event_id', eventId)
+    .limit(10);
+  const splits = (data || []).filter(r => {
+    try {
+      const n = r.notes ? JSON.parse(r.notes) : {};
+      return n.type === 'ctf-split';
+    } catch { return false; }
+  });
+  const split = splits.length >= 2; // up + down
+  const amount = splits[0] ? (JSON.parse(splits[0].notes || '{}').amount ?? null) : null;
+  res.json({ slug, eventId, split, amount, records: splits.length });
+});
+
+app.post('/api/merge', async (req, res) => {
+  const amount = parseFloat(req.body.amount) || 0;
+  if (!amount) return res.status(400).json({ error: 'amount required' });
+  if (!activeEvent) return res.status(400).json({ error: 'No active event' });
+  if (!activeEvent.conditionId) return res.status(400).json({ error: 'No conditionId for this event' });
+
+  try {
+    const result = await executeMerge(amount);
+    res.json({ success: true, ...result });
+  } catch (e) {
+    console.error('[MERGE] Error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ── Buy Both (buy 10 UP + 10 DOWN at current price, GTC limits) ────────────────
 app.post('/api/buy-both', async (req, res) => {
   if (!activeEvent) return res.status(400).json({ error: 'No active event' });
   if (!clobClient) return res.status(500).json({ error: 'CLOB client not ready' });
@@ -969,8 +1348,8 @@ app.post('/api/buy-both', async (req, res) => {
   const tick = parseFloat(tickSize);
   const negRisk = activeEvent.negRisk || false;
   const shares = 10;
-  const upBuyPrice = Math.max(Math.round((liveState.upPrice - 0.01) / tick) * tick, 0.01);
-  const downBuyPrice = Math.max(Math.round((liveState.downPrice - 0.01) / tick) * tick, 0.01);
+  const upBuyPrice = Math.max(Math.round(liveState.upPrice / tick) * tick, 0.01);
+  const downBuyPrice = Math.max(Math.round(liveState.downPrice / tick) * tick, 0.01);
   const upSizeUsd = Math.round(shares * upBuyPrice * 100) / 100;
   const downSizeUsd = Math.round(shares * downBuyPrice * 100) / 100;
   const totalNeeded = upSizeUsd + downSizeUsd;
@@ -1069,7 +1448,7 @@ app.post('/api/buy-both', async (req, res) => {
   }
 });
 
-// ── Buy Then Sell Both: buy 10 each at p-1¢, when filled place sell at p+1¢ ──
+// ── Buy Then Sell Both: buy 10 each at current price, when filled place sell at p+1¢ ──
 app.post('/api/buy-then-sell-both', async (req, res) => {
   if (!activeEvent) return res.status(400).json({ error: 'No active event' });
   if (!clobClient) return res.status(500).json({ error: 'CLOB client not ready' });
@@ -1080,8 +1459,8 @@ app.post('/api/buy-then-sell-both', async (req, res) => {
   const tick = parseFloat(tickSize);
   const negRisk = activeEvent.negRisk || false;
   const shares = 10;
-  const upBuyPrice = Math.max(Math.round((liveState.upPrice - 0.01) / tick) * tick, 0.01);
-  const downBuyPrice = Math.max(Math.round((liveState.downPrice - 0.01) / tick) * tick, 0.01);
+  const upBuyPrice = Math.max(Math.round(liveState.upPrice / tick) * tick, 0.01);
+  const downBuyPrice = Math.max(Math.round(liveState.downPrice / tick) * tick, 0.01);
   const upSizeUsd = Math.round(shares * upBuyPrice * 100) / 100;
   const downSizeUsd = Math.round(shares * downBuyPrice * 100) / 100;
   const totalNeeded = upSizeUsd + downSizeUsd;
@@ -1412,11 +1791,11 @@ app.post('/api/super-rewards', async (req, res) => {
 
   const tickSize = activeEvent.tickSize || '0.01';
   const tick = parseFloat(tickSize);
-  const buyPrice = Math.max(Math.round((price - 0.01) / tick) * tick, 0.01);
+  const buyPrice = Math.max(Math.round(price / tick) * tick, 0.01);
   const shares = 50;
 
   try {
-    console.log(`[SUPER-REWARDS] ${side.toUpperCase()} BUY ${shares}@${buyPrice} (limit -1¢)`);
+    console.log(`[SUPER-REWARDS] ${side.toUpperCase()} BUY ${shares}@${buyPrice} (limit 0¢)`);
     const negRisk = activeEvent.negRisk || false;
     const buyOrder = await clobClient.createOrder({ tokenID: tokenId, price: buyPrice, size: shares, side: 'BUY' }, { tickSize, negRisk });
     const buyResult = await clobClient.postOrder(buyOrder, 'GTC');
@@ -1503,11 +1882,12 @@ app.post('/api/cancel', async (req, res) => {
 
 // ── K9 Copy-Trading endpoints ────────────────────────────────────────────────
 app.post('/api/k9-copy/start', async (req, res) => {
-  const { slug, pct, eventTime, batchMode } = req.body || {};
+  const { slug, pct, eventTime, batchMode, orderType } = req.body || {};
   k9Copy.pct = pct || 0.01;
   k9Copy.targetSlug = slug || null;
   k9Copy.eventTime = eventTime || '';
   k9Copy.batchMode = (batchMode === 'cum50' ? 'cum50' : 'min5');
+  k9Copy.orderType = (orderType === 'GTC' ? 'GTC' : 'FAK');
   resetCopyBuffer();
   k9Copy.stats = { buys: 0, sells: 0, usdcSpent: 0, usdcReceived: 0, skipped: 0 };
   k9Copy.log = [];
@@ -1520,8 +1900,8 @@ app.post('/api/k9-copy/start', async (req, res) => {
 
   k9Copy.enabled = true;
   saveK9CopyState();
-  console.log(`[k9-copy] ENABLED — target: ${slug || 'ALL'}, eventTime: ${k9Copy.eventTime || 'all'}, pct: ${k9Copy.pct * 100}%, batch: ${k9Copy.batchMode}`);
-  res.json({ success: true, k9Copy: { enabled: true, targetSlug: k9Copy.targetSlug, eventTime: k9Copy.eventTime, pct: k9Copy.pct, batchMode: k9Copy.batchMode } });
+  console.log(`[k9-copy] ENABLED — target: ${slug || 'ALL'}, eventTime: ${k9Copy.eventTime || 'all'}, pct: ${k9Copy.pct * 100}%, order: ${k9Copy.orderType}`);
+  res.json({ success: true, k9Copy: { enabled: true, targetSlug: k9Copy.targetSlug, eventTime: k9Copy.eventTime, pct: k9Copy.pct, batchMode: k9Copy.batchMode, orderType: k9Copy.orderType } });
 });
 
 app.post('/api/k9-copy/stop', (req, res) => {
@@ -1531,6 +1911,15 @@ app.post('/api/k9-copy/stop', (req, res) => {
   res.json({ success: true, stats: k9Copy.stats, log: k9Copy.log });
 });
 
+// Reset stuck pending state (if an order hung and blocked the queue)
+app.post('/api/k9-copy/reset-stuck', (req, res) => {
+  const wasPending = k9Copy.pending;
+  k9Copy.pending = false;
+  console.log(`[k9-copy] Reset stuck — was pending: ${wasPending}, queue: ${k9Copy.queue.length}`);
+  if (k9Copy.queue.length) setTimeout(processCopyQueue, 100);
+  res.json({ success: true, wasPending, queueLength: k9Copy.queue.length });
+});
+
 app.get('/api/k9-copy/status', (req, res) => {
   res.json({
     enabled: k9Copy.enabled,
@@ -1538,6 +1927,7 @@ app.get('/api/k9-copy/status', (req, res) => {
     eventTime: k9Copy.eventTime,
     pct: k9Copy.pct,
     batchMode: k9Copy.batchMode,
+    orderType: k9Copy.orderType,
     buffer: k9Copy.buffer,
     stats: k9Copy.stats,
     queueLength: k9Copy.queue.length,
@@ -1645,6 +2035,50 @@ app.get('/api/positions', async (req, res) => {
 // ── Active event ───────────────────────────────────────────────────────────
 app.get('/api/event', (req, res) => res.json({ event: activeEvent, liveState }));
 
+// ── Shared slug cache (avoids slow 169K row scans on every request) ────────
+let _slugCache = { k9Slugs: {}, snapSlugs: [], analysisSlugs: [], updatedAt: 0 };
+const SLUG_CACHE_TTL = 60_000; // refresh every 60s
+
+async function getSlugCache() {
+  if (Date.now() - _slugCache.updatedAt < SLUG_CACHE_TTL) return _slugCache;
+  try {
+    // Use parallel sampling to get all distinct slugs from k9_observed_trades
+    const { count } = await supabase.from('k9_observed_trades').select('*', { count: 'exact', head: true });
+    const total = count || 0;
+    const k9Slugs = {};
+    if (total > 0) {
+      const chunkSize = 1000;
+      const numChunks = Math.min(Math.ceil(total / chunkSize), 200);
+      const step = Math.max(1, Math.floor(total / numChunks));
+      const fetches = [];
+      for (let i = 0; i < numChunks; i++) {
+        const offset = i * step;
+        fetches.push(supabase.from('k9_observed_trades').select('slug').range(offset, offset + chunkSize - 1));
+      }
+      const results = await Promise.all(fetches);
+      for (const { data } of results) {
+        if (data) for (const r of data) k9Slugs[r.slug] = (k9Slugs[r.slug] || 0) + 1;
+      }
+    }
+    const [{ data: snapRows }, { data: analysisRows }] = await Promise.all([
+      supabase.from('polymarket_15m_snapshots').select('event_slug, observed_at').order('observed_at', { ascending: false }).limit(5000),
+      supabase.from('price_change_analysis').select('event_name, time').order('time', { ascending: false }).limit(10000),
+    ]);
+    _slugCache = {
+      k9Slugs,
+      snapSlugs: [...new Set((snapRows || []).map(r => r.event_slug).filter(Boolean))],
+      analysisSlugs: (analysisRows || []).map(r => r.event_name).filter(Boolean),
+      updatedAt: Date.now(),
+    };
+    console.log(`[slug-cache] Refreshed: ${Object.keys(k9Slugs).length} k9 slugs, ${_slugCache.snapSlugs.length} snap slugs`);
+  } catch (e) {
+    console.error('[slug-cache] Error:', e.message);
+  }
+  return _slugCache;
+}
+// Pre-warm cache on startup
+setTimeout(() => getSlugCache(), 3000);
+
 // ── Event search (DB + generated slugs) ───────────────────────────────────
 const MONTH_NAMES = ['january','february','march','april','may','june','july','august','september','october','november','december'];
 
@@ -1736,35 +2170,18 @@ app.get('/api/event-search', async (req, res) => {
     const { duration, date, q } = req.query;
     const limit = parseInt(req.query.limit) || 100;
 
-    // 1. Get DB slugs for enrichment (paginate k9 trades since table is 100K+)
-    async function getK9Slugs() {
-      const slugCounts = {};
-      let offset = 0;
-      while (offset < 200000) {
-        const { data } = await supabase.from('k9_observed_trades')
-          .select('slug').order('trade_timestamp', { ascending: true }).range(offset, offset + 999);
-        if (!data || !data.length) break;
-        for (const r of data) slugCounts[r.slug] = (slugCounts[r.slug] || 0) + 1;
-        offset += 1000;
-      }
-      return slugCounts;
-    }
-    const [k9SlugCounts, { data: snapSlugs }, { data: analysisSlugs }] = await Promise.all([
-      getK9Slugs(),
-      supabase.from('polymarket_15m_snapshots').select('event_slug, observed_at').order('observed_at', { ascending: false }).limit(10000),
-      supabase.from('price_change_analysis').select('event_name, time').order('time', { ascending: false }).limit(10000),
-    ]);
-
+    // 1. Get DB slugs from cache (fast!)
+    const cache = await getSlugCache();
     const dbMap = {};
-    function addDb(slug, time, source, count) {
+    function addDb(slug, source, count) {
       if (!slug) return;
       if (!dbMap[slug]) dbMap[slug] = { sources: new Set(), count: 0 };
       dbMap[slug].sources.add(source);
       dbMap[slug].count += (count || 1);
     }
-    for (const r of (snapSlugs || [])) addDb(r.event_slug, r.observed_at, 'snapshots');
-    for (const [slug, count] of Object.entries(k9SlugCounts)) addDb(slug, null, 'k9', count);
-    for (const r of (analysisSlugs || [])) addDb(r.event_name, r.time, 'analysis');
+    for (const s of cache.snapSlugs) addDb(s, 'snapshots');
+    for (const [slug, count] of Object.entries(cache.k9Slugs)) addDb(slug, 'k9', count);
+    for (const s of cache.analysisSlugs) addDb(s, 'analysis');
 
     // 2. Generate slugs based on filters
     const durs = duration ? [duration] : ['5m', '15m', '1h'];
@@ -2095,26 +2512,11 @@ app.get('/api/sim-dashboard', async (req, res) => {
   const { duration, date } = req.query;
 
   try {
-    // Paginate k9_observed_trades to get ALL distinct slugs (table can be 100K+ rows)
-    async function getAllDistinctSlugs() {
-      const allSlugs = new Set();
-      let offset = 0;
-      while (offset < 200000) {
-        const { data } = await supabase.from('k9_observed_trades')
-          .select('slug').order('trade_timestamp', { ascending: true }).range(offset, offset + 999);
-        if (!data || !data.length) break;
-        for (const r of data) allSlugs.add(r.slug);
-        offset += 1000;
-      }
-      return [...allSlugs];
-    }
-    const [k9Slugs, { data: snapRows }] = await Promise.all([
-      getAllDistinctSlugs(),
-      supabase.from('polymarket_15m_snapshots').select('event_slug, observed_at').order('observed_at', { ascending: false }).limit(5000),
-    ]);
-    const snapSlugs = [...new Set((snapRows || []).map(r => r.event_slug).filter(Boolean))];
+    // Get ALL distinct slugs from cache (fast!)
+    const cache = await getSlugCache();
+    const k9Slugs = Object.keys(cache.k9Slugs);
     const seen = new Set(k9Slugs);
-    for (const s of snapSlugs) {
+    for (const s of cache.snapSlugs) {
       if (!seen.has(s)) { seen.add(s); k9Slugs.push(s); }
     }
     let slugSet = k9Slugs;
@@ -2172,27 +2574,29 @@ app.get('/api/sim-dashboard', async (req, res) => {
     slugSet = slugSet.slice(0, limit);
     if (!slugSet.length) return res.json({ events: [], totals: {} });
 
-    // Fetch k9 trades for all slugs (chunk to avoid Supabase in() URL limits)
-    async function fetchAll(slugs) {
-      const CHUNK = 80; // safe batch size for in() clause
+    // Fetch k9 trades for all slugs in parallel batches
+    async function fetchBatch(batch) {
       let all = [];
-      for (let i = 0; i < slugs.length; i += CHUNK) {
-        const batch = slugs.slice(i, i + CHUNK);
-        let offset = 0;
-        const PAGE = 1000;
-        while (true) {
-          const { data } = await supabase.from('k9_observed_trades')
-            .select('*').in('slug', batch).order('trade_timestamp', { ascending: true })
-            .range(offset, offset + PAGE - 1);
-          if (!data || !data.length) break;
-          all = all.concat(data);
-          if (data.length < PAGE) break;
-          offset += PAGE;
-        }
+      let offset = 0;
+      const PAGE = 1000;
+      while (true) {
+        const { data } = await supabase.from('k9_observed_trades')
+          .select('*').in('slug', batch).order('trade_timestamp', { ascending: true })
+          .range(offset, offset + PAGE - 1);
+        if (!data || !data.length) break;
+        all = all.concat(data);
+        if (data.length < PAGE) break;
+        offset += PAGE;
       }
       return all;
     }
-    const obs = await fetchAll(slugSet);
+    const CHUNK = 10; // smaller chunks run in parallel
+    const batches = [];
+    for (let i = 0; i < slugSet.length; i += CHUNK) {
+      batches.push(slugSet.slice(i, i + CHUNK));
+    }
+    const batchResults = await Promise.all(batches.map(b => fetchBatch(b)));
+    const obs = batchResults.flat();
 
     const events = slugSet.map(slug => {
       const k9Trades = (obs || []).filter(t => t.slug === slug);
@@ -2272,8 +2676,10 @@ app.get('/api/sim-dashboard', async (req, res) => {
         if (!bySecond[sec]) bySecond[sec] = [];
         bySecond[sec].push(t);
       }
-      // For each second, find net direction per outcome and place sim trade
-      for (const [sec, trades] of Object.entries(bySecond)) {
+      // Process seconds in chronological order (critical for fill logic)
+      const sortedSeconds = Object.keys(bySecond).map(Number).sort((a, b) => a - b);
+      for (const sec of sortedSeconds) {
+        const trades = bySecond[sec];
         // Aggregate net shares per outcome in this second
         const netByOutcome = {};
         for (const t of trades) {
@@ -2336,9 +2742,9 @@ app.get('/api/sim-dashboard', async (req, res) => {
             if (mode === '5sh') orderQty = 5;
             else if (mode === '1usd') orderQty = 1 / limitPrice;
             else if (PCT_BY_MODE[mode]) {
-              const secNotional = agg.usdcGross || Math.abs(agg.usdc);
-              if (secNotional < 0.01) continue;
               const pct = PCT_BY_MODE[mode];
+              const ourNotional = Math.abs(agg.usdc) * pct;
+              if (ourNotional < 0.01) continue; // match live: skip if our copy size < 1¢
               const signalQty = Math.abs(agg.shares) * pct;
               if (CUM50_PCT_MODES.has(mode)) {
                 if (side === 'buy') {
@@ -2354,8 +2760,18 @@ app.get('/api/sim-dashboard', async (req, res) => {
                   book.queuedSell = Math.max(0, (book.queuedSell || 0) - orderQty);
                 }
               } else if (MIN5_PCT_MODES.has(mode)) {
-                orderQty = signalQty;
-                if (orderQty < 5) continue; // min 5 units per trigger
+                if (side === 'buy') {
+                  book.queuedBuy = (book.queuedBuy || 0) + signalQty;
+                  if (book.queuedBuy < 5) continue;
+                  orderQty = Math.floor(book.queuedBuy * 100) / 100;
+                  book.queuedBuy = Math.max(0, book.queuedBuy - orderQty);
+                } else {
+                  book.queuedSell = (book.queuedSell || 0) + signalQty;
+                  const available = Math.min(book.queuedSell, book.shares);
+                  if (available < 5) continue;
+                  orderQty = Math.floor(available * 100) / 100;
+                  book.queuedSell = Math.max(0, (book.queuedSell || 0) - orderQty);
+                }
               }
             }
             if (orderQty <= 0) continue;
@@ -2374,6 +2790,32 @@ app.get('/api/sim-dashboard', async (req, res) => {
             book.pending.push(ord);
             simMeta[mode].triggerCount += 1;
             simMeta[mode].triggers.push({ ts: Number(sec), side, outcome, shares: orderQty, price: limitPrice, notional: orderQty * limitPrice });
+          }
+        }
+      }
+      // Settle any remaining pending orders (assume they fill at limit price)
+      // Without this, we'd show "cost $0 · pending" for events with sparse fills
+      for (const mode of SIM_MODES) {
+        for (const outcome of ['Up', 'Down']) {
+          const book = sim[mode][outcome];
+          const pending = book.pending || [];
+          book.pending = [];
+          for (const ord of pending) {
+            if (ord.side === 'buy') {
+              book.shares += ord.remaining;
+              book.cost += ord.remaining * ord.price;
+              simMeta[mode].fills.push({ ts: ord.placedTs, side: 'buy', outcome, shares: ord.remaining, price: ord.price, notional: ord.remaining * ord.price });
+            } else {
+              const fillQty = Math.min(ord.remaining, book.shares);
+              if (fillQty < 0.000001) continue;
+              const avgBuy = book.shares > 0 ? (book.cost / book.shares) : ord.price;
+              const proceeds = fillQty * ord.price;
+              const basis = fillQty * avgBuy;
+              book.shares -= fillQty;
+              book.cost -= basis;
+              book.realized = (book.realized || 0) + (proceeds - basis);
+              simMeta[mode].fills.push({ ts: ord.placedTs, side: 'sell', outcome, shares: fillQty, price: ord.price, notional: fillQty * ord.price });
+            }
           }
         }
       }
@@ -2487,20 +2929,23 @@ app.get('/api/sim-dashboard', async (req, res) => {
 // ── k9 live trades ─────────────────────────────────────────────────────────
 app.get('/api/k9-trades', async (req, res) => {
   const limit = parseInt(req.query.limit || '20');
+  const slugParam = req.query.slug || req.query.slugs;
   try {
-    // Paginate to get ALL distinct slugs (table can be 100K+ rows)
-    const allSlugs = new Set();
-    let offset = 0;
-    while (offset < 200000) {
-      const { data } = await supabase.from('k9_observed_trades')
-        .select('slug').order('trade_timestamp', { ascending: false }).range(offset, offset + 999);
-      if (!data || !data.length) break;
-      for (const r of data) allSlugs.add(r.slug);
-      offset += 1000;
-      if (allSlugs.size >= limit) break; // got enough distinct slugs
+    let slugSet = [];
+    if (slugParam) {
+      slugSet = slugParam.split(/[\s,]+/).map(s => s.trim()).filter(Boolean);
+      if (slugSet.length > 50) slugSet = slugSet.slice(0, 50);
     }
-
-    const slugSet = [...allSlugs].slice(0, limit);
+    if (slugSet.length === 0) {
+      const cache = await getSlugCache();
+      const allSlugs = Object.keys(cache.k9Slugs);
+      allSlugs.sort((a, b) => {
+        const ea = parseInt((a.match(/(\d{10,})/) || [0, 0])[1]) || 0;
+        const eb = parseInt((b.match(/(\d{10,})/) || [0, 0])[1]) || 0;
+        return eb - ea;
+      });
+      slugSet = allSlugs.slice(0, limit);
+    }
     if (!slugSet.length) return res.json({ events: [] });
 
     const { data: trades } = await supabase
@@ -2509,15 +2954,36 @@ app.get('/api/k9-trades', async (req, res) => {
       .in('slug', slugSet)
       .order('trade_timestamp', { ascending: true });
 
-    const { data: ourTrades } = await supabase
-      .from('polymarket_copy_trades')
-      .select('*')
-      .eq('coin', 'k9-15m')
-      .order('purchase_time', { ascending: true });
+    // Our trades: try polymarket_copy_trades first, then Polymarket API
+    let ourTradesFromDb = [];
+    try {
+      const { data } = await supabase.from('polymarket_copy_trades')
+        .select('*').eq('coin', 'k9-15m').order('purchase_time', { ascending: true });
+      ourTradesFromDb = data || [];
+    } catch {}
+
+    const ourWallet = (process.env.PROXY_WALLET || process.env.FUNDER_ADDRESS || '').toLowerCase();
+    let ourTradesFromPoly = [];
+    if (ourWallet) {
+      try {
+        const r = await fetch(`https://data-api.polymarket.com/trades?user=${ourWallet}&limit=500`);
+        const poly = await r.json();
+        ourTradesFromPoly = (poly || []).map(t => {
+          const sh = parseFloat(t.size || 0);
+          const pr = parseFloat(t.price || 0);
+          const amt = sh * pr;
+          const side = (t.side || '').toLowerCase();
+          const outcome = (t.outcome || '').includes('Up') ? 'up' : 'down';
+          return { slug: t.eventSlug || t.slug, direction: outcome, purchase_amount: side === 'buy' ? amt : -amt, shares: side === 'buy' ? sh : -sh };
+        }).filter(t => t.slug);
+      } catch (e) { console.error('[k9-trades] Polymarket API error:', e.message); }
+    }
 
     const events = slugSet.map(slug => {
       const k9 = (trades || []).filter(t => t.slug === slug);
-      const ours = (ourTrades || []).filter(t => (t.notes || '').includes(slug));
+      const oursDb = (ourTradesFromDb || []).filter(t => (t.notes || '').includes(slug));
+      const oursPoly = (ourTradesFromPoly || []).filter(t => t.slug === slug);
+      const ours = oursDb.length ? oursDb : oursPoly;
       const summary = {};
       for (const side of ['Up', 'Down']) {
         const k9s = k9.filter(t => t.outcome === side);
@@ -2549,6 +3015,213 @@ app.get('/api/k9-trades', async (req, res) => {
   } catch (e) {
     console.error('/api/k9-trades error:', e.message);
     res.json({ events: [], error: e.message });
+  }
+});
+
+// ── k9 compare: k9 vs our trades with resolution & PnL (for copy-trade analysis) ─
+app.get('/api/k9-compare', async (req, res) => {
+  let slugs = (req.query.slug || req.query.slugs || '').split(/[\s,]+/).map(s => s.trim()).filter(Boolean);
+  const ourWallet = (process.env.PROXY_WALLET || process.env.FUNDER_ADDRESS || '').toLowerCase();
+
+  if (!slugs.length || slugs[0] === 'auto') {
+    if (ourWallet) {
+      try {
+        const r = await fetch(`https://data-api.polymarket.com/trades?user=${ourWallet}&limit=200`);
+        const trades = await r.json();
+        slugs = [...new Set((trades || []).map(t => t.eventSlug || t.slug).filter(Boolean))].slice(0, 20);
+      } catch (e) {}
+    }
+  }
+  if (!slugs.length) return res.json({ events: [], error: 'Provide ?slug= or ?slugs= or ?slugs=auto' });
+  const slugSet = slugs.slice(0, 30);
+
+  try {
+    const [{ data: k9Trades }, ourTradesFromPoly] = await Promise.all([
+      supabase.from('k9_observed_trades').select('*').in('slug', slugSet).order('trade_timestamp', { ascending: true }),
+      ourWallet ? fetch(`https://data-api.polymarket.com/trades?user=${ourWallet}&limit=500`).then(r => r.json()).catch(() => []) : [],
+    ]);
+
+    const ours = (ourTradesFromPoly || []).map(t => {
+      const sh = parseFloat(t.size || 0);
+      const pr = parseFloat(t.price || 0);
+      const side = (t.side || '').toLowerCase();
+      const outcome = (t.outcome || '').includes('Up') ? 'up' : 'down';
+      return { slug: t.eventSlug || t.slug, direction: outcome, purchase_amount: side === 'buy' ? sh * pr : -sh * pr, shares: side === 'buy' ? sh : -sh };
+    }).filter(t => t.slug);
+
+    const resolutions = await Promise.all(slugSet.map(s => getResolution(s)));
+
+    const events = slugSet.map((slug, i) => {
+      const k9 = (k9Trades || []).filter(t => t.slug === slug);
+      const our = ours.filter(t => t.slug === slug);
+      const res = resolutions[i] || {};
+
+      const k9BySide = { Up: { usdc: 0, shares: 0 }, Down: { usdc: 0, shares: 0 } };
+      for (const t of k9) {
+        k9BySide[t.outcome].usdc += parseFloat(t.usdc_size || 0);
+        k9BySide[t.outcome].shares += parseFloat(t.shares || 0);
+      }
+
+      const ourBySide = { Up: { usdc: 0, shares: 0 }, Down: { usdc: 0, shares: 0 } };
+      for (const t of our) {
+        ourBySide[t.direction === 'up' ? 'Up' : 'Down'].usdc += parseFloat(t.purchase_amount || 0);
+        ourBySide[t.direction === 'up' ? 'Up' : 'Down'].shares += parseFloat(t.shares || 0);
+      }
+
+      const winner = res?.winner;
+      const k9Pnl = winner
+        ? (winner === 'Up' ? k9BySide.Up.shares : k9BySide.Down.shares) - (k9BySide.Up.usdc + k9BySide.Down.usdc)
+        : null;
+      const ourPnl = winner
+        ? (winner === 'Up' ? ourBySide.Up.shares : ourBySide.Down.shares) - (ourBySide.Up.usdc + ourBySide.Down.usdc)
+        : null;
+
+      const k9Total = k9BySide.Up.usdc + k9BySide.Down.usdc;
+      const ourTotal = ourBySide.Up.usdc + ourBySide.Down.usdc;
+      const ratio = k9Total > 0 ? (ourTotal / Math.abs(k9Total)) * 100 : null;
+
+      return {
+        slug,
+        winner,
+        k9: { usdc: k9Total, shares: k9BySide.Up.shares + k9BySide.Down.shares, trades: k9.length, pnl: k9Pnl },
+        ours: { usdc: ourTotal, shares: ourBySide.Up.shares + ourBySide.Down.shares, trades: our.length, pnl: ourPnl },
+        ratio,
+      };
+    });
+
+    res.json({ events });
+  } catch (e) {
+    console.error('/api/k9-compare error:', e.message);
+    res.json({ events: [], error: e.message });
+  }
+});
+
+// ── Event detail: all k9 + our trades + P&L for a single event ────────────
+app.get('/api/event-detail/:slug', async (req, res) => {
+  const { slug } = req.params;
+  if (!slug) return res.json({ error: 'Missing slug' });
+  const ourWallet = (process.env.PROXY_WALLET || process.env.FUNDER_ADDRESS || '').toLowerCase();
+
+  try {
+    // Fetch k9 trades for this slug (paginate for large events)
+    let k9Trades = [];
+    let offset = 0;
+    while (true) {
+      const { data } = await supabase.from('k9_observed_trades')
+        .select('*').eq('slug', slug).order('trade_timestamp', { ascending: true })
+        .range(offset, offset + 999);
+      if (!data || !data.length) break;
+      k9Trades = k9Trades.concat(data);
+      if (data.length < 1000) break;
+      offset += 1000;
+    }
+
+    // Fetch our trades from Polymarket API
+    let ourTrades = [];
+    if (ourWallet) {
+      try {
+        const r = await fetch(`https://data-api.polymarket.com/trades?user=${ourWallet}&limit=500`);
+        const poly = await r.json();
+        ourTrades = (poly || []).filter(t => (t.eventSlug || t.slug) === slug).map(t => ({
+          outcome: (t.outcome || '').includes('Up') ? 'Up' : 'Down',
+          side: (t.side || '').toLowerCase(),
+          price: parseFloat(t.price || 0),
+          shares: parseFloat(t.size || 0),
+          usdc: parseFloat(t.size || 0) * parseFloat(t.price || 0),
+          ts: t.timestamp ? new Date(t.timestamp).getTime() / 1000 : 0,
+          source: 'polymarket',
+        }));
+      } catch {}
+    }
+
+    // Resolution
+    const resolution = await getResolution(slug);
+
+    // Build k9 summary
+    const k9Summary = {};
+    for (const side of ['Up', 'Down']) {
+      const kt = k9Trades.filter(t => t.outcome === side);
+      const buys = kt.filter(t => parseFloat(t.shares) > 0);
+      const sells = kt.filter(t => parseFloat(t.shares) < 0);
+      const buyUsdc = buys.reduce((s, t) => s + parseFloat(t.usdc_size), 0);
+      const buyShares = buys.reduce((s, t) => s + parseFloat(t.shares), 0);
+      const sellUsdc = sells.reduce((s, t) => s + Math.abs(parseFloat(t.usdc_size)), 0);
+      const sellShares = sells.reduce((s, t) => s + Math.abs(parseFloat(t.shares)), 0);
+      const avgBuyPrice = buyShares > 0 ? buyUsdc / buyShares : 0;
+      k9Summary[side] = {
+        buyUsdc, buyShares, sellUsdc, sellShares, avgBuyPrice,
+        netShares: buyShares - sellShares,
+        tradeCount: kt.length,
+        sellPnl: sellShares > 0 ? sellUsdc - (sellShares * avgBuyPrice) : 0,
+      };
+    }
+
+    // Build our summary
+    const ourSummary = {};
+    for (const side of ['Up', 'Down']) {
+      const ot = ourTrades.filter(t => t.outcome === side);
+      const buys = ot.filter(t => t.side === 'buy');
+      const sells = ot.filter(t => t.side === 'sell');
+      const buyUsdc = buys.reduce((s, t) => s + t.usdc, 0);
+      const buyShares = buys.reduce((s, t) => s + t.shares, 0);
+      const sellUsdc = sells.reduce((s, t) => s + t.usdc, 0);
+      const sellShares = sells.reduce((s, t) => s + t.shares, 0);
+      const avgBuyPrice = buyShares > 0 ? buyUsdc / buyShares : 0;
+      ourSummary[side] = {
+        buyUsdc, buyShares, sellUsdc, sellShares, avgBuyPrice,
+        netShares: buyShares - sellShares,
+        tradeCount: ot.length,
+        sellPnl: sellShares > 0 ? sellUsdc - (sellShares * avgBuyPrice) : 0,
+      };
+    }
+
+    // P&L calculations
+    const winner = resolution?.winner;
+    function calcPnl(summary) {
+      if (!winner) return null;
+      const winSide = summary[winner] || {};
+      const loseSide = summary[winner === 'Up' ? 'Down' : 'Up'] || {};
+      const payout = winSide.netShares || 0;
+      const totalCost = (summary.Up?.buyUsdc || 0) + (summary.Down?.buyUsdc || 0);
+      const totalSellProceeds = (summary.Up?.sellUsdc || 0) + (summary.Down?.sellUsdc || 0);
+      return payout + totalSellProceeds - totalCost;
+    }
+
+    // Combined feed (k9 + ours, sorted by time)
+    const k9Feed = k9Trades.map(t => ({
+      who: 'k9',
+      outcome: t.outcome,
+      side: parseFloat(t.shares) > 0 ? 'buy' : 'sell',
+      price: parseFloat(t.price),
+      shares: Math.abs(parseFloat(t.shares)),
+      usdc: Math.abs(parseFloat(t.usdc_size)),
+      ts: parseFloat(t.trade_timestamp),
+    }));
+    const ourFeed = ourTrades.map(t => ({
+      who: 'us',
+      outcome: t.outcome,
+      side: t.side,
+      price: t.price,
+      shares: t.shares,
+      usdc: t.usdc,
+      ts: t.ts,
+    }));
+    const combinedFeed = [...k9Feed, ...ourFeed].sort((a, b) => a.ts - b.ts);
+
+    res.json({
+      slug,
+      resolution,
+      k9Summary,
+      ourSummary,
+      k9Pnl: calcPnl(k9Summary),
+      ourPnl: calcPnl(ourSummary),
+      k9TradeCount: k9Trades.length,
+      ourTradeCount: ourTrades.length,
+      feed: combinedFeed,
+    });
+  } catch (e) {
+    console.error('/api/event-detail error:', e.message);
+    res.json({ error: e.message });
   }
 });
 
@@ -3095,6 +3768,9 @@ server.listen(PORT, async () => {
   connectBinanceStream();
   startPricePoll();
   scheduleNextEvent();
+  const splitReady = !!FUNDER_ADDRESS && !!process.env.PRIVATE_KEY;
+  const scriptExists = fs.existsSync(SPLIT_SCRIPT);
+  console.log(`[SPLIT] autoSplit=${autoSplit.enabled ? 'ON' : 'OFF'}, amount=$${autoSplit.amount}, ready=${splitReady}, script=${scriptExists}`);
   await seedK9SeenTx();
   connectK9Watcher();
   // HTTP poll fallback: catch missed WS events every 15s
