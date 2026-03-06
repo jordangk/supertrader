@@ -3,8 +3,10 @@ import { useEffect, useRef, useState } from 'react';
 export function useWebSocket() {
   const [prices, setPrices] = useState({ upPrice: null, downPrice: null, upStartPrice: null, downStartPrice: null });
   const [btc, setBtc] = useState({ current: null, start: null });
+  const [binanceBtc, setBinanceBtc] = useState(null);
   const [event, setEvent] = useState(null);
   const [autoSell, setAutoSell] = useState(null);
+  const [refreshTrigger, setRefreshTrigger] = useState(0);
   const ws = useRef(null);
 
   useEffect(() => {
@@ -39,8 +41,12 @@ export function useWebSocket() {
             });
           } else if (msg.type === 'event') {
             setEvent(msg.event);
+          } else if (msg.type === 'binance_btc') {
+            setBinanceBtc(msg.price != null ? parseFloat(msg.price) : null);
           } else if (msg.type === 'auto-sell') {
             setAutoSell(msg);
+          } else if (msg.type === 'refresh') {
+            setRefreshTrigger(t => t + 1);
           }
         } catch {}
       };
@@ -52,5 +58,5 @@ export function useWebSocket() {
     return () => ws.current?.close();
   }, []);
 
-  return { prices, btc, event, autoSell };
+  return { prices, btc, binanceBtc, event, autoSell, refreshTrigger };
 }

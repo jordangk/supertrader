@@ -100,20 +100,25 @@ export default function Positions({ positions, eventSlug, dbEventId, fallbackOrd
   })() : null;
 
   const eid = dbEventId ? String(dbEventId) : null;
+  // When dbEventId not passed, parent already filtered fallbackOrders to current event - use as-is
   const ordersForThisEvent = eid && fallbackOrders?.length
     ? fallbackOrders.filter(o => String(o.polymarket_event_id) === eid)
-    : [];
+    : (fallbackOrders || []);
 
   // Fill in any missing sides from orders (API may lag behind filled limit orders)
   if (ordersForThisEvent.length > 0) {
     const derived = deriveFromOrders(ordersForThisEvent, prices);
-    if (!upPos && derived.up) upPos = derived.up;
-    if (!downPos && derived.down) downPos = derived.down;
+    if ((!upPos || (upPos.size === 0 && derived.up?.size > 0)) && derived.up) upPos = derived.up;
+    if ((!downPos || (downPos.size === 0 && derived.down?.size > 0)) && derived.down) downPos = derived.down;
   }
+
+  // Default to zero positions so the panel always renders
+  if (!upPos) upPos = { outcome: 'Up', size: 0, avgPrice: 0, initialValue: 0, currentValue: 0, cashPnl: null, percentPnl: null };
+  if (!downPos) downPos = { outcome: 'Down', size: 0, avgPrice: 0, initialValue: 0, currentValue: 0, cashPnl: null, percentPnl: null };
 
   const totalCost = (upPos?.initialValue || 0) + (downPos?.initialValue || 0);
   const totalValue = (upPos?.currentValue ?? upPos?.initialValue ?? 0) + (downPos?.currentValue ?? downPos?.initialValue ?? 0);
-  const hasData = upPos || downPos;
+  const hasData = true;
 
   const upPrice = prices?.upPrice;
   const downPrice = prices?.downPrice;

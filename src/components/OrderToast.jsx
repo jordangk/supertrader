@@ -6,10 +6,12 @@ export default function OrderToast({ toast, onDismiss }) {
   useEffect(() => {
     if (!toast) return;
     setVisible(true);
+    const isBuyBothError = toast.type === 'buy-both' && !toast.success && (toast.up?.error || toast.down?.error);
+    const duration = isBuyBothError ? 7000 : 3000;
     const t = setTimeout(() => {
       setVisible(false);
       setTimeout(onDismiss, 200);
-    }, 3000);
+    }, duration);
     return () => clearTimeout(t);
   }, [toast]);
 
@@ -34,10 +36,14 @@ export default function OrderToast({ toast, onDismiss }) {
         }
       `}>
         <div className="flex items-center gap-2 flex-wrap">
-          <span>{isSuccess ? (toast.isBuyBoth ? '⚡' : toast.isSell ? '💰' : toast.isLimit ? '📋' : '✅') : '❌'}</span>
-          <span className="font-semibold">{isSuccess ? (toast.isBuyBoth ? `Both: ${toast.filled || 0} filled, ${toast.live || 0} limits` : toast.isSell ? 'Sell listed' : toast.isLimit ? 'Limit set' : 'Filled') : (toast.isBuyBoth ? 'Both failed' : 'Failed')}</span>
-          {!toast.isBuyBoth && <span className="font-mono font-bold">{toast.side?.toUpperCase()}</span>}
-          {isSuccess && (
+          <span>{isSuccess ? (toast.type === 'buy-then-sell' ? '🔄' : toast.type === 'buy-both' ? '⚡' : toast.isSell ? '💰' : toast.isLimit ? '📋' : '✅') : '❌'}</span>
+          <span className="font-semibold">
+            {toast.type === 'buy-both'
+              ? (toast.success ? (toast.message || 'Both placed') : (toast.message || toast.error || 'Failed'))
+              : isSuccess ? (toast.type === 'buy-then-sell' ? (toast.message || 'Buys placed. Sells when filled.') : toast.isBuyBoth ? `Both: ${toast.filled || 0} filled, ${toast.live || 0} limits` : toast.isSell ? 'Sell listed' : toast.isLimit ? 'Limit set' : 'Filled') : (toast.isBuyBoth || toast.type === 'buy-then-sell' ? 'Both failed' : 'Failed')}
+          </span>
+          {!toast.isBuyBoth && toast.type !== 'buy-then-sell' && <span className="font-mono font-bold">{toast.side?.toUpperCase()}</span>}
+          {isSuccess && toast.type !== 'buy-then-sell' && toast.type !== 'buy-both' && (
             <span className="font-mono">
               ${parseFloat(toast.purchase_amount ?? toast.shares * toast.price ?? 0).toFixed(2)}
               {toast.price ? ` @ ${(parseFloat(toast.price) * 100).toFixed(1)}¢` : ''}
@@ -45,6 +51,13 @@ export default function OrderToast({ toast, onDismiss }) {
             </span>
           )}
           {!isSuccess && toast.error && <span className="opacity-90">{toast.error}</span>}
+          {toast.type === 'buy-both' && toast.up && toast.down && (
+            <span className="opacity-90 block mt-0.5">
+              UP {toast.up.ok ? '✓' : '✗'} · DOWN {toast.down.ok ? '✓' : '✗'}
+              {toast.up.error && <span className="block text-red-300 text-[10px]">UP: {toast.up.error}</span>}
+              {toast.down.error && <span className="block text-red-300 text-[10px]">DOWN: {toast.down.error}</span>}
+            </span>
+          )}
         </div>
       </div>
     </div>

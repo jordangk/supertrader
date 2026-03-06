@@ -67,6 +67,30 @@ export default function EventHeader({ event }) {
         </span>
       </div>
       <p className="text-xs text-gray-500 mt-1">{event.slug}</p>
+      {(event.min_incentive_size != null || event.max_incentive_spread != null || (event.rewards_config?.length > 0)) && (
+        <div className="mt-2 pt-2 border-t border-gray-800 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-gray-500">
+          {event.min_incentive_size != null && (
+            <span title="Min order size (shares) to qualify for liquidity rewards">
+              min_incentive_size: <span className="text-cyan-400 font-mono">{event.min_incentive_size}</span>
+            </span>
+          )}
+          {event.max_incentive_spread != null && (
+            <span title="Max spread from midpoint (¢) to qualify">
+              max_incentive_spread: <span className="text-cyan-400 font-mono">{event.max_incentive_spread}¢</span>
+            </span>
+          )}
+          {event.rewards_config?.length > 0 && (
+            <span title="Epoch reward allocations (from CLOB/Markets API)">
+              rewards: {event.rewards_config.map((c, i) => (
+                <span key={i} className="text-cyan-400/80 font-mono">
+                  {i > 0 && ' | '}${(c.rate_per_day ?? c.total_rewards ?? 0).toFixed(0)}/day
+                  {c.start_date && c.end_date && ` (${c.start_date}–${c.end_date})`}
+                </span>
+              ))}
+            </span>
+          )}
+        </div>
+      )}
     </div>
   );
 }

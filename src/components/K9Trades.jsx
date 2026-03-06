@@ -74,7 +74,7 @@ export default function K9Trades() {
 
   async function load() {
     try {
-      const r = await fetch(`${API_BASE}/api/k9-trades?limit=5`);
+      const r = await fetch(`${API_BASE}/api/k9-trades?limit=20`);
       const d = await r.json();
       setEvents(d.events || []);
       setLastUpdate(new Date());
