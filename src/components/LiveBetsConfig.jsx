@@ -24,6 +24,7 @@ async function fetchWithTimeout(url, opts = {}, ms = 60000) {
 
 const PCT_OPTIONS = [
   { value: 0.01, label: '1%' },
+  { value: 0.02, label: '2%' },
   { value: 0.05, label: '5%' },
   { value: 0.10, label: '10%' },
   { value: 0.50, label: '50%' },
@@ -31,8 +32,8 @@ const PCT_OPTIONS = [
 
 const EVENT_TIME_OPTIONS = [
   { value: '', label: 'All' },
-  { value: '5m', label: '5m' },
-  { value: '15m', label: '15m' },
+  // { value: '5m', label: '5m' },
+  // { value: '15m', label: '15m' },
   { value: '1h', label: '1h' },
 ];
 
@@ -46,7 +47,7 @@ const ORDER_TYPE_OPTIONS = [
 ];
 
 function getSimMode(pct, batchMode) {
-  const base = { 0.01: '1pct', 0.05: '5pct', 0.10: '10pct', 0.50: '50pct' }[pct] || '1pct';
+  const base = { 0.01: '1pct', 0.02: '2pct', 0.05: '5pct', 0.10: '10pct', 0.50: '50pct' }[pct] || '1pct';
   return batchMode === 'cum50' ? `${base}_070` : `${base}_070_min5`;
 }
 
@@ -294,12 +295,10 @@ export default function LiveBetsConfig({ copyFeed = [] }) {
   return (
     <div className="bg-gray-900 rounded-xl border border-gray-800 p-4 space-y-4">
       <div className="flex items-center justify-between">
-        <h3 className="text-sm font-semibold text-gray-200">
-          Live Bets (k9 Copy){status?.pct != null && <span className="ml-1 text-orange-400">{Math.round(status.pct * 100)}%</span>}
-        </h3>
+        <h3 className="text-sm font-semibold text-gray-200">Live Bets (k9 Copy)</h3>
         <div className="flex items-center gap-2">
           <span className={`text-xs font-mono px-2 py-0.5 rounded ${enabled ? 'bg-green-900/50 text-green-400' : 'bg-gray-800 text-gray-500'}`}>
-            {enabled ? 'ON' : 'OFF'}
+            {enabled ? `ON · ${status?.pct != null ? Math.round(status.pct * 100) : '?'}%` : 'OFF'}
           </span>
           {enabled && status?.stats && (
             <span className="text-xs text-gray-500">

@@ -109,6 +109,14 @@ async function ensureAllowance() {
 
 // ── State ──────────────────────────────────────────────────────────────────
 let activeEvent = null;
+const SPLIT_STATE_FILE = new URL('./split-state.json', import.meta.url).pathname;
+function loadSplitState() {
+  try { return JSON.parse(fs.readFileSync(SPLIT_STATE_FILE, 'utf8')); } catch { return {}; }
+}
+function saveSplitState(slot) {
+  try { fs.writeFileSync(SPLIT_STATE_FILE, JSON.stringify({ lastSplitSlot: slot, ts: Date.now() })); } catch {}
+}
+let lastSplitSlot = loadSplitState().lastSplitSlot || 0; // persisted across restarts
 let liveState = {
   upPrice: null,
   downPrice: null,
@@ -136,8 +144,8 @@ function eventDbId() {
 let k9Copy = {
   enabled: false,
   targetSlug: null,       // null = copy ALL k9 events, or specific slug
-  eventTime: '',          // '' | '5m' | '15m' | '1h' — filter by event timeframe
-  pct: 0.01,              // 1% of k9's volume
+  eventTime: '1h',        // LOCKED to 1h — only copy hourly BTC events
+  pct: 0.02,              // 2% of k9's volume
   batchMode: 'min5',      // 'min5' = 5 units min (Polymarket min) | 'cum50' = batch to 50 units
   orderType: 'FAK',       // 'FAK' = Fill and Kill (immediate) | 'GTC' = Good Till Cancel (resting)
   minShares: 5,           // Polymarket minimum order size
@@ -150,37 +158,47 @@ let k9Copy = {
 };
 
 function resetCopyBuffer() {
-  k9Copy.buffer = { Up: { buy: 0, sell: 0 }, Down: { buy: 0, sell: 0 } };
+  k9Copy.buffer = {}; // keyed by "Outcome:slug"
 }
 resetCopyBuffer();
 
-// Persist copy state to disk so it survives server restarts
-function saveK9CopyState() {
+// Persist copy state to Supabase so it survives restarts — defaults OFF
+async function saveK9CopyState() {
   try {
-    const state = { enabled: k9Copy.enabled, targetSlug: k9Copy.targetSlug, eventTime: k9Copy.eventTime, pct: k9Copy.pct, batchMode: k9Copy.batchMode, orderType: k9Copy.orderType, tokenIds: k9Copy.tokenIds };
-    fs.writeFileSync(K9_COPY_STATE_FILE, JSON.stringify(state), 'utf8');
+    const { error } = await supabase.from('strategy_settings').upsert({
+      strategy: 'k9_copy',
+      enabled: k9Copy.enabled,
+      value: Math.round(k9Copy.pct * 100), // store pct as integer (2 = 2%)
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'strategy' });
+    if (error) console.error('[k9-copy] DB save error:', error.message);
+    else console.log(`[k9-copy] State saved to DB — enabled: ${k9Copy.enabled}, pct: ${k9Copy.pct * 100}%`);
   } catch (e) { console.error('[k9-copy] Failed to save state:', e.message); }
 }
 
-// Restore copy state from disk on startup
-function loadK9CopyState() {
+// Restore copy state from Supabase on startup — defaults OFF unless DB says enabled
+async function loadK9CopyState() {
   try {
-    if (!fs.existsSync(K9_COPY_STATE_FILE)) return;
-    const state = JSON.parse(fs.readFileSync(K9_COPY_STATE_FILE, 'utf8'));
-    if (state.enabled) {
+    const { data, error } = await supabase.from('strategy_settings')
+      .select('enabled, value')
+      .eq('strategy', 'k9_copy')
+      .single();
+    if (error || !data) {
+      console.log('[k9-copy] No DB state found — starting DISABLED');
+      return;
+    }
+    if (data.enabled) {
       k9Copy.enabled = true;
-      k9Copy.targetSlug = state.targetSlug;
-      k9Copy.eventTime = state.eventTime || '';
-      k9Copy.pct = state.pct || 0.01;
-      k9Copy.batchMode = state.batchMode || 'min5';
-      k9Copy.orderType = state.orderType || 'FAK';
-      k9Copy.tokenIds = state.tokenIds || {};
+      k9Copy.eventTime = '1h'; // LOCKED — only hourly
+      k9Copy.pct = data.value ? data.value / 100 : 0.02;
+      k9Copy.orderType = 'FAK';
       resetCopyBuffer();
-      console.log(`[k9-copy] RESTORED from disk — target: ${k9Copy.targetSlug || 'ALL'}, eventTime: ${k9Copy.eventTime || 'all'}, pct: ${k9Copy.pct * 100}%, order: ${k9Copy.orderType}`);
+      console.log(`[k9-copy] RESTORED from DB — enabled: true, pct: ${k9Copy.pct * 100}%, order: ${k9Copy.orderType}`);
+    } else {
+      console.log('[k9-copy] DB state: DISABLED — not starting copy');
     }
   } catch (e) { console.error('[k9-copy] Failed to load state:', e.message); }
 }
-loadK9CopyState();
 
 // Resolve token IDs for the target event (1h events need lookup)
 async function resolveCopyTokens(slug) {
@@ -223,38 +241,76 @@ function accumulateCopyTrades(trades) {
   const byOutcome = {};
   for (const t of trades) {
     if (k9Copy.targetSlug && t.slug !== k9Copy.targetSlug) continue;
-    if (k9Copy.eventTime && !(t.slug.includes(`-${k9Copy.eventTime}-`) || t.slug.endsWith(`-${k9Copy.eventTime}`))) continue;
+    if (k9Copy.eventTime) {
+      const is5m = t.slug.includes('-5m-');
+      const is15m = t.slug.includes('-15m-');
+      const is1h = !is5m && !is15m && t.slug.startsWith('bitcoin-up-or-down');
+      if (k9Copy.eventTime === '5m' && !is5m) continue;
+      if (k9Copy.eventTime === '15m' && !is15m) continue;
+      if (k9Copy.eventTime === '1h' && !is1h) continue;
+    }
     const side = t.side || 'buy';
     const outcome = t.outcome;
-    if (!byOutcome[outcome]) byOutcome[outcome] = { shares: 0, usdc: 0, slug: t.slug };
+    const key = `${outcome}:${t.slug}`;
+    if (!byOutcome[key]) byOutcome[key] = { shares: 0, usdc: 0, slug: t.slug, outcome };
     if (side === 'buy') {
-      byOutcome[outcome].shares += t.shares;
-      byOutcome[outcome].usdc += t.usdcSize;
+      byOutcome[key].shares += t.shares;
+      byOutcome[key].usdc += t.usdcSize;
     } else {
-      byOutcome[outcome].shares -= t.shares;
-      byOutcome[outcome].usdc -= t.usdcSize;
+      byOutcome[key].shares -= t.shares;
+      byOutcome[key].usdc -= t.usdcSize;
     }
   }
 
-  // For each outcome with net movement, accumulate into buffer
-  for (const [outcome, agg] of Object.entries(byOutcome)) {
+  // For each outcome with net movement, accumulate into buffer (keyed by outcome:slug)
+  for (const [key, agg] of Object.entries(byOutcome)) {
     const notional = Math.abs(agg.usdc) * k9Copy.pct;
     if (notional < 0.01) continue; // skip if grouped notional < $0.01
 
     const copyShares = Math.abs(agg.shares) * k9Copy.pct;
     const side = agg.shares > 0 ? 'buy' : 'sell';
 
-    if (!k9Copy.buffer[outcome]) k9Copy.buffer[outcome] = { buy: 0, sell: 0 };
-    k9Copy.buffer[outcome][side] += copyShares;
+    const bufKey = `${agg.outcome}:${agg.slug}`;
+    if (!k9Copy.buffer[bufKey]) k9Copy.buffer[bufKey] = { buy: 0, sell: 0, slug: agg.slug, outcome: agg.outcome, firstSeen: Date.now() };
+    k9Copy.buffer[bufKey][side] += copyShares;
+    k9Copy.buffer[bufKey].firstSeen = Date.now(); // reset timer on every new trade
 
     // Buffer accumulates — flushed every 1s by the interval below
   }
 }
 
+const BUFFER_MAX_AGE_MS = 30_000; // drop unmatched orders after 30s (event will have moved)
+
 // Flush buffer every 1 second — fire when ≥$1 worth (FAK minimum)
 setInterval(() => {
   if (!k9Copy.enabled) return;
-  for (const [outcome, buf] of Object.entries(k9Copy.buffer)) {
+  const now = Date.now();
+  for (const [bufKey, buf] of Object.entries(k9Copy.buffer)) {
+    const outcome = buf.outcome || bufKey.split(':')[0];
+    const slug    = buf.slug    || liveState.eventSlug || '';
+
+    // Drop stale buffer entries — 5min for 1h events, 30s for others
+    const is1hEvent = slug.startsWith('bitcoin-up-or-down') && !slug.includes('-5m-') && !slug.includes('-15m-');
+    const maxAge = is1hEvent ? 300_000 : BUFFER_MAX_AGE_MS; // 5 min vs 30s
+    if (buf.firstSeen && (now - buf.firstSeen) > maxAge) {
+      const dropped = (buf.buy + buf.sell).toFixed(2);
+      console.log(`[k9-copy] Buffer expired — dropping ${dropped}sh on ${slug} (${outcome}, >${maxAge/1000}s old)`);
+      delete k9Copy.buffer[bufKey];
+      continue;
+    }
+
+    // Drop buffer entries for hourly events that have already closed
+    // Hourly slugs: bitcoin-up-or-down-{month}-{day}-{hour}{am/pm}-et
+    if (slug.startsWith('bitcoin-up-or-down') && !slug.includes('-5m-') && !slug.includes('-15m-')) {
+      const isActiveLiveSlug = Object.values(k9TokenMap || {}).some(v => v.slug === slug);
+      if (!isActiveLiveSlug) {
+        const dropped = (buf.buy + buf.sell).toFixed(2);
+        console.log(`[k9-copy] Hourly market closed — dropping ${dropped}sh on ${slug} (${outcome})`);
+        delete k9Copy.buffer[bufKey];
+        continue;
+      }
+    }
+
     for (const side of ['buy', 'sell']) {
       if (buf[side] > 0) {
         const livePrice = (outcome === 'Up')
@@ -264,7 +320,7 @@ setInterval(() => {
         const estUsdc = Number((shares * livePrice).toFixed(2));
         if (shares >= 0.01 && estUsdc >= 1.0) {
           buf[side] -= shares;
-          enqueueCopyOrder(outcome, side, shares, k9Copy.targetSlug || liveState.eventSlug || '');
+          enqueueCopyOrder(outcome, side, shares, k9Copy.targetSlug || slug);
         }
       }
     }
@@ -311,8 +367,11 @@ async function executeCopyOrder({ outcome, side, shares, slug }) {
   // Get market price — ask for buys, bid for sells
   let price = await getCopyPrice(tokenId, side);
   if (!price || price <= 0 || price >= 1) {
-    console.error(`[k9-copy] Bad price ${price} for ${outcome}`);
-    k9Copy.stats.skipped++;
+    // Put shares back in buffer for retry — price may recover
+    const retryKey = `${outcome}:${slug}`;
+    if (!k9Copy.buffer[retryKey]) k9Copy.buffer[retryKey] = { buy: 0, sell: 0, slug, outcome, firstSeen: Date.now() };
+    k9Copy.buffer[retryKey][side] += shares;
+    console.log(`[k9-copy] Bad price ${price} for ${outcome} ${side} — ${shares.toFixed(2)}sh back to buffer`);
     return;
   }
 
@@ -320,7 +379,7 @@ async function executeCopyOrder({ outcome, side, shares, slug }) {
   const tick = parseFloat(tickSize);
 
   if (side === 'buy') {
-    const buyPrice = Math.max(Number((Math.round(price / tick) * tick).toFixed(2)), 0.01);
+    const buyPrice = Math.min(Number((Math.round((price + 0.04) / tick) * tick).toFixed(2)), 0.99);
     // Use createMarketOrder — pass USDC amount directly (avoids 2dp mismatch)
     const sizeUsd = Number((shares * buyPrice).toFixed(2));
     if (sizeUsd < 1.0) { k9Copy.stats.skipped++; return; }
@@ -339,7 +398,16 @@ async function executeCopyOrder({ outcome, side, shares, slug }) {
       // Detect failed orders (400, error field, or no orderId)
       if (apiErr || (httpStatus && httpStatus >= 400) || (!orderId && !result?.success)) {
         const errMsg = apiErr || `HTTP ${httpStatus}` || 'No orderID returned';
-        console.error(`[k9-copy] BUY rejected: ${errMsg} (full: ${JSON.stringify(result)})`);
+        const isNoMatch = String(errMsg).includes('no orders found to match');
+        if (isNoMatch) {
+          // Put shares back in buffer for retry on next flush — keep slug so it retries on the correct market
+          const retryKey = `${outcome}:${slug}`;
+          if (!k9Copy.buffer[retryKey]) k9Copy.buffer[retryKey] = { buy: 0, sell: 0, slug, outcome, firstSeen: Date.now() };
+          k9Copy.buffer[retryKey].buy += shares;
+          console.log(`[k9-copy] BUY no match — ${shares.toFixed(2)}sh back to buffer (retry next flush)`);
+        } else {
+          console.error(`[k9-copy] BUY rejected: ${errMsg} (full: ${JSON.stringify(result)})`);
+        }
         k9Copy.stats.errors = (k9Copy.stats.errors || 0) + 1;
         const logEntry = { ts: Date.now(), side: 'buy', outcome, shares, price: buyPrice, usdc: sizeUsd, error: String(errMsg), status: httpStatus };
         k9Copy.log.push(logEntry);
@@ -366,7 +434,7 @@ async function executeCopyOrder({ outcome, side, shares, slug }) {
     }
 
   } else {
-    const sellPrice = Math.min(Number((Math.round((price + 0.01) / tick) * tick).toFixed(2)), 0.99);
+    const sellPrice = Math.max(Number((Math.round((price - 0.04) / tick) * tick).toFixed(2)), 0.01);
 
     // Check how many we actually hold
     try {
@@ -400,7 +468,16 @@ async function executeCopyOrder({ outcome, side, shares, slug }) {
 
       if (apiErr || (httpStatus && httpStatus >= 400) || (!orderId && !result?.success)) {
         const errMsg = apiErr || `HTTP ${httpStatus}` || 'No orderID returned';
-        console.error(`[k9-copy] SELL rejected: ${errMsg} (full: ${JSON.stringify(result)})`);
+        const isNoMatch = String(errMsg).includes('no orders found to match');
+        if (isNoMatch) {
+          // Put shares back in buffer for retry on next flush — keep slug so it retries on the correct market
+          const retryKey = `${outcome}:${slug}`;
+          if (!k9Copy.buffer[retryKey]) k9Copy.buffer[retryKey] = { buy: 0, sell: 0, slug, outcome, firstSeen: Date.now() };
+          k9Copy.buffer[retryKey].sell += shares;
+          console.log(`[k9-copy] SELL no match — ${shares.toFixed(2)}sh back to buffer (retry next flush)`);
+        } else {
+          console.error(`[k9-copy] SELL rejected: ${errMsg} (full: ${JSON.stringify(result)})`);
+        }
         k9Copy.stats.errors = (k9Copy.stats.errors || 0) + 1;
         const logEntry = { ts: Date.now(), side: 'sell', outcome, shares, price: sellPrice, error: String(errMsg), status: httpStatus };
         k9Copy.log.push(logEntry);
@@ -685,7 +762,7 @@ let manualEventOverride = false; // when true, skip auto-refresh to preserve use
 const SPLIT_SCRIPT = path.join(__dirname, 'scripts', 'split-position.py');
 const MERGE_SCRIPT = path.join(__dirname, 'scripts', 'merge-positions.py');
 
-let autoSplit = { enabled: true, amount: 200 }; // $200 USDC → 200 Up + 200 Down = 400 shares total
+let autoSplit = { enabled: true, amount: 50 }; // $50 USDC → 50 Up + 50 Down = 100 shares total
 
 function runPythonScript(scriptPath, args) {
   return new Promise((resolve, reject) => {
@@ -735,13 +812,18 @@ async function executeSplit(amountUsd) {
   const match = String(slugForDb).match(/(\d{10,})/);
   const eventIdForDb = match ? parseInt(match[1]) : eventDbId();
 
+  // Mark this slot as split — persisted to disk so PM2 restarts don't re-split
+  lastSplitSlot = eventIdForDb;
+  saveSplitState(eventIdForDb);
+
   const now = new Date().toISOString();
   for (const dir of ['up', 'down']) {
     await supabase.from('polymarket_trades').insert({
       purchase_time: now,
       polymarket_event_id: eventIdForDb,
+      minute: Math.floor(eventIdForDb / 60), // minute bucket (epoch seconds → minutes)
       direction: dir,
-      purchase_price: 0.50, // split = $1 per pair = $0.50 each
+      purchase_price: 0.50,
       purchase_amount: amountUsd * 0.5,
       shares: amountUsd,
       order_status: 'filled',
@@ -795,6 +877,17 @@ function scheduleNextEvent() {
   const nowSecs = Math.floor(now / 1000);
   const nextSlot = (Math.floor(nowSecs / 300) + 1) * 300;
 
+  // If locked to 1h only, skip 5m splits — schedule hourly splits instead
+  if (!autoSplit.enabled || !k9Copy.enabled || k9Copy.eventTime === '1h') {
+    const delay = (nextSlot * 1000) - now + 2000;
+    eventTimer = setTimeout(refreshEvent, delay);
+    // Schedule hourly pre-split if in 1h mode
+    if (k9Copy.eventTime === '1h' && autoSplit.enabled && k9Copy.enabled) {
+      scheduleHourlySplit();
+    }
+    return;
+  }
+
   // Pre-split: 15s BEFORE the next 5m boundary — retry every 2s until event is available
   const PRE_SPLIT_START_SECONDS = 15;
   const PRE_SPLIT_RETRY_MS = 2000;
@@ -818,7 +911,9 @@ function scheduleNextEvent() {
           activeEvent.slug = upcomingSlug;
           const result = await executeSplit(autoSplit.amount);
           console.log(`[PRE-SPLIT] Success: $${result.amount} → ${result.upShares} Up + ${result.downShares} Down, tx=${result.txHash}`);
-          activeEvent._preSplitDone = nextSlot;
+          // Credit memory so low-stock monitor starts fresh knowing we have shares
+          inMemoryShares = { up: result.amount, down: result.amount };
+          // lastSplitSlot is set inside executeSplit — fallback will skip this slot
           if (prevSlug && prevSlug !== upcomingSlug) {
             activeEvent.conditionId = prevConditionId;
             activeEvent.slug = prevSlug;
@@ -856,7 +951,7 @@ function scheduleNextEvent() {
       const upcomingSlug = `btc-updown-5m-${nextSlot}`;
       const { data: rows } = await supabase.from('polymarket_trades').select('notes').eq('polymarket_event_id', nextSlot);
       const ctfCount = (rows || []).filter(r => { try { return r.notes && JSON.parse(r.notes).type === 'ctf-split'; } catch { return false; } }).length;
-      if (autoSplit.enabled && ctfCount < 2) {
+      if (autoSplit.enabled && ctfCount < 2 && k9Copy.eventTime !== '1h') {
         try {
           const r = await fetch(`https://gamma-api.polymarket.com/events?slug=${upcomingSlug}`);
           const j = await r.json();
@@ -880,6 +975,132 @@ function scheduleNextEvent() {
     }
     scheduleNextEvent();
   }, delay);
+}
+
+// ── Hourly event split scheduling ─────────────────────────────────────────
+let hourlySplitTimer = null;
+let hourlyActiveEvent = null; // { slug, conditionId } for the current 1h event we're trading
+
+function getNextHourlyBoundary() {
+  // Next hour boundary in ET
+  const now = new Date();
+  const next = new Date(now);
+  next.setMinutes(0, 0, 0);
+  next.setHours(next.getHours() + 1);
+  return next.getTime();
+}
+
+function getUpcomingHourlySlug() {
+  const MONTHS = ['january','february','march','april','may','june','july','august','september','october','november','december'];
+  const fmt = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: 'numeric', hour12: true, day: 'numeric', month: 'numeric', year: 'numeric' });
+  const nextHour = new Date(getNextHourlyBoundary());
+  const parts = {};
+  fmt.formatToParts(nextHour).forEach(p => { parts[p.type] = p.value; });
+  const month = MONTHS[parseInt(parts.month) - 1];
+  const day = parseInt(parts.day);
+  const hour = parseInt(parts.hour);
+  const ampm = parts.dayPeriod?.toLowerCase() || (nextHour.getUTCHours() >= 12 ? 'pm' : 'am');
+  return `bitcoin-up-or-down-${month}-${day}-${hour}${ampm}-et`;
+}
+
+function getCurrentHourlySlug() {
+  const MONTHS = ['january','february','march','april','may','june','july','august','september','october','november','december'];
+  const fmt = new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: 'numeric', hour12: true, day: 'numeric', month: 'numeric', year: 'numeric' });
+  const now = new Date();
+  const parts = {};
+  fmt.formatToParts(now).forEach(p => { parts[p.type] = p.value; });
+  const month = MONTHS[parseInt(parts.month) - 1];
+  const day = parseInt(parts.day);
+  const hour = parseInt(parts.hour);
+  const ampm = parts.dayPeriod?.toLowerCase() || (now.getUTCHours() >= 12 ? 'pm' : 'am');
+  return `bitcoin-up-or-down-${month}-${day}-${hour}${ampm}-et`;
+}
+
+async function resolveHourlyEvent(slug) {
+  try {
+    const r = await fetch(`https://gamma-api.polymarket.com/events?slug=${slug}`);
+    const data = await r.json();
+    const ev = Array.isArray(data) ? data[0] : data;
+    const cid = ev?.markets?.[0]?.conditionId;
+    if (cid) return { slug, conditionId: cid };
+  } catch (e) {
+    console.error(`[1H-SPLIT] Failed to resolve ${slug}:`, e.message);
+  }
+  return null;
+}
+
+async function splitForHourlyEvent(slug) {
+  const resolved = await resolveHourlyEvent(slug);
+  if (!resolved) { console.log(`[1H-SPLIT] Could not resolve ${slug}`); return; }
+
+  // Temporarily swap activeEvent to do the split
+  const prevCid = activeEvent?.conditionId;
+  const prevSlug = activeEvent?.slug;
+  if (activeEvent) {
+    activeEvent.conditionId = resolved.conditionId;
+    activeEvent.slug = resolved.slug;
+  } else {
+    // activeEvent doesn't exist yet
+    return;
+  }
+
+  try {
+    console.log(`[1H-SPLIT] Splitting $${autoSplit.amount} for ${slug}...`);
+    const result = await executeSplit(autoSplit.amount);
+    console.log(`[1H-SPLIT] Success: $${result.amount} → ${result.upShares} Up + ${result.downShares} Down, tx=${result.txHash}`);
+    hourlyActiveEvent = resolved;
+  } catch (e) {
+    console.error(`[1H-SPLIT] Failed:`, e.message);
+  }
+
+  // Restore activeEvent
+  if (prevSlug) {
+    activeEvent.conditionId = prevCid;
+    activeEvent.slug = prevSlug;
+  }
+}
+
+function scheduleHourlySplit() {
+  if (hourlySplitTimer) clearTimeout(hourlySplitTimer);
+
+  const nextBoundary = getNextHourlyBoundary();
+  const now = Date.now();
+  const PRE_SPLIT_SECS = 5;
+  const delay = nextBoundary - now - (PRE_SPLIT_SECS * 1000);
+
+  if (delay > 0) {
+    console.log(`[1H-SPLIT] Pre-split for next hourly in ${Math.round(delay / 1000)}s`);
+    hourlySplitTimer = setTimeout(async () => {
+      const slug = getUpcomingHourlySlug();
+      // Retry up to 5 times
+      for (let i = 1; i <= 5; i++) {
+        try {
+          await splitForHourlyEvent(slug);
+          break;
+        } catch (e) {
+          console.error(`[1H-SPLIT] Attempt ${i} failed:`, e.message);
+          if (i < 5) await new Promise(r => setTimeout(r, 2000));
+        }
+      }
+      // Schedule the next hourly split
+      setTimeout(scheduleHourlySplit, 10000);
+    }, delay);
+  } else {
+    // Already past the boundary, schedule for next hour
+    const nextDelay = nextBoundary + 3600000 - now - (PRE_SPLIT_SECS * 1000);
+    console.log(`[1H-SPLIT] Missed this boundary, next hourly pre-split in ${Math.round(nextDelay / 1000)}s`);
+    hourlySplitTimer = setTimeout(scheduleHourlySplit, Math.max(nextDelay, 5000));
+  }
+
+  // Also resolve the current hourly event for low-stock monitoring
+  (async () => {
+    const currentSlug = getCurrentHourlySlug();
+    const resolved = await resolveHourlyEvent(currentSlug);
+    if (resolved) {
+      hourlyActiveEvent = resolved;
+      console.log(`[1H-SPLIT] Tracking current hourly: ${currentSlug}`);
+    }
+  })();
 }
 
 async function saveEventAnalysis(oldSlug) {
@@ -933,6 +1154,11 @@ async function refreshEvent() {
   if (event && event.slug !== liveState.eventSlug) {
     // Save analysis for the old event before switching
     if (liveState.eventSlug) saveEventAnalysis(liveState.eventSlug);
+    // Reset in-memory shares for new event — but keep them if pre-split already ran for this slot
+    const newEventSlot = parseInt(String(event.slug).match(/(\d{10,})/)?.[1] || 0);
+    if (lastSplitSlot !== newEventSlot) {
+      inMemoryShares = { up: 0, down: 0 };
+    }
     console.log('[EVENT] new active event:', event.slug);
     liveState.eventSlug = event.slug;
     liveState.eventTitle = event.title;
@@ -952,25 +1178,14 @@ async function refreshEvent() {
     if (event.tokenUp && event.tokenDown) {
       connectClobStream([event.tokenUp, event.tokenDown]);
     }
-    // Auto-split fallback: split if pre-split didn't run or we have no DB records
+    // Auto-split fallback: split if pre-split didn't already handle this slot
     const slotMatch = event.slug?.match(/(\d{10,})/);
     const eventSlot = slotMatch ? parseInt(slotMatch[1]) : 0;
-    const preSplitClaimed = activeEvent?._preSplitDone === eventSlot;
 
-    let shouldSplit = autoSplit.enabled && event.conditionId;
-    if (shouldSplit && preSplitClaimed) {
-      // Verify we actually have split records (pre-split may have recorded under wrong event before fix)
-      const { data: allForSlot } = await supabase
-        .from('polymarket_trades')
-        .select('notes')
-        .eq('polymarket_event_id', eventSlot);
-      const ctfSplitCount = (allForSlot || []).filter(r => {
-        try { return r.notes && JSON.parse(r.notes).type === 'ctf-split'; } catch { return false; }
-      }).length;
-      if (ctfSplitCount >= 2) {
-        console.log('[AUTO-SPLIT] Skipped — split already recorded for this event');
-        shouldSplit = false;
-      }
+    let shouldSplit = autoSplit.enabled && k9Copy.enabled && event.conditionId && k9Copy.eventTime !== '1h';
+    if (shouldSplit && lastSplitSlot === eventSlot) {
+      console.log(`[AUTO-SPLIT] Skipped — already split slot ${eventSlot}`);
+      shouldSplit = false;
     }
 
     if (shouldSplit) {
@@ -978,10 +1193,16 @@ async function refreshEvent() {
       try {
         const result = await executeSplit(autoSplit.amount);
         console.log(`[AUTO-SPLIT] Success: $${result.amount} → ${result.upShares} Up + ${result.downShares} Down, tx=${result.txHash}`);
+        // Credit in-memory shares so low-stock monitor won't immediately re-split
+        inMemoryShares.up += result.amount;
+        inMemoryShares.down += result.amount;
       } catch (e) {
         console.error('[AUTO-SPLIT] Failed:', e.message);
       }
     }
+
+    // Start low-stock monitor for this event
+    startLowStockMonitor();
   }
 }
 
@@ -1009,6 +1230,72 @@ function startPricePoll() {
       pricePollInFlight = false;
     }
   }, 500);
+}
+
+// ── Low-stock monitor: if either side drops below 10 shares, top up with $50 ─
+const LOW_STOCK_THRESHOLD = 10;
+const LOW_STOCK_SPLIT = 50;
+let lowStockInterval = null;
+let inMemoryShares = { up: 0, down: 0 }; // updated on every split so DB failures don't cause loops
+
+function startLowStockMonitor() {
+  if (lowStockInterval) clearInterval(lowStockInterval);
+  // inMemoryShares is reset at the top of refreshEvent — don't reset here or we wipe auto-split credits
+  let splitting = false;
+  lowStockInterval = setInterval(async () => {
+    if (!autoSplit.enabled || !k9Copy.enabled || !activeEvent?.conditionId || splitting) return;
+    // For 1h mode, check hourly event holdings instead of 5m
+    if (k9Copy.eventTime === '1h') {
+      if (!hourlyActiveEvent?.conditionId) return;
+      // Swap activeEvent temporarily to check hourly holdings
+      const prevCid = activeEvent.conditionId;
+      const prevSlug = activeEvent.slug;
+      activeEvent.conditionId = hourlyActiveEvent.conditionId;
+      activeEvent.slug = hourlyActiveEvent.slug;
+      try {
+        const holdings = await fetchHoldings();
+        const up = holdings.up.shares + inMemoryShares.up;
+        const down = holdings.down.shares + inMemoryShares.down;
+        if (up < LOW_STOCK_THRESHOLD || down < LOW_STOCK_THRESHOLD) {
+          splitting = true;
+          console.log(`[1H-LOW-STOCK] up=${up.toFixed(1)}, down=${down.toFixed(1)} — topping up $${LOW_STOCK_SPLIT} on ${hourlyActiveEvent.slug}`);
+          inMemoryShares.up += LOW_STOCK_SPLIT;
+          inMemoryShares.down += LOW_STOCK_SPLIT;
+          const result = await executeSplit(LOW_STOCK_SPLIT);
+          console.log(`[1H-LOW-STOCK] Split done: tx=${result.txHash}`);
+          splitting = false;
+        }
+      } catch (e) {
+        splitting = false;
+        console.error('[1H-LOW-STOCK] Error:', e.message);
+      } finally {
+        activeEvent.conditionId = prevCid;
+        activeEvent.slug = prevSlug;
+      }
+      return;
+    }
+    // In 1h mode, NEVER split on 5m events — the 1h path above handles it
+    if (k9Copy.eventTime === '1h') return;
+    try {
+      const holdings = await fetchHoldings();
+      // Combine DB holdings with in-memory splits done this event
+      const up = holdings.up.shares + inMemoryShares.up;
+      const down = holdings.down.shares + inMemoryShares.down;
+      if (up < LOW_STOCK_THRESHOLD || down < LOW_STOCK_THRESHOLD) {
+        splitting = true;
+        console.log(`[LOW-STOCK] up=${up.toFixed(1)}, down=${down.toFixed(1)} — topping up $${LOW_STOCK_SPLIT}`);
+        // Credit memory immediately so next tick sees updated shares
+        inMemoryShares.up += LOW_STOCK_SPLIT;
+        inMemoryShares.down += LOW_STOCK_SPLIT;
+        const result = await executeSplit(LOW_STOCK_SPLIT);
+        console.log(`[LOW-STOCK] Split done: tx=${result.txHash}`);
+        splitting = false;
+      }
+    } catch (e) {
+      splitting = false;
+      console.error('[LOW-STOCK] Error:', e.message);
+    }
+  }, 5_000); // check every 5s
 }
 
 // ── Helper: fetch holdings for current event ────────────────────────────────
@@ -1883,9 +2170,9 @@ app.post('/api/cancel', async (req, res) => {
 // ── K9 Copy-Trading endpoints ────────────────────────────────────────────────
 app.post('/api/k9-copy/start', async (req, res) => {
   const { slug, pct, eventTime, batchMode, orderType } = req.body || {};
-  k9Copy.pct = pct || 0.01;
+  k9Copy.pct = pct || 0.02;
   k9Copy.targetSlug = slug || null;
-  k9Copy.eventTime = eventTime || '';
+  k9Copy.eventTime = '1h'; // LOCKED — only hourly events
   k9Copy.batchMode = (batchMode === 'cum50' ? 'cum50' : 'min5');
   k9Copy.orderType = (orderType === 'GTC' ? 'GTC' : 'FAK');
   resetCopyBuffer();
@@ -1920,7 +2207,22 @@ app.post('/api/k9-copy/reset-stuck', (req, res) => {
   res.json({ success: true, wasPending, queueLength: k9Copy.queue.length });
 });
 
-app.get('/api/k9-copy/status', (req, res) => {
+app.get('/api/k9-copy/status', async (req, res) => {
+  // Merge session stats with today's DB totals so restarts don't zero out the counter
+  let dbStats = { buys: 0, sells: 0 };
+  try {
+    const todayUtc = new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
+    const { data } = await supabase
+      .from('polymarket_trades')
+      .select('direction, order_type')
+      .gte('purchase_time', `${todayUtc}T00:00:00Z`)
+      .in('order_type', ['copy-buy', 'copy-sell', 'live']);
+    if (data) {
+      dbStats.buys  = data.filter(r => r.order_type !== 'copy-sell').length;
+      dbStats.sells = data.filter(r => r.order_type === 'copy-sell').length;
+    }
+  } catch {}
+
   res.json({
     enabled: k9Copy.enabled,
     targetSlug: k9Copy.targetSlug,
@@ -1929,7 +2231,14 @@ app.get('/api/k9-copy/status', (req, res) => {
     batchMode: k9Copy.batchMode,
     orderType: k9Copy.orderType,
     buffer: k9Copy.buffer,
-    stats: k9Copy.stats,
+    stats: {
+      buys:         dbStats.buys  + (k9Copy.stats.buys  || 0),
+      sells:        dbStats.sells + (k9Copy.stats.sells || 0),
+      errors:       k9Copy.stats.errors   || 0,
+      skipped:      k9Copy.stats.skipped  || 0,
+      usdcSpent:    k9Copy.stats.usdcSpent    || 0,
+      usdcReceived: k9Copy.stats.usdcReceived || 0,
+    },
     queueLength: k9Copy.queue.length,
     pending: k9Copy.pending,
     log: k9Copy.log,
@@ -2329,26 +2638,53 @@ app.get('/api/btc5m-reward-config', (req, res) => {
 // ── Price snapshot buffer — capture on every tick, batch-flush to Supabase ────
 const snapshotBuffer = [];
 
-function pushSnapshot() {
+async function pushSnapshot() {
   if (!liveState.eventSlug) return;
   if (liveState.btcCurrent == null && liveState.binanceBtc == null) return;
   const endDate = activeEvent?.endDate ? new Date(activeEvent.endDate) : null;
   const secsLeft = endDate ? Math.max(0, Math.floor((endDate - Date.now()) / 1000)) : null;
+
+  // Fetch real bid/ask from CLOB for Up and Down tokens
+  let upBid = null, upAsk = null, downBid = null, downAsk = null;
+  try {
+    const upToken = liveState.tokenUp || activeEvent?.tokenUp;
+    const downToken = liveState.tokenDown || activeEvent?.tokenDown;
+    if (upToken && downToken) {
+      const [ubr, uar, dbr, dar] = await Promise.all([
+        fetch(`https://clob.polymarket.com/price?token_id=${upToken}&side=buy`).then(r => r.json()).catch(() => null),
+        fetch(`https://clob.polymarket.com/price?token_id=${upToken}&side=sell`).then(r => r.json()).catch(() => null),
+        fetch(`https://clob.polymarket.com/price?token_id=${downToken}&side=buy`).then(r => r.json()).catch(() => null),
+        fetch(`https://clob.polymarket.com/price?token_id=${downToken}&side=sell`).then(r => r.json()).catch(() => null),
+      ]);
+      upBid = ubr?.price ? parseFloat(ubr.price) : null;
+      upAsk = uar?.price ? parseFloat(uar.price) : null;
+      downBid = dbr?.price ? parseFloat(dbr.price) : null;
+      downAsk = dar?.price ? parseFloat(dar.price) : null;
+    }
+  } catch (e) { /* ignore — bid/ask are optional */ }
+
   snapshotBuffer.push({
     event_slug: liveState.eventSlug,
     btc_price: liveState.btcCurrent,
     coin_price: liveState.binanceBtc,
     up_cost: liveState.upPrice,
     down_cost: liveState.downPrice,
-    up_best_bid: liveState.upPrice,
-    down_best_bid: liveState.downPrice,
+    up_best_bid: upBid,
+    up_best_ask: upAsk,
+    down_best_bid: downBid,
+    down_best_ask: downAsk,
+    up_spread: upBid != null && upAsk != null ? Number((upAsk - upBid).toFixed(4)) : null,
+    down_spread: downBid != null && downAsk != null ? Number((downAsk - downBid).toFixed(4)) : null,
     observed_at: new Date().toISOString(),
     seconds_left: secsLeft,
     coin: 'btc',
   });
 }
 
-// Flush buffer to Supabase every 1s
+// Capture a snapshot every 1s
+setInterval(() => { pushSnapshot(); }, 1000);
+
+// Flush buffer to Supabase every 5s
 setInterval(async () => {
   if (!snapshotBuffer.length) return;
   const batch = snapshotBuffer.splice(0, snapshotBuffer.length);
@@ -3772,6 +4108,7 @@ server.listen(PORT, async () => {
   const scriptExists = fs.existsSync(SPLIT_SCRIPT);
   console.log(`[SPLIT] autoSplit=${autoSplit.enabled ? 'ON' : 'OFF'}, amount=$${autoSplit.amount}, ready=${splitReady}, script=${scriptExists}`);
   await seedK9SeenTx();
+  await loadK9CopyState();
   connectK9Watcher();
   // HTTP poll fallback: catch missed WS events every 15s
   setTimeout(k9HttpPoll, 5000); // first poll after 5s
