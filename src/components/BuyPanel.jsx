@@ -38,7 +38,7 @@ export default function BuyPanel({ side, price, amounts, buying, onBuy, onReward
                 }
               `}
             >
-              {isBuying ? '...' : `$${amt}`}
+              {isBuying ? '...' : `${amt}sh`}
             </button>
           );
         })}

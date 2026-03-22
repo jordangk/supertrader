@@ -8,6 +8,7 @@ export function useWebSocket() {
   const [autoSell, setAutoSell] = useState(null);
   const [refreshTrigger, setRefreshTrigger] = useState(0);
   const [copyFeed, setCopyFeed] = useState([]); // combined k9 + our copy orders
+  const [whaleTrades, setWhaleTrades] = useState([]);
   const ws = useRef(null);
 
   useEffect(() => {
@@ -56,6 +57,14 @@ export function useWebSocket() {
               }));
               return [...entries, ...prev].slice(0, 100);
             });
+          } else if (msg.type === 'whale_trades') {
+            setWhaleTrades(prev => {
+              const entries = (msg.trades || []).map(t => ({
+                ts: t.ts * 1000, side: t.side, outcome: t.outcome,
+                shares: t.shares, price: t.price, usdc: t.usdcSize, slug: t.slug,
+              }));
+              return [...entries, ...prev].slice(0, 200);
+            });
           } else if (msg.type === 'k9_copy') {
             setCopyFeed(prev => {
               const entry = {
@@ -76,5 +85,5 @@ export function useWebSocket() {
     return () => ws.current?.close();
   }, []);
 
-  return { prices, btc, binanceBtc, event, autoSell, refreshTrigger, copyFeed };
+  return { prices, btc, binanceBtc, event, autoSell, refreshTrigger, copyFeed, whaleTrades };
 }

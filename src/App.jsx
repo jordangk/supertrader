@@ -14,14 +14,17 @@ import LiveBetsConfig from './components/LiveBetsConfig.jsx';
 import SimDashboard from './components/SimDashboard.jsx';
 import PriceTracker from './components/PriceTracker.jsx';
 import EventSearch from './components/EventSearch.jsx';
+import PriceDivergence from './components/PriceDivergence.jsx';
+import WhaleHistory from './components/WhaleHistory.jsx';
+import WhaleFeed from './components/WhaleFeed.jsx';
 
-const AMOUNTS = [50, 20, 10, 5, 1];
+const AMOUNTS = [50, 25, 10, 5];
 const FEE_PCT = 0.02; // 2% Polymarket fee
 
 const API_BASE = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
 
 export default function App() {
-  const { prices, btc, binanceBtc, event, refreshTrigger, copyFeed } = useWebSocket();
+  const { prices, btc, binanceBtc, event, refreshTrigger, copyFeed, whaleTrades } = useWebSocket();
   const [wallet, setWallet] = useState(null);
   const [orders, setOrders] = useState([]);
   const [positions, setPositions] = useState([]);
@@ -31,6 +34,7 @@ export default function App() {
   const [tab, setTab] = useState('trade');
   const [showEventSearch, setShowEventSearch] = useState(false);
   const [liquidityRewards, setLiquidityRewards] = useState({ total: 0, byDate: [] });
+  const [autoScalp, setAutoScalp] = useState({ enabled: false, threshold: 5, profitCents: 2, shares: 50, log: [] });
 
   function fetchOpenOrders() {
     fetch(`${API_BASE}/api/open-orders`)
@@ -55,8 +59,29 @@ export default function App() {
     const iv = setInterval(fetchOpenOrders, 5000);
     // Refresh liquidity rewards every 5 min (rewards distributed daily at midnight UTC)
     const rv = setInterval(fetchLiquidityRewards, 5 * 60 * 1000);
-    return () => { clearInterval(iv); clearInterval(rv); };
+    fetchAutoScalp();
+    const asIv = setInterval(fetchAutoScalp, 5000);
+    return () => { clearInterval(iv); clearInterval(rv); clearInterval(asIv); };
   }, []);
+
+  function fetchAutoScalp() {
+    fetch(`${API_BASE}/api/auto-scalp`).then(r => r.json()).then(setAutoScalp).catch(() => {});
+  }
+
+  async function toggleAutoScalp() {
+    try {
+      // Read current state from server first to avoid stale closure
+      const cur = await fetch(`${API_BASE}/api/auto-scalp`).then(r => r.json());
+      const res = await fetch(`${API_BASE}/api/auto-scalp`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: !cur.enabled }),
+      });
+      const data = await res.json();
+      setAutoScalp(prev => ({ ...prev, ...data, ref: data.lastTriggerPrice ?? prev.ref, btc: prev.btc }));
+    } catch (e) {
+      setToast({ success: false, error: e.message });
+    }
+  }
 
   useEffect(() => {
     if (event?.slug) {
@@ -108,7 +133,7 @@ export default function App() {
       const res = await fetch(`${API_BASE}/api/buy`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ side, amount }),
+        body: JSON.stringify({ side, shares: amount }),
       });
       const text = await res.text();
       let data;
@@ -448,7 +473,7 @@ export default function App() {
 
       {/* Tab bar */}
       <div className="bg-gray-900 border-b border-gray-800 px-4 flex gap-1">
-        {[['trade', '⚡ Trade'], ['trades', '🔥 Live Trades'], ['mytrades', '📋 My Trades'], ['prices', '📈 Prices'], ['sim', '📊 k9 Simulator'], ['k9', '👁 k9 Raw']].map(([t, label]) => (
+        {[['trade', '⚡ Trade'], ['divergence', '📉 Divergence'], ['whale', '🐋 Whale'], ['trades', '🔥 Live Trades'], ['mytrades', '📋 My Trades'], ['prices', '📈 Prices'], ['sim', '📊 k9 Simulator'], ['k9', '👁 k9 Raw']].map(([t, label]) => (
           <button key={t} onClick={() => setTab(t)}
             className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
               tab === t ? 'border-orange-500 text-orange-400' : 'border-transparent text-gray-500 hover:text-gray-300'
@@ -456,7 +481,13 @@ export default function App() {
         ))}
       </div>
 
-      <div className={`flex-1 p-4 mx-auto w-full space-y-4 ${tab === 'prices' ? 'max-w-5xl' : 'max-w-2xl'}`}>
+      <div className={`flex-1 p-4 mx-auto w-full space-y-4 ${tab === 'prices' || tab === 'divergence' || tab === 'whale' ? 'max-w-5xl' : 'max-w-2xl'}`}>
+        {tab === 'whale' && (
+          <div className="space-y-6">
+            <WhaleFeed whaleTrades={whaleTrades} />
+            <WhaleHistory whaleTrades={whaleTrades} />
+          </div>
+        )}
         {tab === 'trades' && (
           <div className="space-y-4">
             <div>
@@ -464,6 +495,54 @@ export default function App() {
               <p className="text-xs text-gray-500 mt-0.5">Copy k9&apos;s BTC Up/Down trades in real time. Select %, event time, and enable.</p>
             </div>
             <LiveBetsConfig copyFeed={copyFeed} />
+          </div>
+        )}
+        {tab === 'divergence' && (
+          <div className="space-y-4">
+            {/* Auto-Scalp Toggle */}
+            <div className={`rounded-xl border p-3 space-y-2 ${autoScalp.enabled ? 'border-cyan-600 bg-cyan-950/30' : 'border-gray-800 bg-gray-900/50'}`}>
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-bold text-cyan-400">Auto-Scalp</span>
+                  <span className="text-[10px] text-gray-500">${autoScalp.threshold} BTC move → {autoScalp.profitCents}¢ scalp ({autoScalp.shares}sh)</span>
+                </div>
+                <button
+                  onClick={toggleAutoScalp}
+                  className={`px-3 py-1 rounded-lg text-xs font-bold transition-all ${
+                    autoScalp.enabled
+                      ? 'bg-cyan-600 text-white hover:bg-cyan-500'
+                      : 'bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-gray-200'
+                  }`}
+                >
+                  {autoScalp.enabled ? 'ON' : 'OFF'}
+                </button>
+              </div>
+              {autoScalp.enabled && autoScalp.ref != null && (
+                <div className="text-[10px] text-gray-500 font-mono">
+                  Ref: ${autoScalp.ref?.toLocaleString()} | BTC: ${autoScalp.btc?.toLocaleString()} | Next trigger: ±${autoScalp.threshold}
+                </div>
+              )}
+              {autoScalp.hedgeOrderId && (
+                <div className="text-[10px] text-yellow-400 font-mono">
+                  Hedge pending: {autoScalp.hedgeOrderId.slice(0, 12)}... (blocked until filled/cancelled)
+                </div>
+              )}
+              {autoScalp.log?.length > 0 && (
+                <div className="space-y-0.5">
+                  {autoScalp.log.slice(0, 5).map((l, i) => (
+                    <div key={i} className="text-[10px] font-mono text-gray-500">
+                      {new Date(l.ts).toLocaleTimeString()} — {l.side.toUpperCase()} (BTC {l.delta >= 0 ? '+' : ''}{l.delta})
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="border-t border-gray-800 pt-2 space-y-1 text-[10px] text-gray-600 leading-relaxed">
+                <p>Watches Binance BTC stream. $5+ move → 1 scalp. FAK buys {autoScalp.shares}sh winning side → waits 1.5s for BTC to keep moving same direction → GTC hedge opposite side at price locking 1¢ profit.</p>
+                <p>One scalp at a time — blocked until hedge fills or you cancel it. 3s cooldown after. Only 50-80¢.</p>
+              </div>
+            </div>
+            <WhaleFeed whaleTrades={whaleTrades} maxBuckets={3} />
+            <PriceDivergence prices={prices} btc={btc} binanceBtc={binanceBtc} event={event} whaleTrades={whaleTrades} />
           </div>
         )}
         {tab === 'mytrades' && <MyTrades />}

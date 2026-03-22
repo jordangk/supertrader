@@ -131,6 +131,70 @@ let liveState = {
   binanceBtc: null,
 };
 
+// ── Auto-scalp on BTC $5 move (Binance stream) ─────────────────────────────
+let autoScalp = {
+  enabled: false,
+  threshold: 5,        // $5 BTC move
+  profitCents: 2,      // scalp with 2¢ profit
+  shares: 5,           // shares per scalp
+  winningPriceMin: 45, // only trigger when winning side 45–85¢ (was 50–80)
+  winningPriceMax: 85,
+  cooldownSeconds: 15,  // (legacy, unused — scalp blocks until hedge fills)
+  lastTriggerPrice: null,
+  lastTriggerTime: 0,   // timestamp of last trigger (or abort)
+  firing: false,
+  hedgeOrderId: null,
+  log: [],
+  inFlight: false,  // hard lock: exactly one scalp at a time
+  needsHedge: false, // true when holding unhedged shares — blocks all new scalps
+  unhedged: null,     // { side, shares, avgPrice, ts } — tracks the naked leg
+};
+let autoScalpLastDiagLog = 0;
+
+// ── Stop-loss state (persisted in memory + DB, survives frontend refresh & restart) ──
+let stopLossState = null; // { side: 'up'|'down', trigger: cents, shares: number }
+let stopLossFiring = false; // lock to prevent double-fire
+
+// Encoding: value = trigger (1-99), side & shares packed into a second row or encoded:
+// We use two rows: 'stop_loss' for enabled/trigger, 'stop_loss_detail' for side+shares
+// Actually simpler: pack as value = side_bit * 10000 + shares * 100 + trigger
+// side_bit: 0=up, 1=down; shares max 999; trigger max 99
+function packSL(sl) { return (sl.side === 'down' ? 10000 : 0) + sl.shares * 100 + sl.trigger; }
+function unpackSL(v) {
+  const side = v >= 10000 ? 'down' : 'up';
+  const rem = v % 10000;
+  return { side, shares: Math.floor(rem / 100), trigger: rem % 100 };
+}
+
+async function saveStopLossToDb(sl) {
+  try {
+    await supabase.from('strategy_settings').upsert({
+      strategy: 'stop_loss',
+      enabled: !!sl,
+      value: sl ? packSL(sl) : 0,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'strategy' });
+  } catch (e) { console.error('[SL] DB save error:', e.message); }
+}
+
+async function loadStopLossFromDb() {
+  try {
+    const { data, error } = await supabase.from('strategy_settings')
+      .select('enabled, value')
+      .eq('strategy', 'stop_loss')
+      .single();
+    if (error || !data || !data.enabled || !data.value) {
+      console.log('[SL] No active stop-loss in DB');
+      return;
+    }
+    stopLossState = unpackSL(data.value);
+    console.log(`[SL] RESTORED from DB — ${stopLossState.shares}sh ${stopLossState.side} ≥${stopLossState.trigger}¢`);
+  } catch (e) { console.error('[SL] DB load error:', e.message); }
+}
+
+// Cached DB open price for /api/event (invalidated on event change)
+let cachedOpenPrice = { slug: null, btc: null, up: null, down: null };
+
 // Extract numeric ID from slug for DB (bigint column)
 function eventDbId() {
   const slug = liveState.eventSlug || '';
@@ -557,14 +621,14 @@ function broadcast(data) {
 // Track when WS last gave us a real price update
 let lastWsPrice = 0;
 
-// ── Fetch active 5m BTC event from Polymarket ─────────────────────────────
+// ── Fetch active 15m BTC event from Polymarket ────────────────────────────
 async function fetchActiveEvent() {
   try {
-    // Find current 5m BTC event by timestamp
+    // Find current 15m BTC event by timestamp
     const now = Math.floor(Date.now() / 1000);
-    // Round down to nearest 5 min
-    const slot = Math.floor(now / 300) * 300;
-    const slug = `btc-updown-5m-${slot}`;
+    // Round down to nearest 15 min
+    const slot = Math.floor(now / 900) * 900;
+    const slug = `btc-updown-15m-${slot}`;
 
     const res = await fetch(`https://gamma-api.polymarket.com/events?slug=${slug}`);
     const data = await res.json();
@@ -705,6 +769,43 @@ function connectBinanceStream() {
         liveState.binanceBtc = newPrice;
         broadcast({ type: 'binance_btc', price: newPrice });
         // if (changed) pushSnapshot(); // paused
+        // Auto-scalp: check for $threshold BTC move in winning direction
+        const hasPendingHedge = !!autoScalp.hedgeOrderId;
+        const busy = autoScalp.firing || hasPendingHedge || autoScalp.inFlight || autoScalp.needsHedge;
+        if (changed && autoScalp.enabled && !busy && activeEvent && liveState.btcStart != null) {
+          const ref = autoScalp.lastTriggerPrice ?? liveState.btcStart;
+          const delta = newPrice - ref;
+          const upWinning = liveState.upPrice != null && liveState.downPrice != null && liveState.upPrice > liveState.downPrice;
+          let triggerSide = null;
+          const winningPrice = upWinning ? liveState.upPrice : liveState.downPrice;
+          const thresh = autoScalp.threshold || 5;
+          const absDelta = Math.abs(delta);
+          const dirOk = (upWinning && delta > 0) || (!upWinning && delta < 0);
+          // only scalp when winning side is 45-85¢ (configurable range)
+          const winMin = (autoScalp.winningPriceMin ?? 45) / 100;
+          const winMax = (autoScalp.winningPriceMax ?? 85) / 100;
+          const inRange = winningPrice != null && winningPrice >= winMin && winningPrice <= winMax;
+          if (!inRange) {
+            if (Date.now() - autoScalpLastDiagLog > 60000) {
+              autoScalpLastDiagLog = Date.now();
+              console.log(`[AUTO-SCALP] No trigger: winning side ${winningPrice != null ? (winningPrice * 100).toFixed(0) : '?'}¢ outside ${(winMin*100).toFixed(0)}–${(winMax*100).toFixed(0)}¢ | Up=${liveState.upPrice != null ? (liveState.upPrice * 100).toFixed(0) : '?'}¢ Dn=${liveState.downPrice != null ? (liveState.downPrice * 100).toFixed(0) : '?'}¢`);
+            }
+          } else if (!dirOk || absDelta < thresh) {
+            if (Date.now() - autoScalpLastDiagLog > 60000) {
+              autoScalpLastDiagLog = Date.now();
+              console.log(`[AUTO-SCALP] No trigger: delta=$${delta.toFixed(1)} (need $${thresh}+ ${upWinning ? 'UP' : 'DOWN'}) | ref=$${ref?.toFixed(0)} btc=$${newPrice.toFixed(0)}`);
+            }
+          } else {
+            triggerSide = upWinning ? 'up' : 'down';
+            autoScalp.firing = true;
+            autoScalp.lastTriggerTime = Date.now();
+            const logEntry = { ts: Date.now(), side: triggerSide, btc: newPrice, delta: Math.round(delta) };
+            autoScalp.log = [logEntry, ...autoScalp.log].slice(0, 20);
+            console.log(`[AUTO-SCALP] Triggered ${triggerSide.toUpperCase()} — BTC $${delta >= 0 ? '+' : ''}${delta.toFixed(0)} from ref $${ref.toFixed(0)}`);
+            broadcast({ type: 'auto_scalp', status: 'triggered', side: triggerSide, delta: Math.round(delta), btc: newPrice });
+            fireAutoScalp(triggerSide);
+          }
+        }
       }
     } catch {}
   });
@@ -714,6 +815,172 @@ function connectBinanceStream() {
     binanceRetryDelay = Math.min(binanceRetryDelay * 2, 30000);
   });
   binanceWs.on('error', (e) => console.error('[BINANCE] error:', e.message));
+}
+
+// ── Auto-scalp fire function ─────────────────────────────────────────────
+// 1. FAK buy winning side
+// 2. Confirm fill
+// 3. Wait 1.5s, check price is stable (no change)
+// 4. FAK buy opposite side at current price + 1¢ (aggressive sweep)
+function _autoScalpAbort({ boughtLeg = false } = {}) {
+  if (boughtLeg) {
+    // We hold unhedged shares — stay locked until hedge fills
+    autoScalp.needsHedge = true;
+    console.log('[AUTO-SCALP] LOCKED — holding unhedged shares, waiting for hedge opportunity');
+    return;
+  }
+  autoScalp.firing = false;
+  autoScalp.inFlight = false;
+  autoScalp.needsHedge = false;
+  if (liveState.binanceBtc != null) {
+    autoScalp.lastTriggerPrice = liveState.binanceBtc;
+    autoScalp.lastTriggerTime = Date.now();
+  }
+}
+
+async function fireAutoScalp(side) {
+  if (autoScalp.inFlight) {
+    console.log('[AUTO-SCALP] BLOCKED: scalp already in progress');
+    return;
+  }
+  autoScalp.inFlight = true;
+  if (!clobClient || !activeEvent) { _autoScalpAbort(); return; }
+  const currentPrice = side === 'up' ? liveState.upPrice : liveState.downPrice;
+  const tokenId = side === 'up' ? liveState.tokenUp : liveState.tokenDown;
+  const otherSide = side === 'up' ? 'down' : 'up';
+  const otherTokenId = side === 'up' ? liveState.tokenDown : liveState.tokenUp;
+  if (!currentPrice || !tokenId || !otherTokenId) {
+    console.error('[AUTO-SCALP] Missing price or token — skipping');
+    _autoScalpAbort();
+    return;
+  }
+  const tickSize = activeEvent.tickSize || '0.01';
+  const tick = parseFloat(tickSize);
+  const negRisk = activeEvent.negRisk || false;
+  const sizeShares = autoScalp.shares;
+
+  const buyPrice = Math.max(0.01, Math.min(Math.round(Math.round(currentPrice * 100) / 100 / tick) * tick, 0.99));
+
+  try {
+    // ── Step 1: FAK buy winning side ──
+    const minFakPrice = Math.ceil(100 / sizeShares) / 100;
+    const fakPrice = Math.max(minFakPrice, Math.min(Math.round((buyPrice + 0.02) / tick) * tick, 0.99));
+    console.log(`[AUTO-SCALP] Step 1: FAK ${sizeShares}sh ${side.toUpperCase()} @ ${fakPrice}`);
+    const buyOrder = await clobClient.createOrder({ tokenID: tokenId, price: fakPrice, size: sizeShares, side: 'BUY' }, { tickSize, negRisk });
+    const buyResult = await clobClient.postOrder(buyOrder, 'FAK');
+    if (!buyResult?.success && !buyResult?.orderID && !buyResult?.takingAmount) {
+      console.error('[AUTO-SCALP] FAK failed:', buyResult?.error || JSON.stringify(buyResult));
+      broadcast({ type: 'auto_scalp', status: 'error', error: 'FAK failed' });
+      _autoScalpAbort();
+      return;
+    }
+    const rawTaking = parseFloat(buyResult?.takingAmount ?? 0);
+    const rawMaking = parseFloat(buyResult?.makingAmount ?? 0);
+    const sizeMatched = parseFloat(buyResult?.size_matched ?? 0);
+    let filled, spent;
+    if (rawTaking > 0 && rawMaking > 0) {
+      if (rawTaking > sizeShares * 2 && rawMaking <= sizeShares * 2) {
+        filled = rawMaking; spent = rawTaking;
+      } else {
+        filled = rawTaking; spent = rawMaking;
+      }
+    } else {
+      filled = sizeMatched || sizeShares;
+      spent = filled * buyPrice;
+    }
+    const avgPrice = spent > 0 && filled > 0 ? spent / filled : buyPrice;
+    const gotShares = filled > 0 ? Math.round(Math.min(filled, sizeShares * 1.5) * 100) / 100 : sizeShares;
+    if (gotShares <= 0) {
+      console.error('[AUTO-SCALP] FAK got 0 shares — no hedge');
+      broadcast({ type: 'auto_scalp', status: 'error', error: '0 shares filled' });
+      _autoScalpAbort();
+      return;
+    }
+    console.log(`[AUTO-SCALP] Step 1 done: Got ${gotShares}sh ${side.toUpperCase()} @ ~${(avgPrice*100).toFixed(0)}¢`);
+    // From here on, we hold unhedged shares — all aborts must keep the lock
+    autoScalp.unhedged = { side, shares: gotShares, avgPrice, ts: Date.now() };
+    broadcast({ type: 'auto_scalp', status: 'bought', side, avgPrice, gotShares });
+
+    supabase.from('polymarket_trades').insert({
+      polymarket_event_id: eventDbId(), direction: side,
+      purchase_price: avgPrice, purchase_amount: Math.round(spent * 100) / 100,
+      purchase_time: new Date().toISOString(), minute: Math.floor(Date.now() / 60000),
+      btc_price_at_purchase: liveState.btcCurrent, order_type: 'live',
+      order_status: 'filled', polymarket_order_id: buyResult?.orderID || `auto-scalp-buy-${Date.now()}`,
+      shares: gotShares,
+      notes: JSON.stringify({ type: 'auto-scalp-buy', side, avgPrice, gotShares, spent }),
+    }).select().single().then(({ error: dbErr }) => { if (dbErr) console.error('[AUTO-SCALP] DB error (buy):', dbErr); });
+
+    // ── Step 2: Immediately place hedge — always lock in profit ──
+    const hedgePrice = Math.max(0.01, Math.min(
+      Math.round(Math.round((1.0 - avgPrice - 0.01) * 100) / 100 / tick) * tick,
+      0.99
+    ));
+    if (hedgePrice <= 0.01) {
+      console.log(`[AUTO-SCALP] Hedge price too low (${(hedgePrice*100).toFixed(0)}¢) — LOCKED, holding unhedged`);
+      broadcast({ type: 'auto_scalp', status: 'locked_unhedged', reason: 'hedge price too low', side, gotShares });
+      _autoScalpAbort({ boughtLeg: true });
+      return;
+    }
+    const totalCost = avgPrice + hedgePrice;
+    const profitCents = Math.round((1.0 - totalCost) * 100);
+    console.log(`[AUTO-SCALP] Step 3: GTC ${gotShares}sh ${otherSide.toUpperCase()} @ ${(hedgePrice*100).toFixed(0)}¢ (${profitCents}¢ profit locked when filled)`);
+    const hedgeOrder = await clobClient.createOrder({ tokenID: otherTokenId, price: hedgePrice, size: gotShares, side: 'BUY' }, { tickSize, negRisk });
+    const hedgeResult = await clobClient.postOrder(hedgeOrder, 'GTC');
+    const hedgeId = hedgeResult?.orderID ?? hedgeResult?.order_id;
+    console.log(`[AUTO-SCALP] Hedge posted: id=${hedgeId}`);
+    // Only now reset the ref — failed/aborted scalps keep the old ref so they don't re-trigger
+    autoScalp.lastTriggerPrice = liveState.binanceBtc;
+
+    supabase.from('polymarket_trades').insert({
+      polymarket_event_id: eventDbId(), direction: otherSide,
+      purchase_price: hedgePrice, purchase_amount: Math.round(gotShares * hedgePrice * 100) / 100,
+      purchase_time: new Date().toISOString(), minute: Math.floor(Date.now() / 60000),
+      btc_price_at_purchase: liveState.btcCurrent, order_type: 'live',
+      order_status: 'open', polymarket_order_id: hedgeId || `auto-scalp-hedge-${Date.now()}`,
+      shares: gotShares,
+      notes: JSON.stringify({ type: 'auto-scalp-hedge', side: otherSide, hedgePrice, gotShares, method: 'gtc-1c-profit' }),
+    }).select().single().then(({ error: dbErr }) => { if (dbErr) console.error('[AUTO-SCALP] DB error (hedge):', dbErr); });
+
+    console.log(`[AUTO-SCALP] Hedge placed: ${side.toUpperCase()} @ ${(avgPrice*100).toFixed(0)}¢ + GTC ${otherSide.toUpperCase()} @ ${(hedgePrice*100).toFixed(0)}¢ = ${(totalCost*100).toFixed(0)}¢ → ${profitCents}¢ profit when filled`);
+    broadcast({ type: 'auto_scalp', status: 'placed', side, otherSide, buyPrice: avgPrice, hedgePrice, gotShares, profitCents });
+
+    // Track hedge order — block new scalps until filled or cancelled
+    if (hedgeId) {
+      autoScalp.hedgeOrderId = hedgeId;
+      console.log(`[AUTO-SCALP] Waiting for hedge ${hedgeId} to fill or be cancelled...`);
+      // Poll every 3s to check if hedge order is still open
+      const pollHedge = setInterval(async () => {
+        try {
+          const raw = await clobClient.getOpenOrders();
+          const list = Array.isArray(raw) ? raw : (raw?.data ?? raw?.orders ?? []);
+          const oid = o => o?.id ?? o?.order_id ?? o?.orderID ?? o?.orderId;
+          const still = (list || []).some(o => oid(o) === hedgeId);
+          if (!still) {
+            console.log(`[AUTO-SCALP] Hedge ${hedgeId} filled or cancelled — ready for next scalp`);
+            broadcast({ type: 'auto_scalp', status: 'hedge_done', hedgeId });
+            autoScalp.hedgeOrderId = null;
+            autoScalp.firing = false;
+            autoScalp.inFlight = false;
+            autoScalp.needsHedge = false;
+            autoScalp.unhedged = null;
+            clearInterval(pollHedge);
+          }
+        } catch (e) {
+          console.error('[AUTO-SCALP] Hedge poll error:', e.message);
+        }
+      }, 3000);
+    } else {
+      // Hedge posted but no ID — still holding unhedged shares
+      _autoScalpAbort({ boughtLeg: true });
+    }
+  } catch (e) {
+    console.error('[AUTO-SCALP] Error:', e?.message ?? e);
+    broadcast({ type: 'auto_scalp', status: 'error', error: e?.message });
+    autoScalp.hedgeOrderId = null;
+    // If we already bought the first leg, stay locked
+    _autoScalpAbort({ boughtLeg: !!autoScalp.unhedged });
+  }
 }
 
 // ── BTC price from Polymarket RTDS (Chainlink feed) ──────────────────────
@@ -875,9 +1142,9 @@ function scheduleNextEvent() {
 
   const now = Date.now();
   const nowSecs = Math.floor(now / 1000);
-  const nextSlot = (Math.floor(nowSecs / 300) + 1) * 300;
+  const nextSlot = (Math.floor(nowSecs / 900) + 1) * 900;
 
-  // If locked to 1h only, skip 5m splits — schedule hourly splits instead
+  // If locked to 1h only, skip 15m splits — schedule hourly splits instead
   if (!autoSplit.enabled || !k9Copy.enabled || k9Copy.eventTime === '1h') {
     const delay = (nextSlot * 1000) - now + 2000;
     eventTimer = setTimeout(refreshEvent, delay);
@@ -888,13 +1155,13 @@ function scheduleNextEvent() {
     return;
   }
 
-  // Pre-split: 15s BEFORE the next 5m boundary — retry every 2s until event is available
+  // Pre-split: 15s BEFORE the next 15m boundary — retry every 2s until event is available
   const PRE_SPLIT_START_SECONDS = 15;
   const PRE_SPLIT_RETRY_MS = 2000;
   const preSplitStartDelay = (nextSlot * 1000) - now - (PRE_SPLIT_START_SECONDS * 1000);
 
   const runPreSplit = async () => {
-    const upcomingSlug = `btc-updown-5m-${nextSlot}`;
+    const upcomingSlug = `btc-updown-15m-${nextSlot}`;
     for (let attempt = 1; attempt <= 10; attempt++) {
       try {
         console.log(`[PRE-SPLIT] Attempt ${attempt}: fetching ${upcomingSlug}`);
@@ -948,7 +1215,7 @@ function scheduleNextEvent() {
       await refreshEvent();
     } else {
       // Manual override: don't switch UI, but still run split for the new event if needed
-      const upcomingSlug = `btc-updown-5m-${nextSlot}`;
+      const upcomingSlug = `btc-updown-15m-${nextSlot}`;
       const { data: rows } = await supabase.from('polymarket_trades').select('notes').eq('polymarket_event_id', nextSlot);
       const ctfCount = (rows || []).filter(r => { try { return r.notes && JSON.parse(r.notes).type === 'ctf-split'; } catch { return false; } }).length;
       if (autoSplit.enabled && ctfCount < 2 && k9Copy.eventTime !== '1h') {
@@ -1104,7 +1371,7 @@ function scheduleHourlySplit() {
 }
 
 async function saveEventAnalysis(oldSlug) {
-  if (!oldSlug || !oldSlug.startsWith('btc-updown-5m-')) return;
+  if (!oldSlug || !oldSlug.startsWith('btc-updown-15m-')) return;
   try {
     // Paginate to fetch ALL snapshots
     let allData = [];
@@ -1149,9 +1416,16 @@ async function saveEventAnalysis(oldSlug) {
   }
 }
 
-async function refreshEvent() {
+async function refreshEvent(clientBtcOpen) {
   const event = await fetchActiveEvent();
   if (event && event.slug !== liveState.eventSlug) {
+    // Cancel all open GTC orders from the previous event before switching
+    if (clobClient && liveState.eventSlug) {
+      try {
+        await clobClient.cancelAll();
+        console.log('[EVENT] Cancelled all open orders from previous event');
+      } catch (e) { console.error('[EVENT] Failed to cancel orders:', e.message); }
+    }
     // Save analysis for the old event before switching
     if (liveState.eventSlug) saveEventAnalysis(liveState.eventSlug);
     // Reset in-memory shares for new event — but keep them if pre-split already ran for this slot
@@ -1160,6 +1434,7 @@ async function refreshEvent() {
       inMemoryShares = { up: 0, down: 0 };
     }
     console.log('[EVENT] new active event:', event.slug);
+    autoScalp.lastTriggerPrice = null; // reset reference on event change
     liveState.eventSlug = event.slug;
     liveState.eventTitle = event.title;
     liveState.tokenUp = event.tokenUp;
@@ -1168,10 +1443,36 @@ async function refreshEvent() {
     liveState.downPrice = null;
     liveState.upStartPrice = null;
     liveState.downStartPrice = null;
-    // Capture current BTC as the start price for this event, then reset so next tick re-captures
-    liveState.btcStart = liveState.btcCurrent;
+    // Capture BTC open price — prefer client-provided (from Binance REST on client),
+    // then try server-side Binance REST, then fall back to cached values
+    let freshBtc = clientBtcOpen || null;
+    if (!freshBtc) {
+      try {
+        const binRes = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT');
+        const binData = await binRes.json();
+        if (binData?.price) freshBtc = parseFloat(binData.price);
+      } catch {}
+    }
+    if (!freshBtc) freshBtc = liveState.binanceBtc || liveState.btcCurrent;
+    liveState.btcStart = freshBtc;
+    liveState.binanceBtc = freshBtc; // update cached value too
+    cachedOpenPrice = { slug: null, btc: null, up: null, down: null }; // invalidate cache for /api/event
     activeEvent = event;
     broadcast({ type: 'event', event });
+    // Save open price to database
+    try {
+      await supabase.from('polymarket_15m_snapshots').insert({
+        event_slug: event.slug,
+        btc_price: liveState.btcCurrent,
+        coin_price: freshBtc,
+        up_cost: null,
+        down_cost: null,
+        observed_at: new Date().toISOString(),
+        seconds_left: 300,
+        coin: 'btc',
+      });
+      console.log(`[EVENT] Saved open BTC=$${freshBtc} for ${event.slug}`);
+    } catch (e) { console.error('[EVENT] Failed to save open:', e.message); }
     // Fetch initial prices via REST immediately
     await fetchInitialPrices();
     // Then connect WS for live streaming
@@ -1226,6 +1527,34 @@ function startPricePoll() {
       if (liveState.upStartPrice == null && upPrice != null) liveState.upStartPrice = upPrice;
       if (liveState.downStartPrice == null && downPrice != null) liveState.downStartPrice = downPrice;
       if (changed) broadcast({ type: 'prices', ...liveState });
+
+      // ── Server-side stop-loss trigger check ───────────────────────────
+      if (stopLossState && !stopLossFiring && clobClient && activeEvent) {
+        const watchPrice = stopLossState.side === 'up' ? liveState.upPrice : liveState.downPrice;
+        if (watchPrice != null && watchPrice * 100 >= stopLossState.trigger) {
+          const sl = stopLossState;
+          stopLossState = null; // clear immediately
+          stopLossFiring = true;
+          console.log(`[SL] TRIGGERED — ${sl.shares}sh ${sl.side} @ ${(watchPrice * 100).toFixed(0)}¢ ≥ ${sl.trigger}¢`);
+          saveStopLossToDb(null); // clear from DB
+          const tokenId = sl.side === 'up' ? liveState.tokenUp : liveState.tokenDown;
+          if (tokenId) {
+            try {
+              const tickSize = activeEvent.tickSize || '0.01';
+              const signedOrder = await clobClient.createOrder({
+                tokenID: tokenId, price: 0.99, size: Math.max(5, sl.shares), side: 'BUY',
+              }, { tickSize, negRisk: activeEvent.negRisk || false });
+              const result = await clobClient.postOrder(signedOrder, 'FAK');
+              console.log(`[SL] FAK order filled:`, result?.orderID || result);
+              broadcast({ type: 'stop_loss', armed: false, fired: true, side: sl.side, shares: sl.shares, orderID: result?.orderID });
+            } catch (e) {
+              console.error('[SL] FAK order error:', e?.message ?? e);
+              broadcast({ type: 'stop_loss', armed: false, fired: true, error: e?.message });
+            }
+          }
+          stopLossFiring = false;
+        }
+      }
     } finally {
       pricePollInFlight = false;
     }
@@ -1322,7 +1651,7 @@ async function fetchHoldings() {
 
 // ── Buy order (LIVE — GTC limit order via CLOB) ─────────────────────────────
 app.post('/api/buy', async (req, res) => {
-  const { side, amount } = req.body;
+  const { side, amount, limitPrice, shares: reqShares } = req.body;
 
   if (!activeEvent) return res.status(400).json({ error: 'No active event' });
   if (!['up', 'down'].includes(side)) return res.status(400).json({ error: 'Invalid side' });
@@ -1336,77 +1665,256 @@ app.post('/api/buy', async (req, res) => {
 
   const tickSize = activeEvent.tickSize || '0.01';
   const tick = parseFloat(tickSize);
-  // Buy at current price (rounds to tick)
-  const buyPrice = Math.min(Math.round(price / tick) * tick, 0.99);
-  // Polymarket BUY orders: size = dollar amount to spend (not shares)
-  const sizeUsd = Math.round(amount * 100) / 100;
-  if (sizeUsd < 1) return res.status(400).json({ error: 'Amount too small (min $1)' });
+  // Use explicit limitPrice if provided, otherwise current price (rounds to tick)
+  const buyPrice = limitPrice
+    ? Math.max(0.01, Math.min(Math.round(Math.round(parseFloat(limitPrice) * 100) / 100 / tick) * tick, 0.99))
+    : Math.min(Math.round(Math.round(price * 100) / 100 / tick) * tick, 0.99);
+  // Use explicit shares if provided, otherwise compute from amount (min 5)
+  const sizeUsd = Math.round((amount || 0) * 100) / 100;
+  const sizeShares = reqShares ? Math.max(5, Math.round(parseFloat(reqShares))) : Math.max(5, Math.ceil((sizeUsd / buyPrice) * 100) / 100);
 
   const endDate = activeEvent.endDate ? new Date(activeEvent.endDate) : null;
   const timeLeftSecs = endDate ? Math.max(0, Math.floor((endDate - Date.now()) / 1000)) : null;
 
+  // Respond instantly — fire order in background
+  res.json({
+    success: true, error: null,
+    price: buyPrice, shares: sizeShares,
+    purchase_amount: Math.round(sizeShares * buyPrice * 100) / 100,
+    status: 'sending',
+    snapshot: { upPrice: liveState.upPrice, downPrice: liveState.downPrice, btcPrice: liveState.btcCurrent, timeLeftSecs },
+  });
+
+  // Fire-and-forget: sign, post, record
+  (async () => {
+    try {
+      const t0 = Date.now();
+      const signedOrder = await clobClient.createOrder({
+        tokenID: tokenId, price: buyPrice, size: sizeShares, side: 'BUY',
+      }, { tickSize, negRisk: activeEvent.negRisk || false });
+      const result = await clobClient.postOrder(signedOrder, 'GTC');
+      console.log(`[BUY] Posted in ${Date.now() - t0}ms — id:`, result?.orderID || result);
+
+      const tradeData = {
+        polymarket_event_id: eventDbId(), direction: side,
+        purchase_price: buyPrice, purchase_amount: Math.round(sizeShares * buyPrice * 100) / 100,
+        purchase_time: new Date().toISOString(), minute: Math.floor(Date.now() / 60000),
+        btc_price_at_purchase: liveState.btcCurrent, order_type: 'live',
+        order_status: result?.orderID ? 'open' : 'failed',
+        polymarket_order_id: result?.orderID || `live-${Date.now()}`,
+        shares: sizeShares,
+        notes: JSON.stringify({ tokenId, eventTitle: liveState.eventTitle, upPriceAtBuy: liveState.upPrice, downPriceAtBuy: liveState.downPrice, timeLeftSecs, orderType: 'GTC' }),
+      };
+      supabase.from('polymarket_trades').insert(tradeData).select().single()
+        .then(({ error: dbErr }) => { if (dbErr) console.error('[BUY] DB error:', dbErr); });
+
+      broadcast({ type: 'order', status: 'placed', side, price: buyPrice, shares: sizeShares, orderID: result?.orderID });
+    } catch (e) {
+      console.error('[BUY] Error:', e?.message ?? e);
+      broadcast({ type: 'order', status: 'failed', side, price: buyPrice, error: e?.message });
+    }
+  })();
+});
+
+// ── Scalp: FAK buy one side → GTC hedge other side for profit ──────────────
+// Up+Down=$1, so buy Up@45¢ + buy Down@50¢ = 95¢ cost, $1 payout = 5¢ profit
+app.post('/api/scalp', async (req, res) => {
+  const { side, shares: reqShares, profitCents } = req.body;
+  const profit = parseInt(profitCents) || 2;
+
+  if (!activeEvent) return res.status(400).json({ error: 'No active event' });
+  if (!['up', 'down'].includes(side)) return res.status(400).json({ error: 'Invalid side' });
+  if (!clobClient) return res.status(500).json({ error: 'CLOB client not ready' });
+
+  const currentPrice = side === 'up' ? liveState.upPrice : liveState.downPrice;
+  const tokenId = side === 'up' ? liveState.tokenUp : liveState.tokenDown;
+  const otherSide = side === 'up' ? 'down' : 'up';
+  const otherTokenId = side === 'up' ? liveState.tokenDown : liveState.tokenUp;
+  if (!currentPrice) return res.status(400).json({ error: 'No price available' });
+  if (!tokenId || !otherTokenId) return res.status(400).json({ error: 'No token ID' });
+
+  const tickSize = activeEvent.tickSize || '0.01';
+  const tick = parseFloat(tickSize);
+  const negRisk = activeEvent.negRisk || false;
+  const sizeShares = Math.max(5, Math.round(parseFloat(reqShares) || 5));
+
+  const buyPrice = Math.max(0.01, Math.min(Math.round(Math.round(currentPrice * 100) / 100 / tick) * tick, 0.99));
+  const hedgePrice = Math.max(0.01, Math.min(
+    Math.round(Math.round((1.0 - currentPrice - profit / 100) * 100) / 100 / tick) * tick,
+    0.99
+  ));
+
+  if (buyPrice + hedgePrice >= 1.0) {
+    return res.status(400).json({ error: `No room for ${profit}¢ profit: ${(buyPrice*100).toFixed(0)}¢ + ${(hedgePrice*100).toFixed(0)}¢ ≥ 100¢` });
+  }
+
+  res.json({
+    success: true,
+    buy: { price: buyPrice, shares: sizeShares, side },
+    hedge: { price: hedgePrice, shares: sizeShares, side: otherSide },
+    profitCents: profit,
+    status: 'sending',
+  });
+
+  // Fire-and-forget: FAK buy → read fill → GTC hedge with matching size
+  (async () => {
+    try {
+      const t0 = Date.now();
+      const minFakPrice = Math.ceil(100 / sizeShares) / 100;
+      const fakPrice = Math.max(minFakPrice, Math.min(Math.round((buyPrice + 0.02) / tick) * tick, 0.99));
+      console.log(`[SCALP] FAK ${sizeShares}sh @ ${fakPrice} ($${(sizeShares * fakPrice).toFixed(2)})`);
+      const buyOrder = await clobClient.createOrder({ tokenID: tokenId, price: fakPrice, size: sizeShares, side: 'BUY' }, { tickSize, negRisk });
+      const buyResult = await clobClient.postOrder(buyOrder, 'FAK');
+      console.log(`[SCALP] FAK done in ${Date.now() - t0}ms:`, JSON.stringify(buyResult));
+
+      if (!buyResult?.success && !buyResult?.orderID && !buyResult?.takingAmount) {
+        console.error('[SCALP] FAK failed:', buyResult?.error || JSON.stringify(buyResult));
+        broadcast({ type: 'scalp', status: 'error', error: buyResult?.error || 'FAK failed' });
+        return;
+      }
+
+      const rawTaking = parseFloat(buyResult?.takingAmount ?? 0);
+      const rawMaking = parseFloat(buyResult?.makingAmount ?? 0);
+      const sizeMatched = parseFloat(buyResult?.size_matched ?? 0);
+      console.log(`[SCALP] FAK raw: takingAmount=${rawTaking}, makingAmount=${rawMaking}, size_matched=${sizeMatched}, requested=${sizeShares}`);
+      let filled, spent;
+      if (rawTaking > 0 && rawMaking > 0) {
+        if (rawTaking > sizeShares * 2 && rawMaking <= sizeShares * 2) {
+          filled = rawMaking; spent = rawTaking;
+          console.log(`[SCALP] Detected swapped taking/making — shares=${filled}, usdc=${spent}`);
+        } else {
+          filled = rawTaking; spent = rawMaking;
+        }
+      } else {
+        filled = sizeMatched || sizeShares;
+        spent = filled * buyPrice;
+      }
+      const avgPrice = spent > 0 && filled > 0 ? spent / filled : buyPrice;
+      const gotShares = filled > 0 ? Math.round(Math.min(filled, sizeShares * 1.5) * 100) / 100 : sizeShares;
+      console.log(`[SCALP] Got ${gotShares} shares @ ~${(avgPrice*100).toFixed(0)}¢ (filled=${filled}, spent=${spent})`);
+
+      if (gotShares <= 0) {
+        console.error('[SCALP] FAK got 0 shares — no hedge');
+        broadcast({ type: 'scalp', status: 'error', error: 'FAK fill was 0 shares' });
+        return;
+      }
+
+      supabase.from('polymarket_trades').insert({
+        polymarket_event_id: eventDbId(), direction: side,
+        purchase_price: avgPrice, purchase_amount: Math.round(spent * 100) / 100,
+        purchase_time: new Date().toISOString(), minute: Math.floor(Date.now() / 60000),
+        btc_price_at_purchase: liveState.btcCurrent, order_type: 'live',
+        order_status: 'filled', polymarket_order_id: buyResult?.orderID || `scalp-buy-${Date.now()}`,
+        shares: gotShares,
+        notes: JSON.stringify({ type: 'scalp-buy', side, tokenId, avgPrice, gotShares, spent }),
+      }).select().single().then(({ error: dbErr }) => { if (dbErr) console.error('[SCALP] DB error (buy):', dbErr); });
+
+      const actualHedgePrice = Math.max(0.01, Math.min(
+        Math.round(Math.round((1.0 - avgPrice - profit / 100) * 100) / 100 / tick) * tick,
+        0.99
+      ));
+      console.log(`[SCALP] Hedge: ${gotShares}sh ${otherSide.toUpperCase()} @ ${actualHedgePrice}`);
+      const hedgeOrder = await clobClient.createOrder({ tokenID: otherTokenId, price: actualHedgePrice, size: gotShares, side: 'BUY' }, { tickSize, negRisk });
+      const hedgeResult = await clobClient.postOrder(hedgeOrder, 'GTC');
+      const hedgeId = hedgeResult?.orderID ?? hedgeResult?.order_id;
+      console.log(`[SCALP] Hedge posted in ${Date.now() - t0}ms — id: ${hedgeId}`);
+
+      supabase.from('polymarket_trades').insert({
+        polymarket_event_id: eventDbId(), direction: otherSide,
+        purchase_price: actualHedgePrice, purchase_amount: Math.round(gotShares * actualHedgePrice * 100) / 100,
+        purchase_time: new Date().toISOString(), minute: Math.floor(Date.now() / 60000),
+        btc_price_at_purchase: liveState.btcCurrent, order_type: 'live',
+        order_status: 'open', polymarket_order_id: hedgeId || `scalp-hedge-${Date.now()}`,
+        shares: gotShares,
+        notes: JSON.stringify({ type: 'scalp-hedge', side: otherSide, tokenId: otherTokenId, hedgePrice: actualHedgePrice, gotShares }),
+      }).select().single().then(({ error: dbErr }) => { if (dbErr) console.error('[SCALP] DB error (hedge):', dbErr); });
+
+      broadcast({ type: 'scalp', status: 'placed', hedgeId, buyPrice: avgPrice, hedgePrice: actualHedgePrice, gotShares, side, otherSide, profit });
+
+      // Monitor: cancel hedge if not filled within 4 min
+      if (hedgeId) {
+        for (let i = 0; i < 120; i++) {
+          await new Promise(r => setTimeout(r, 2000));
+          try {
+            const orders = await clobClient.getOpenOrders();
+            const list = Array.isArray(orders) ? orders : (orders?.data ?? orders?.orders ?? []);
+            if (!list.find(o => (o.id || o.order_id || o.orderID) === hedgeId)) {
+              console.log(`[SCALP] Hedge filled — ${profit}¢ profit locked`);
+              broadcast({ type: 'scalp', status: 'complete', profit });
+              return;
+            }
+          } catch {}
+        }
+        console.log(`[SCALP] Hedge timeout — cancelling`);
+        try { await clobClient.cancelOrder({ orderID: hedgeId }); } catch {}
+      }
+    } catch (e) {
+      console.error('[SCALP] Error:', e.message);
+      broadcast({ type: 'scalp', status: 'error', error: e.message });
+    }
+  })();
+});
+
+// ── Stop-loss config: arm / disarm / query ─────────────────────────────────
+app.get('/api/stop-loss-config', (req, res) => {
+  res.json({ armed: !!stopLossState, ...(stopLossState || {}) });
+});
+
+app.post('/api/stop-loss-config', async (req, res) => {
+  const { side, trigger, shares } = req.body;
+  if (!['up', 'down'].includes(side)) return res.status(400).json({ error: 'Invalid side' });
+  const t = parseInt(trigger);
+  if (!t || t < 1 || t > 99) return res.status(400).json({ error: 'Trigger must be 1-99¢' });
+  const s = Math.max(5, parseInt(shares) || 5);
+  stopLossState = { side, trigger: t, shares: s };
+  stopLossFiring = false;
+  await saveStopLossToDb(stopLossState);
+  console.log(`[SL] ARMED — ${s}sh ${side} ≥${t}¢`);
+  broadcast({ type: 'stop_loss', armed: true, ...stopLossState });
+  res.json({ armed: true, ...stopLossState });
+});
+
+app.delete('/api/stop-loss-config', async (req, res) => {
+  stopLossState = null;
+  stopLossFiring = false;
+  await saveStopLossToDb(null);
+  console.log('[SL] DISARMED');
+  broadcast({ type: 'stop_loss', armed: false });
+  res.json({ armed: false });
+});
+
+// ── Stop-loss kill: FAK buy opposite side at 99¢ to sweep the book ──────────
+app.post('/api/stop-loss', async (req, res) => {
+  const { side, shares } = req.body; // side = 'up' or 'down' — the side to BUY (opposite of your position)
+
+  if (!activeEvent) return res.status(400).json({ error: 'No active event' });
+  if (!['up', 'down'].includes(side)) return res.status(400).json({ error: 'Invalid side' });
+  if (!clobClient) return res.status(500).json({ error: 'CLOB client not ready' });
+
+  const tokenId = side === 'up' ? liveState.tokenUp : liveState.tokenDown;
+  if (!tokenId) return res.status(400).json({ error: 'No token ID' });
+
+  const tickSize = activeEvent.tickSize || '0.01';
+  const buyPrice = 0.99;
+  const sizeShares = Math.max(5, Math.ceil(parseFloat(shares || 5)));
+
   try {
-    console.log(`[BUY] Placing GTC limit BUY $${sizeUsd} ${side.toUpperCase()} @ ${buyPrice} (tick=${tickSize})`);
+    console.log(`[STOP-LOSS] FAK BUY ${sizeShares}sh ${side.toUpperCase()} @ ${buyPrice} (sweep)`);
 
     const signedOrder = await clobClient.createOrder({
       tokenID: tokenId,
       price: buyPrice,
-      size: sizeUsd,
+      size: sizeShares,
       side: 'BUY',
     }, { tickSize, negRisk: activeEvent.negRisk || false });
 
-    const result = await clobClient.postOrder(signedOrder, 'GTC');
-    console.log('[BUY] Order posted:', result?.orderID || result);
+    const result = await clobClient.postOrder(signedOrder, 'FAK');
+    console.log('[STOP-LOSS] Order posted:', result?.orderID || result);
 
-    // Estimated shares = amount/price (actual fill may vary slightly)
-    const estimatedShares = sizeUsd / buyPrice;
-
-    // Record to DB
-    const tradeData = {
-      polymarket_event_id: eventDbId(),
-      direction: side,
-      purchase_price: buyPrice,
-      purchase_amount: sizeUsd,
-      purchase_time: new Date().toISOString(),
-      btc_price_at_purchase: liveState.btcCurrent,
-      order_type: 'live',
-      order_status: result?.orderID ? 'open' : 'failed',
-      polymarket_order_id: result?.orderID || `live-${Date.now()}`,
-      shares: Math.round(estimatedShares * 100) / 100,
-      notes: JSON.stringify({
-        tokenId,
-        eventTitle: liveState.eventTitle,
-        upPriceAtBuy: liveState.upPrice,
-        downPriceAtBuy: liveState.downPrice,
-        timeLeftSecs,
-        orderType: 'GTC',
-      }),
-    };
-
-    const { data: trade, error: dbErr } = await supabase
-      .from('polymarket_trades').insert(tradeData).select().single();
-    if (dbErr) console.error('[BUY] DB error:', dbErr);
-
-    const holdings = await fetchHoldings();
-
-    res.json({
-      success: true,
-      error: null,
-      trade: trade || tradeData,
-      order: { orderID: result?.orderID },
-      price: buyPrice,
-      shares: Math.round(estimatedShares * 100) / 100,
-      snapshot: {
-        upPrice: liveState.upPrice, downPrice: liveState.downPrice,
-        btcPrice: liveState.btcCurrent, timeLeftSecs, holdings,
-      },
-    });
+    res.json({ success: true, orderID: result?.orderID, shares: sizeShares, price: buyPrice });
   } catch (e) {
-    const errMsg = e?.message ?? e?.errorMsg ?? String(e);
-    console.error('[BUY] Error:', errMsg);
-    if (!res.headersSent) {
-      res.status(500).json({ success: false, error: errMsg });
-    }
+    console.error('[STOP-LOSS] Error:', e?.message ?? e);
+    res.status(500).json({ success: false, error: e?.message ?? String(e) });
   }
 });
 
@@ -1426,8 +1934,8 @@ app.post('/api/sell', async (req, res) => {
 
   const tickSize = activeEvent.tickSize || '0.01';
   const tick = parseFloat(tickSize);
-  // Sell at current price (rounds to tick)
-  const sellPrice = Math.max(Math.round(price / tick) * tick, 0.01);
+  // Sell at current price - 1¢ (cross the spread to fill immediately)
+  const sellPrice = Math.max(Math.round((price - 0.01) / tick) * tick, 0.01);
   const roundedShares = Math.round(parseFloat(shares) * 100) / 100;
   if (roundedShares < 1) return res.status(400).json({ error: 'Size too small' });
 
@@ -1464,22 +1972,19 @@ app.post('/api/sell', async (req, res) => {
       }),
     };
 
-    const { data: trade, error: dbErr } = await supabase
-      .from('polymarket_trades').insert(tradeData).select().single();
-    if (dbErr) console.error('[SELL] DB error:', dbErr);
-
-    const holdings = await fetchHoldings();
+    const dbPromise = supabase.from('polymarket_trades').insert(tradeData).select().single();
+    dbPromise.then(({ error: dbErr }) => { if (dbErr) console.error('[SELL] DB error:', dbErr); });
 
     res.json({
       success: true,
       error: null,
-      trade: trade || tradeData,
+      trade: tradeData,
       order: { orderID: result?.orderID },
       price: sellPrice,
       shares: roundedShares,
       snapshot: {
         upPrice: liveState.upPrice, downPrice: liveState.downPrice,
-        btcPrice: liveState.btcCurrent, holdings,
+        btcPrice: liveState.btcCurrent,
       },
     });
   } catch (e) {
@@ -1558,10 +2063,10 @@ app.get('/api/auto-split', (req, res) => {
 app.get('/api/split-status', (req, res) => {
   const now = Date.now();
   const nowSecs = Math.floor(now / 1000);
-  const nextSlot = (Math.floor(nowSecs / 300) + 1) * 300;
+  const nextSlot = (Math.floor(nowSecs / 900) + 1) * 900;
   const preSplitStartDelay = (nextSlot * 1000) - now - (15 * 1000);
   const refreshDelay = (nextSlot * 1000) - now + 2000;
-  const upcomingSlug = `btc-updown-5m-${nextSlot}`;
+  const upcomingSlug = `btc-updown-15m-${nextSlot}`;
   const nextSlotTime = new Date(nextSlot * 1000).toISOString();
   const hasFunder = !!FUNDER_ADDRESS;
   const hasKey = !!process.env.PRIVATE_KEY;
@@ -2245,6 +2750,42 @@ app.get('/api/k9-copy/status', async (req, res) => {
   });
 });
 
+// ── Auto-scalp toggle + status ───────────────────────────────────────────────
+app.get('/api/auto-scalp', (req, res) => {
+  res.json({
+    enabled: autoScalp.enabled,
+    threshold: autoScalp.threshold,
+    profitCents: autoScalp.profitCents,
+    shares: autoScalp.shares,
+    winningPriceMin: autoScalp.winningPriceMin,
+    winningPriceMax: autoScalp.winningPriceMax,
+    cooldownSeconds: autoScalp.cooldownSeconds,
+    lastTriggerPrice: autoScalp.lastTriggerPrice,
+    firing: autoScalp.firing,
+    hedgeOrderId: autoScalp.hedgeOrderId || null,
+    ref: autoScalp.lastTriggerPrice ?? liveState.btcStart,
+    btc: liveState.binanceBtc,
+    log: autoScalp.log,
+  });
+});
+
+app.post('/api/auto-scalp', (req, res) => {
+  const { enabled, threshold, profitCents, shares, winningPriceMin, winningPriceMax, cooldownSeconds } = req.body;
+  if (typeof enabled === 'boolean') autoScalp.enabled = enabled;
+  if (threshold != null) autoScalp.threshold = parseFloat(threshold) || 5;
+  if (profitCents != null) autoScalp.profitCents = parseInt(profitCents) || 2;
+  if (shares != null) autoScalp.shares = Math.max(5, parseInt(shares) || 5);
+  if (winningPriceMin != null) autoScalp.winningPriceMin = Math.max(1, Math.min(99, parseInt(winningPriceMin) || 45));
+  if (winningPriceMax != null) autoScalp.winningPriceMax = Math.max(1, Math.min(99, parseInt(winningPriceMax) || 85));
+  if (cooldownSeconds != null) autoScalp.cooldownSeconds = Math.max(5, Math.min(120, parseInt(cooldownSeconds) || 15));
+  if (enabled) {
+    // Use Binance price as ref; fallback to Polymarket btcStart if Binance not connected yet
+    autoScalp.lastTriggerPrice = liveState.binanceBtc ?? liveState.btcStart;
+  }
+  console.log(`[AUTO-SCALP] ${autoScalp.enabled ? 'ON' : 'OFF'} — $${autoScalp.threshold} threshold, ${autoScalp.profitCents}¢ profit, ${autoScalp.shares}sh, ${autoScalp.cooldownSeconds}s cooldown, winning ${autoScalp.winningPriceMin}–${autoScalp.winningPriceMax}¢`);
+  res.json({ success: true, ...autoScalp });
+});
+
 // ── Cancel all open orders ───────────────────────────────────────────────────
 app.post('/api/cancel-all', async (req, res) => {
   if (!clobClient) return res.status(500).json({ error: 'CLOB client not ready' });
@@ -2321,7 +2862,7 @@ app.get('/api/wallet', async (req, res) => {
 // ── Positions from Polymarket (source of truth) ─────────────────────────────
 app.get('/api/positions', async (req, res) => {
   try {
-    const user = (process.env.PROXY_WALLET || process.env.FUNDER_ADDRESS)?.toLowerCase();
+    const user = (process.env.FUNDER_ADDRESS || process.env.PROXY_WALLET)?.toLowerCase();
     if (!user) return res.json({ positions: [], error: 'PROXY_WALLET or FUNDER_ADDRESS not set' });
     const eventSlug = req.query.event;
     const conditionId = activeEvent?.conditionId && activeEvent?.slug === eventSlug
@@ -2342,7 +2883,28 @@ app.get('/api/positions', async (req, res) => {
 });
 
 // ── Active event ───────────────────────────────────────────────────────────
-app.get('/api/event', (req, res) => res.json({ event: activeEvent, liveState }));
+app.get('/api/event', async (req, res) => {
+  // Lazily fetch & cache the open price from the first DB snapshot for this event
+  const slug = liveState.eventSlug;
+  if (slug && slug !== cachedOpenPrice.slug) {
+    try {
+      const { data } = await supabase
+        .from('polymarket_15m_snapshots')
+        .select('coin_price, btc_price, up_cost, down_cost')
+        .eq('event_slug', slug)
+        .order('observed_at', { ascending: true })
+        .limit(1);
+      const row = data?.[0];
+      cachedOpenPrice = {
+        slug,
+        btc: row ? (parseFloat(row.coin_price) || parseFloat(row.btc_price) || null) : null,
+        up: row?.up_cost != null ? parseFloat(row.up_cost) : null,
+        down: row?.down_cost != null ? parseFloat(row.down_cost) : null,
+      };
+    } catch { cachedOpenPrice = { slug, btc: null, up: null, down: null }; }
+  }
+  res.json({ event: activeEvent, liveState, openPrice: cachedOpenPrice, stopLoss: stopLossState ? { armed: true, ...stopLossState } : { armed: false } });
+});
 
 // ── Shared slug cache (avoids slow 169K row scans on every request) ────────
 let _slugCache = { k9Slugs: {}, snapSlugs: [], analysisSlugs: [], updatedAt: 0 };
@@ -2620,7 +3182,12 @@ app.post('/api/event/switch', async (req, res) => {
 // ── Force refresh (back to auto 5m cycle) ─────────────────────────────────
 app.post('/api/event/refresh', async (req, res) => {
   manualEventOverride = false;
-  await refreshEvent();
+  const clientBtcOpen = req.body?.btcOpen ? parseFloat(req.body.btcOpen) : null;
+  await refreshEvent(clientBtcOpen);
+  // Reconnect stale streams
+  try { connectBinanceStream(); } catch (e) { console.error('[REFRESH] Binance reconnect:', e.message); }
+  try { connectBtcStream(); } catch (e) { console.error('[REFRESH] BTC reconnect:', e.message); }
+  scheduleNextEvent();
   res.json({ success: true, event: activeEvent });
 });
 
@@ -2716,7 +3283,7 @@ app.get('/api/event-archive', async (req, res) => {
     }
 
     // 2. Also get current live event from snapshots
-    if (liveState.eventSlug?.startsWith('btc-updown-5m-')) {
+    if (liveState.eventSlug?.startsWith('btc-updown-15m-')) {
       const { data: liveSnaps } = await supabase
         .from('polymarket_15m_snapshots')
         .select('observed_at, btc_price, coin_price, up_cost, down_cost')
@@ -3574,6 +4141,8 @@ wss.on('connection', (ws) => {
 // ══════════════════════════════════════════════════════════════════════════
 const K9_WALLET     = '0xd0d6053c3c37e727402d84c14069780d360993aa';
 const K9_PAD        = '0x000000000000000000000000' + K9_WALLET.slice(2);
+const WHALE_WALLET  = '0x63ce342161250d705dc0b16df89036c8e5f9ba9a'; // @0x8dxd
+const WHALE_PAD     = '0x000000000000000000000000' + WHALE_WALLET.slice(2);
 const TRANSFER_SIG  = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 const ORDER_FILLED  = '0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6';
 const TRANSFER_SINGLE = '0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62';
@@ -3594,16 +4163,19 @@ let k9Pending      = {};   // txHash -> { detectedAt }
 let k9SeenTx       = new Set();
 const k9TxBuffer   = {};   // txHash -> [fills] — buffer to detect complete sets
 
+// Whale (0x8dxd) watcher state
+let whaleSeenTx       = new Set();
+const whaleTxBuffer   = {};
+
 // Seed k9SeenTx from Supabase so we don't re-insert after restart
 async function seedK9SeenTx() {
   try {
     const { data } = await supabase.from('k9_observed_trades')
-      .select('tx_hash, log_index')
+      .select('tx_hash')
       .order('id', { ascending: false }).limit(5000);
     if (data?.length) {
       for (const t of data) {
-        const logIdx = t.log_index != null ? t.log_index : t.tx_hash; // fallback for old rows
-        k9SeenTx.add(`${t.tx_hash}:${logIdx}`);
+        k9SeenTx.add(t.tx_hash);  // partial dedup — new logs use txHash:logIndex
       }
       console.log(`[k9-watcher] Seeded dedup set with ${k9SeenTx.size} entries from Supabase`);
     }
@@ -3764,14 +4336,15 @@ async function saveK9Trades(trades) {
 }
 
 // ── Shared: decode an OrderFilled log into a fill object ──────────────────
-function decodeOrderFilledLog(log) {
+function decodeOrderFilledLog(log, wallet = K9_WALLET, seenSet = k9SeenTx) {
   const topics = log.topics || [];
   if (topics.length < 4) return null;
 
+  const walletLower = wallet.toLowerCase();
   const txHash   = log.transactionHash;
   const logMaker = '0x' + topics[2].slice(-40).toLowerCase();
   const logTaker = '0x' + topics[3].slice(-40).toLowerCase();
-  if (logMaker !== K9_WALLET.toLowerCase() && logTaker !== K9_WALLET.toLowerCase()) return null;
+  if (logMaker !== walletLower && logTaker !== walletLower) return null;
 
   const data = (log.data || '0x').slice(2);
   if (data.length < 256) return null;
@@ -3783,19 +4356,19 @@ function decodeOrderFilledLog(log) {
   const makerAmount = BigInt('0x' + chunks[2]);
   const takerAmount = BigInt('0x' + chunks[3]);
 
-  const k9IsMaker = logMaker === K9_WALLET.toLowerCase();
-  const k9IsTaker = logTaker === K9_WALLET.toLowerCase();
+  const isMaker = logMaker === walletLower;
+  const isTaker = logTaker === walletLower;
   let usdcSize, shares, tokenId, side;
-  if (k9IsMaker && makerAsset === 0n) {
+  if (isMaker && makerAsset === 0n) {
     usdcSize = Number(makerAmount) / 1e6; shares = Number(takerAmount) / 1e6;
     tokenId = takerAsset; side = 'buy';
-  } else if (k9IsTaker && takerAsset === 0n) {
+  } else if (isTaker && takerAsset === 0n) {
     usdcSize = Number(takerAmount) / 1e6; shares = Number(makerAmount) / 1e6;
     tokenId = makerAsset; side = 'buy';
-  } else if (k9IsMaker && takerAsset === 0n) {
+  } else if (isMaker && takerAsset === 0n) {
     usdcSize = Number(takerAmount) / 1e6; shares = Number(makerAmount) / 1e6;
     tokenId = makerAsset; side = 'sell';
-  } else if (k9IsTaker && makerAsset === 0n) {
+  } else if (isTaker && makerAsset === 0n) {
     usdcSize = Number(makerAmount) / 1e6; shares = Number(takerAmount) / 1e6;
     tokenId = takerAsset; side = 'sell';
   } else {
@@ -3808,9 +4381,9 @@ function decodeOrderFilledLog(log) {
 
   const logIdx = log.logIndex || '0';
   const dedup = `${txHash}:${logIdx}`;
-  if (k9SeenTx.has(dedup)) return null;
-  k9SeenTx.add(dedup);
-  if (k9SeenTx.size > 10000) k9SeenTx = new Set([...k9SeenTx].slice(-5000));
+  if (seenSet.has(dedup)) return null;
+  seenSet.add(dedup);
+  if (seenSet.size > 10000) seenSet = new Set([...seenSet].slice(-5000));
 
   return { txHash, logIndex: logIdx, slug: info.slug, outcome: info.outcome, side,
            price, shares, usdcSize, coin: info.coin,
@@ -3818,13 +4391,13 @@ function decodeOrderFilledLog(log) {
 }
 
 // ── Decode rebate TransferSingle: ConditionalTokens → k9 from rebate contract ──
-function decodeRebateTransfer(log) {
+function decodeRebateTransfer(log, wallet = K9_WALLET, seenSet = k9SeenTx) {
   const topics = log.topics || [];
   if (topics.length < 4) return null;
   const from = '0x' + topics[2].slice(-40).toLowerCase();
   if (from !== REBATE_CONTRACT.toLowerCase()) return null; // only rebate contract
   const to = '0x' + topics[3].slice(-40).toLowerCase();
-  if (to !== K9_WALLET.toLowerCase()) return null;
+  if (to !== wallet.toLowerCase()) return null;
 
   const data = (log.data || '0x').slice(2);
   if (data.length < 128) return null;
@@ -3841,8 +4414,8 @@ function decodeRebateTransfer(log) {
   const txHash = log.transactionHash;
   const logIdx = log.logIndex || '0';
   const dedup = `rebate:${txHash}:${logIdx}`;
-  if (k9SeenTx.has(dedup)) return null;
-  k9SeenTx.add(dedup);
+  if (seenSet.has(dedup)) return null;
+  seenSet.add(dedup);
 
   return { txHash, logIndex: logIdx, slug: info.slug, outcome: info.outcome, side: 'buy',
            price: 0, shares: amount, usdcSize: 0, coin: info.coin,
@@ -4017,6 +4590,257 @@ async function k9HttpPoll() {
   }
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// WHALE WATCHER (0x8dxd) — 15m events only
+// ══════════════════════════════════════════════════════════════════════════
+
+async function seedWhaleSeenTx() {
+  try {
+    const { data } = await supabase.from('k9_observed_trades')
+      .select('tx_hash')
+      .like('slug', '%-15m-%')
+      .order('id', { ascending: false }).limit(5000);
+    if (data?.length) {
+      for (const t of data) {
+        whaleSeenTx.add(t.tx_hash);  // partial dedup
+      }
+      console.log(`[whale-watcher] Seeded dedup set with ${whaleSeenTx.size} entries`);
+    }
+  } catch (e) {
+    console.error('[whale-watcher] seedWhaleSeenTx error:', e.message);
+  }
+}
+
+async function saveWhaleTrades(trades) {
+  if (!trades || !trades.length) return;
+  // Only save 15m trades
+  const filtered = trades.filter(t => t.slug && t.slug.includes('-15m-'));
+  if (!filtered.length) return;
+
+  const obsRows = filtered.map(t => ({
+    slug: t.slug, outcome: t.outcome, price: t.price,
+    shares: t.side === 'sell' ? -t.shares : t.shares,
+    usdc_size: t.side === 'sell' ? -t.usdcSize : t.usdcSize,
+    tx_hash: t.txHash, trade_timestamp: t.ts,
+  }));
+  const { error: e1 } = await supabase.from('k9_observed_trades').insert(obsRows);
+  if (e1) console.error('[whale-watcher] insert error:', e1.message);
+
+  broadcast({ type: 'whale_trades', trades: filtered });
+  console.log(`[whale-watcher] ${filtered.map(t => `${t.side.toUpperCase()} ${t.outcome} ${t.slug} @${t.price} $${t.usdcSize.toFixed(2)}`).join(' | ')}`);
+}
+
+let whaleWsRetryDelay = 2000;
+function connectWhaleWatcher() {
+  console.log('[whale-watcher] Connecting to Alchemy WS...');
+  const ws = new WebSocket(ALCHEMY_WS);
+
+  ws.on('open', async () => {
+    whaleWsRetryDelay = 2000;
+    // Subscribe to OrderFilled (whale as taker)
+    ws.send(JSON.stringify({
+      jsonrpc: '2.0', id: 10,
+      method: 'eth_subscribe',
+      params: ['logs', { address: CTF_EXCHANGE, topics: [ORDER_FILLED, null, null, WHALE_PAD] }],
+    }));
+    await new Promise(r => setTimeout(r, 300));
+    // Subscribe to OrderFilled (whale as maker)
+    ws.send(JSON.stringify({
+      jsonrpc: '2.0', id: 11,
+      method: 'eth_subscribe',
+      params: ['logs', { address: CTF_EXCHANGE, topics: [ORDER_FILLED, null, WHALE_PAD, null] }],
+    }));
+    await new Promise(r => setTimeout(r, 300));
+    // Subscribe to TransferSingle (rebates to whale)
+    ws.send(JSON.stringify({
+      jsonrpc: '2.0', id: 12,
+      method: 'eth_subscribe',
+      params: ['logs', { address: CONDITIONAL_TOKENS, topics: [TRANSFER_SINGLE, null, null, WHALE_PAD] }],
+    }));
+    console.log('[whale-watcher] Subscribed to OrderFilled + TransferSingle');
+  });
+
+  ws.on('message', async (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      const log = msg?.params?.result;
+      if (!log || log.removed) return;
+
+      const fill = decodeOrderFilledLog(log, WHALE_WALLET, whaleSeenTx);
+      if (fill) {
+        if (!whaleTxBuffer[fill.txHash]) {
+          whaleTxBuffer[fill.txHash] = [];
+          setTimeout(() => {
+            const fills = whaleTxBuffer[fill.txHash];
+            delete whaleTxBuffer[fill.txHash];
+            if (fills?.length) saveWhaleTrades(fills);
+          }, 500);
+        }
+        whaleTxBuffer[fill.txHash].push(fill);
+        return;
+      }
+
+      const rebate = decodeRebateTransfer(log, WHALE_WALLET, whaleSeenTx);
+      if (rebate) {
+        saveWhaleTrades([rebate]);
+        console.log(`[whale-watcher] REBATE: +${rebate.shares.toFixed(2)} ${rebate.outcome} ${rebate.slug}`);
+      }
+    } catch (e) {
+      console.error('[whale-watcher] decode error:', e.message);
+    }
+  });
+
+  ws.on('close', () => {
+    console.log(`[whale-watcher] WS closed, retrying in ${whaleWsRetryDelay}ms`);
+    setTimeout(connectWhaleWatcher, whaleWsRetryDelay);
+    whaleWsRetryDelay = Math.min(whaleWsRetryDelay * 2, 30000);
+  });
+  ws.on('error', () => ws.close());
+}
+
+// Whale HTTP poll fallback
+let whalePollLastBlock = 0;
+async function whaleHttpPoll() {
+  try {
+    const blockRes = await fetch(ALCHEMY_HTTP, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_blockNumber', params: [] }),
+    });
+    const blockData = await blockRes.json();
+    const currentBlock = parseInt(blockData.result, 16);
+    if (!currentBlock) return;
+
+    const fromBlock = whalePollLastBlock ? whalePollLastBlock + 1 : currentBlock - 120;
+    if (fromBlock > currentBlock) return;
+
+    const queryLogs = async (topics) => {
+      const r = await fetch(ALCHEMY_HTTP, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0', id: 1, method: 'eth_getLogs',
+          params: [{ address: CTF_EXCHANGE, topics, fromBlock: '0x' + fromBlock.toString(16), toBlock: '0x' + currentBlock.toString(16) }],
+        }),
+      });
+      const d = await r.json();
+      return d.result || [];
+    };
+
+    const queryLogsAddr = async (address, topics) => {
+      const r = await fetch(ALCHEMY_HTTP, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc: '2.0', id: 1, method: 'eth_getLogs',
+          params: [{ address, topics, fromBlock: '0x' + fromBlock.toString(16), toBlock: '0x' + currentBlock.toString(16) }],
+        }),
+      });
+      const d = await r.json();
+      return d.result || [];
+    };
+
+    const [takerLogs, makerLogs, rebateLogs] = await Promise.all([
+      queryLogs([ORDER_FILLED, null, null, WHALE_PAD]),
+      queryLogs([ORDER_FILLED, null, WHALE_PAD, null]),
+      queryLogsAddr(CONDITIONAL_TOKENS, [TRANSFER_SINGLE, null, null, WHALE_PAD]),
+    ]);
+
+    const fillsByTx = {};
+    let newCount = 0;
+    for (const log of [...takerLogs, ...makerLogs]) {
+      if (log.removed) continue;
+      const fill = decodeOrderFilledLog(log, WHALE_WALLET, whaleSeenTx);
+      if (!fill) continue;
+      newCount++;
+      if (!fillsByTx[fill.txHash]) fillsByTx[fill.txHash] = [];
+      fillsByTx[fill.txHash].push(fill);
+    }
+
+    let rebateCount = 0;
+    for (const log of rebateLogs) {
+      if (log.removed) continue;
+      const rebate = decodeRebateTransfer(log, WHALE_WALLET, whaleSeenTx);
+      if (!rebate) continue;
+      rebateCount++;
+      if (!fillsByTx[rebate.txHash]) fillsByTx[rebate.txHash] = [];
+      fillsByTx[rebate.txHash].push(rebate);
+    }
+
+    for (const [, fills] of Object.entries(fillsByTx)) {
+      await saveWhaleTrades(fills);
+    }
+    whalePollLastBlock = currentBlock;
+
+    if (newCount > 0 || rebateCount > 0) {
+      console.log(`[whale-poll] Backfilled ${newCount} fills + ${rebateCount} rebates from blocks ${fromBlock}-${currentBlock}`);
+    }
+  } catch (e) {
+    console.error('[whale-poll] error:', e.message);
+  }
+}
+
+// Whale trades API — fetch from Supabase
+app.get('/api/whale-trades', async (req, res) => {
+  const { slug } = req.query;
+  try {
+    let q = supabase.from('k9_observed_trades').select('*').like('slug', '%-15m-%').order('id', { ascending: false }).limit(200);
+    if (slug) q = q.eq('slug', slug);
+    const { data, error } = await q;
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ trades: data || [] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// List all slugs the whale has traded on (for browsing history)
+app.get('/api/whale-slugs', async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit || '10000', 10) || 10000, 50000);
+    const { data, error } = await supabase.from('k9_observed_trades')
+      .select('slug, trade_timestamp')
+      .like('slug', '%-15m-%')
+      .order('id', { ascending: false })
+      .limit(limit);
+    if (error) return res.status(500).json({ error: error.message });
+    // Group by slug, get latest timestamp per slug
+    const bySlug = {};
+    for (const r of (data || [])) {
+      if (!r.slug) continue;
+      if (!bySlug[r.slug] || r.trade_timestamp > bySlug[r.slug]) bySlug[r.slug] = r.trade_timestamp;
+    }
+    const slugs = Object.entries(bySlug)
+      .sort((a, b) => b[1] - a[1])
+      .map(([slug, ts]) => ({ slug, ts }));
+    res.json({ slugs });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Whale holdings for current 15m event (net shares from trades)
+app.get('/api/whale-holdings', async (req, res) => {
+  try {
+    // Find the current/latest 15m slug
+    const nowSecs = Math.floor(Date.now() / 1000);
+    const currentSlot = Math.floor(nowSecs / 900) * 900;
+    const slug = req.query.slug || `btc-updown-15m-${currentSlot}`;
+
+    const { data, error } = await supabase.from('k9_observed_trades')
+      .select('outcome, shares')
+      .eq('slug', slug);
+    if (error) return res.status(500).json({ error: error.message });
+
+    let upShares = 0, downShares = 0;
+    for (const t of (data || [])) {
+      const shares = parseFloat(t.shares) || 0;
+      if (/up/i.test(t.outcome)) upShares += shares;
+      else downShares += shares;
+    }
+    res.json({ slug, up: Math.round(upShares * 100) / 100, down: Math.round(downShares * 100) / 100 });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── k9 Trade Monitor: compare our tracked data vs Polymarket every 60s ────
 async function k9TradeMonitor() {
   try {
@@ -4109,6 +4933,7 @@ server.listen(PORT, async () => {
   console.log(`[SPLIT] autoSplit=${autoSplit.enabled ? 'ON' : 'OFF'}, amount=$${autoSplit.amount}, ready=${splitReady}, script=${scriptExists}`);
   await seedK9SeenTx();
   await loadK9CopyState();
+  await loadStopLossFromDb();
   connectK9Watcher();
   // HTTP poll fallback: catch missed WS events every 15s
   setTimeout(k9HttpPoll, 5000); // first poll after 5s
@@ -4116,4 +4941,9 @@ server.listen(PORT, async () => {
   // Monitor k9 trades vs Polymarket every 60s
   setTimeout(k9TradeMonitor, 20000);
   setInterval(k9TradeMonitor, 60000);
+  // Whale watcher (0x8dxd)
+  await seedWhaleSeenTx();
+  connectWhaleWatcher();
+  setTimeout(whaleHttpPoll, 7000);
+  setInterval(whaleHttpPoll, 15000);
 });
