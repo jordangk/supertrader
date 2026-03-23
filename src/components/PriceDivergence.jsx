@@ -1,12 +1,12 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import {
   ComposedChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
-  ResponsiveContainer, ReferenceLine, Area, Bar, Cell,
+  ResponsiveContainer, ReferenceLine, ReferenceDot, Area, Bar, Cell,
 } from 'recharts';
 
 const API_BASE = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
 
-export default function PriceDivergence({ prices, btc, binanceBtc, event, whaleTrades = [] }) {
+export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sEma, priceEma, event, autoEmaLog = [] }) {
   const [history, setHistory] = useState([]);
   const [live, setLive] = useState({ btc: null, up: null, down: null, upStart: null, downStart: null, btcStart: null, slug: null, endDate: null, title: null });
   const [btcOpen, setBtcOpen] = useState(null); // captured at event start, client-side
@@ -17,6 +17,7 @@ export default function PriceDivergence({ prices, btc, binanceBtc, event, whaleT
   const [pos, setPos] = useState({ up: null, down: null }); // positions from Polymarket
   const [openOrders, setOpenOrders] = useState([]); // pending limit orders
   const [chartWindowS, setChartWindowS] = useState(180); // chart zoom in seconds
+  const [myTradesForEvent, setMyTradesForEvent] = useState([]);
   const [stopLoss, setStopLoss] = useState(null); // { side: 'up'|'down', trigger: cents, shares }
   const stopLossRef = useRef(null); // keep in sync for poll callback
   const [slTrigger, setSlTrigger] = useState('');
@@ -125,7 +126,7 @@ export default function PriceDivergence({ prices, btc, binanceBtc, event, whaleT
         // Accumulate history directly in poll — one point per poll, no dedup
         if (btcPrice || up || down) {
           setHistory(prev => {
-            const next = [...prev, { t: Date.now(), btc: btcPrice, up, down }];
+            const next = [...prev, { t: Date.now(), btc: btcPrice, up, down, sE12: sEma?.e12 ?? null, sE26: sEma?.e26 ?? null }];
             return next.length > 1000 ? next.slice(-1000) : next;
           });
         }
@@ -314,17 +315,18 @@ export default function PriceDivergence({ prices, btc, binanceBtc, event, whaleT
     setTimeout(() => setBuyStatus(null), 3000);
   };
 
-  const quickSell = async (side) => {
-    setBuyStatus({ side, msg: `Sell 5sh ${side}...`, ok: null });
+  const quickSell = async (side, shares) => {
+    const sh = shares || 5;
+    setBuyStatus({ side, msg: `Sell ${sh}sh ${side}...`, ok: null });
     try {
       const res = await fetch(`${API_BASE}/api/sell`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ side, shares: 5 }),
+        body: JSON.stringify({ side, shares: sh }),
       });
       const data = await res.json();
       if (res.ok && data.success) {
-        setBuyStatus({ side, msg: `Sold 5sh ${side} @ ${(data.price * 100).toFixed(0)}¢`, ok: true });
+        setBuyStatus({ side, msg: `Sold ${sh}sh ${side} @ ${(data.price * 100).toFixed(0)}¢`, ok: true });
         setTimeout(() => { fetchPositions(live.slug); fetchOpenOrders(); }, 2000);
       } else {
         setBuyStatus({ side, msg: data.error || 'Sell failed', ok: false });
@@ -335,17 +337,36 @@ export default function PriceDivergence({ prices, btc, binanceBtc, event, whaleT
     setTimeout(() => setBuyStatus(null), 3000);
   };
 
-  // Whale holdings — refresh on new trades + poll every 10s
+  // Whale holdings — refresh on new trades + poll every 10s (use event slug when 15m)
   const [whaleHoldings, setWhaleHoldings] = useState(null);
-  const fetchWhaleHoldings = () => fetch(`${API_BASE}/api/whale-holdings`).then(r => r.json()).then(setWhaleHoldings).catch(() => {});
+  const slug = event?.slug;
+  const fetchWhaleHoldings = () => {
+    const q = slug?.includes('-15m-') ? `?slug=${encodeURIComponent(slug)}` : '';
+    return fetch(`${API_BASE}/api/whale-holdings${q}`).then(r => r.json()).then(setWhaleHoldings).catch(() => {});
+  };
   useEffect(() => {
     fetchWhaleHoldings();
     const iv = setInterval(fetchWhaleHoldings, 10000);
     return () => clearInterval(iv);
-  }, []);
-  useEffect(() => { if (whaleTrades.length) fetchWhaleHoldings(); }, [whaleTrades.length]);
+  }, [slug]);
 
-  // Scalp: FAK buy at current price → GTC hedge other side for N¢ profit
+  // Fetch my trades from Polymarket (on-chain, your wallet) for chart markers
+  useEffect(() => {
+    if (!event?.slug) { setMyTradesForEvent([]); return; }
+    const params = new URLSearchParams({ slug: event.slug });
+    if (event.tokenUp) params.set('tokenUp', event.tokenUp);
+    if (event.tokenDown) params.set('tokenDown', event.tokenDown);
+    const fetchMy = () =>
+      fetch(`${API_BASE}/api/my-trades?${params}`)
+        .then(r => r.json())
+        .then(d => setMyTradesForEvent(d.trades || []))
+        .catch(() => setMyTradesForEvent([]));
+    fetchMy();
+    const iv = setInterval(fetchMy, 10000); // refresh every 10s
+    return () => clearInterval(iv);
+  }, [event?.slug, event?.tokenUp, event?.tokenDown]);
+
+  // Scalp: FAK buy at ask+1¢ + GTC sell at buy+profitCents (same side, sent together)
   const scalp = async (side, profitCents = 2) => {
     const rawPrice = side === 'up' ? live.up : live.down;
     if (!rawPrice || rawPrice <= 0) {
@@ -353,25 +374,31 @@ export default function PriceDivergence({ prices, btc, binanceBtc, event, whaleT
       setTimeout(() => setBuyStatus(null), 2000);
       return;
     }
-    const other = side === 'up' ? 'down' : 'up';
-    const hedgeTarget = Math.round((1.0 - rawPrice - profitCents / 100) * 100);
-    setBuyStatus({ side, msg: `Scalp +${profitCents}¢: ${side}@${(rawPrice*100).toFixed(0)}¢ → ${other}@${hedgeTarget}¢...`, ok: null });
+    setBuyStatus({ side, msg: `Scalp +${profitCents}¢: buy @ mkt+1¢, sell @ +${profitCents}¢...`, ok: null });
     try {
       const res = await fetch(`${API_BASE}/api/scalp`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ side, shares: 5, profitCents }),
       });
-      const data = await res.json();
+      const text = await res.text();
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (_) {
+        setBuyStatus({ side, msg: (text && text.length < 80 ? text : null) || `HTTP ${res.status}`, ok: false });
+        setTimeout(() => setBuyStatus(null), 4000);
+        return;
+      }
       if (res.ok && data.success) {
-        setBuyStatus({ side, msg: `Scalp +${profitCents}¢ sent: ${side}@${(data.buy.price*100).toFixed(0)}¢ + ${other}@${(data.hedge.price*100).toFixed(0)}¢`, ok: true });
+        setBuyStatus({ side, msg: `Scalp +${profitCents}¢ sent: buy @${((data.buy?.price ?? 0) * 100).toFixed(0)}¢ → sell @${((data.sell?.price ?? 0) * 100).toFixed(0)}¢ (5sh)`, ok: true });
         setTimeout(fetchOpenOrders, 500);
         setTimeout(fetchOpenOrders, 1500);
       } else {
         setBuyStatus({ side, msg: data.error || 'Scalp failed', ok: false });
       }
     } catch (e) {
-      setBuyStatus({ side, msg: 'Scalp error', ok: false });
+      setBuyStatus({ side, msg: e?.message || 'Scalp error', ok: false });
     }
     setTimeout(() => setBuyStatus(null), 3000);
   };
@@ -405,28 +432,34 @@ export default function PriceDivergence({ prices, btc, binanceBtc, event, whaleT
       upPrice: h.up != null ? h.up * 100 : null,
       downPrice: h.down != null ? h.down * 100 : null,
       btcVal: h.btc,
-      ema10: null, ema30: null, macdHist: null, macdLine: null, macdSignal: null, rsi: null, signal: null,
+      sE12: h.sE12 ?? null, sE26: h.sE26 ?? null,
+      ema12: null, ema26: null, macdHist: null, macdLine: null, macdSignal: null, rsi: null, signal: null,
     }));
 
-    // EMA
-    let e10 = null, e30 = null;
-    const a10 = 2 / 11, a30 = 2 / 31;
+    // EMA — use server-side fast tick EMA values, fall back to client computation with matching alphas
+    let e12 = null, e26 = null;
+    const a12 = 2 / (12 * 10 + 1), a26 = 2 / (26 * 10 + 1); // match server FAST_EMA alphas
     for (const d of data) {
       if (d.btcDelta == null) continue;
-      e10 = e10 == null ? d.btcDelta : d.btcDelta * a10 + e10 * (1 - a10);
-      e30 = e30 == null ? d.btcDelta : d.btcDelta * a30 + e30 * (1 - a30);
-      d.ema10 = Math.round(e10 * 100) / 100;
-      d.ema30 = Math.round(e30 * 100) / 100;
+      // Prefer server EMA (no cold-start lag)
+      if (d.sE12 != null && d.sE26 != null) {
+        e12 = d.sE12; e26 = d.sE26;
+      } else {
+        e12 = e12 == null ? d.btcDelta : d.btcDelta * a12 + e12 * (1 - a12);
+        e26 = e26 == null ? d.btcDelta : d.btcDelta * a26 + e26 * (1 - a26);
+      }
+      d.ema12 = Math.round(e12 * 100) / 100;
+      d.ema26 = Math.round(e26 * 100) / 100;
     }
 
     // MACD (12,26,9)
-    let e12 = null, e26 = null, ms = null;
-    const a12 = 2 / 13, a26 = 2 / 27, a9 = 2 / 10;
+    let mf = null, msl = null, ms = null;
+    const ma12 = 2 / 13, ma26 = 2 / 27, a9 = 2 / 10;
     for (const d of data) {
       if (d.btcVal == null) continue;
-      e12 = e12 == null ? d.btcVal : d.btcVal * a12 + e12 * (1 - a12);
-      e26 = e26 == null ? d.btcVal : d.btcVal * a26 + e26 * (1 - a26);
-      const ml = e12 - e26;
+      mf = mf == null ? d.btcVal : d.btcVal * ma12 + mf * (1 - ma12);
+      msl = msl == null ? d.btcVal : d.btcVal * ma26 + msl * (1 - ma26);
+      const ml = mf - msl;
       ms = ms == null ? ml : ml * a9 + ms * (1 - a9);
       d.macdHist = Math.round((ml - ms) * 100) / 100;
       d.macdLine = Math.round(ml * 100) / 100;
@@ -450,7 +483,7 @@ export default function PriceDivergence({ prices, btc, binanceBtc, event, whaleT
     let pmh = null;
     for (const d of data) {
       let s = 0;
-      if (d.ema10 != null && d.ema30 != null) s += d.ema10 > d.ema30 ? 1 : -1;
+      if (d.ema12 != null && d.ema26 != null) s += d.ema12 > d.ema26 ? 1 : -1;
       if (d.macdHist != null) {
         s += d.macdHist > 0 ? 1 : -1;
         if (pmh != null) { if (d.macdHist > 0 && d.macdHist > pmh) s += 0.5; else if (d.macdHist < 0 && d.macdHist < pmh) s -= 0.5; }
@@ -471,6 +504,52 @@ export default function PriceDivergence({ prices, btc, binanceBtc, event, whaleT
     return { chartData: data, lastSignal: data.length > 0 ? data[data.length - 1] : null, speed: spd };
   }, [history, openPrice, chartWindowS]);
 
+
+  // Map autoEma trade entries + hedges onto chart (entry = winning side, hedge = opposite)
+  const entryMarkers = useMemo(() => {
+    if (!autoEmaLog.length || !history.length) return [];
+    const lastT = history[history.length - 1].t;
+    const windowed = history.filter(h => (lastT - h.t) / 1000 <= chartWindowS);
+    const t0 = windowed.length > 0 ? windowed[0].t : Date.now();
+    const maxElapsed = windowed.length > 0 ? Math.round((windowed[windowed.length - 1].t - t0) / 1000) : chartWindowS;
+    const markers = [];
+    for (const e of autoEmaLog) {
+      if (e.entryFillTime && e.entryPrice) {
+        const elapsed = Math.round((e.entryFillTime - t0) / 1000);
+        if (elapsed >= 0 && elapsed <= maxElapsed) {
+          markers.push({ elapsed, price: Math.round(e.entryPrice * 100), side: e.side });
+        }
+      }
+      if (e.hedgeTime && e.hedgePrice) {
+        const oppSide = e.side === 'up' ? 'down' : 'up';
+        const elapsed = Math.round((e.hedgeTime - t0) / 1000);
+        if (elapsed >= 0 && elapsed <= maxElapsed) {
+          markers.push({ elapsed, price: Math.round(e.hedgePrice * 100), side: oppSide });
+        }
+      }
+    }
+    return markers;
+  }, [autoEmaLog, history, chartWindowS]);
+
+  // My trade markers — from Polymarket API (your wallet's on-chain trades)
+  const myTradeMarkers = useMemo(() => {
+    if (!history.length) return [];
+    const lastT = history[history.length - 1].t;
+    const windowed = history.filter(h => (lastT - h.t) / 1000 <= chartWindowS);
+    const t0 = windowed.length > 0 ? windowed[0].t : Date.now();
+    const maxElapsed = windowed.length > 0 ? Math.round((windowed[windowed.length - 1].t - t0) / 1000) : chartWindowS;
+    return myTradesForEvent
+      .filter(t => t.price > 0 && (t.ts || 0) > 0)
+      .map(t => {
+        const ts = t.ts || 0;
+        const price = Math.round((parseFloat(t.price) || 0) * 100);
+        const isUp = /up/i.test(t.outcome || '');
+        const isBuy = (t.side || '').toLowerCase() === 'buy';
+        const elapsed = Math.round((ts - t0) / 1000);
+        return { elapsed, price, isUp, isBuy };
+      })
+      .filter(m => m.price > 0 && m.elapsed >= 0 && m.elapsed <= maxElapsed);
+  }, [myTradesForEvent, history, chartWindowS]);
 
   // Divergence detection — BTC moved but Up/Down didn't react
   const divergences = [];
@@ -535,7 +614,7 @@ export default function PriceDivergence({ prices, btc, binanceBtc, event, whaleT
       });
       const data = await res.json();
       if (res.ok && data.success) {
-        setBuyStatus({ side, msg: `Fade sent: ${side}@${(data.buy.price*100).toFixed(0)}¢`, ok: true });
+        setBuyStatus({ side, msg: `Fade sent: ${side}@${((data.buy?.price ?? 0) * 100).toFixed(0)}¢`, ok: true });
       } else {
         setBuyStatus({ side, msg: data.error || 'Failed', ok: false });
       }
@@ -553,8 +632,8 @@ export default function PriceDivergence({ prices, btc, binanceBtc, event, whaleT
       <div className="bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-xs">
         <div className="text-gray-400">{d.elapsed}s elapsed</div>
         {d.btcDelta != null && <div className={d.btcDelta >= 0 ? 'text-green-400' : 'text-red-400'}>BTC: {d.btcDelta >= 0 ? '+' : ''}${d.btcDelta.toFixed(2)}</div>}
-        {d.ema10 != null && <div className="text-cyan-400">EMA10: {d.ema10 >= 0 ? '+' : ''}${d.ema10.toFixed(2)}</div>}
-        {d.ema30 != null && <div className="text-purple-400">EMA30: {d.ema30 >= 0 ? '+' : ''}${d.ema30.toFixed(2)}</div>}
+        {d.ema12 != null && <div className="text-cyan-400">EMA12: {d.ema12 >= 0 ? '+' : ''}${d.ema12.toFixed(2)}</div>}
+        {d.ema26 != null && <div className="text-purple-400">EMA26: {d.ema26 >= 0 ? '+' : ''}${d.ema26.toFixed(2)}</div>}
         {d.btcVal && <div className="text-yellow-400">BTC: ${d.btcVal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>}
         {d.upPrice != null && <div className="text-green-300">Up: {d.upPrice.toFixed(1)}¢</div>}
         {d.downPrice != null && <div className="text-red-300">Down: {d.downPrice.toFixed(1)}¢</div>}
@@ -642,8 +721,8 @@ export default function PriceDivergence({ prices, btc, binanceBtc, event, whaleT
         </div>
         <div>
           <span className="text-xs text-gray-500 mr-1">EMA:</span>
-          <span className={`font-mono text-xs ${lastSignal?.ema10 > lastSignal?.ema30 ? 'text-green-400' : lastSignal?.ema10 < lastSignal?.ema30 ? 'text-red-400' : 'text-gray-300'}`}>
-            {lastSignal?.ema10 != null ? (lastSignal.ema10 > lastSignal.ema30 ? '10>30' : '10<30') : '—'}
+          <span className={`font-mono text-xs ${lastSignal?.ema12 > lastSignal?.ema26 ? 'text-green-400' : lastSignal?.ema12 < lastSignal?.ema26 ? 'text-red-400' : 'text-gray-300'}`}>
+            {lastSignal?.ema12 != null ? (lastSignal.ema12 > lastSignal.ema26 ? '12>26' : '12<26') : '—'}
           </span>
         </div>
       </div>
@@ -684,6 +763,14 @@ export default function PriceDivergence({ prices, btc, binanceBtc, event, whaleT
             className="px-2 py-1.5 rounded bg-green-900/50 hover:bg-green-800/60 disabled:opacity-40 text-green-200 font-bold text-[10px] transition-colors border border-green-600/30">Sell ↑</button>
           <button onClick={() => quickSell('down')} disabled={expired || buyStatus?.side === 'down'}
             className="px-2 py-1.5 rounded bg-red-900/50 hover:bg-red-800/60 disabled:opacity-40 text-red-200 font-bold text-[10px] transition-colors border border-red-600/30">Sell ↓</button>
+          {pos.up?.shares > 0 && (
+            <button onClick={() => quickSell('up', Math.ceil(pos.up.shares * 0.25))} disabled={expired || buyStatus?.side === 'up'}
+              className="px-2 py-1.5 rounded bg-green-900/30 hover:bg-green-800/40 disabled:opacity-40 text-green-300/70 font-bold text-[10px] transition-colors border border-green-700/20">25% ↑ ({Math.ceil(pos.up.shares * 0.25)})</button>
+          )}
+          {pos.down?.shares > 0 && (
+            <button onClick={() => quickSell('down', Math.ceil(pos.down.shares * 0.25))} disabled={expired || buyStatus?.side === 'down'}
+              className="px-2 py-1.5 rounded bg-red-900/30 hover:bg-red-800/40 disabled:opacity-40 text-red-300/70 font-bold text-[10px] transition-colors border border-red-700/20">25% ↓ ({Math.ceil(pos.down.shares * 0.25)})</button>
+          )}
           <span className="text-gray-700">|</span>
           {/* Stop Loss inline */}
           {stopLoss ? (
@@ -755,12 +842,12 @@ export default function PriceDivergence({ prices, btc, binanceBtc, event, whaleT
               </span>
             );
           })() : <span className="text-gray-600">No Down</span>}
-          {whaleHoldings && (
+          {whaleHoldings?.up != null && (
             <>
               <span className="text-gray-700">|</span>
               <span className="text-gray-500 font-bold">@0x8d</span>
               <span className="text-green-400">{whaleHoldings.up.toFixed(1)} Up</span>
-              <span className="text-red-400">{whaleHoldings.down.toFixed(1)} Dn</span>
+              <span className="text-red-400">{(whaleHoldings.down ?? 0).toFixed(1)} Dn</span>
             </>
           )}
         </div>
@@ -835,18 +922,46 @@ export default function PriceDivergence({ prices, btc, binanceBtc, event, whaleT
               <Tooltip content={<CustomTooltip />} position={{ x: 70, y: 0 }} />
               <ReferenceLine yAxisId="btc" y={0} stroke="#555" strokeDasharray="3 3" />
               <Area yAxisId="btc" dataKey="btcDelta" stroke="#eab308" fill="#eab30822" strokeWidth={2} dot={false} connectNulls isAnimationActive={false} />
-              <Line yAxisId="btc" dataKey="ema10" stroke="#22d3ee" strokeWidth={1.5} dot={false} connectNulls isAnimationActive={false} strokeDasharray="4 2" />
-              <Line yAxisId="btc" dataKey="ema30" stroke="#a855f7" strokeWidth={1.5} dot={false} connectNulls isAnimationActive={false} strokeDasharray="6 3" />
+              <Line yAxisId="btc" dataKey="ema12" stroke="#22d3ee" strokeWidth={1.5} dot={false} connectNulls isAnimationActive={false} strokeDasharray="4 2" />
+              <Line yAxisId="btc" dataKey="ema26" stroke="#a855f7" strokeWidth={1.5} dot={false} connectNulls isAnimationActive={false} strokeDasharray="6 3" />
               <Line yAxisId="poly" dataKey="upPrice" stroke="#4ade80" strokeWidth={2} dot={false} connectNulls isAnimationActive={false} />
               <Line yAxisId="poly" dataKey="downPrice" stroke="#f87171" strokeWidth={2} dot={false} connectNulls isAnimationActive={false} />
+              {entryMarkers.map((m, i) => (
+                <ReferenceDot key={`entry-${i}`} yAxisId="poly" x={m.elapsed} y={m.price} r={6}
+                  fill={m.side === 'up' ? '#4ade80' : '#f87171'} stroke="#fff" strokeWidth={2}
+                  label={{ value: `${m.price}¢`, position: 'top', fill: '#fff', fontSize: 10, fontWeight: 'bold' }} />
+              ))}
+              {myTradeMarkers.map((m, i) => {
+                // Up: green buy, red sell. Down: cyan buy, orange sell (so they stand out on red line)
+                const color = m.isUp
+                  ? (m.isBuy ? '#22c55e' : '#ef4444')
+                  : (m.isBuy ? '#06b6d4' : '#f97316');
+                return (
+                  <ReferenceDot key={`my-${i}`} yAxisId="poly" x={m.elapsed} y={m.price} r={5}
+                    fill={color} fillOpacity={0.9} stroke="#fff" strokeWidth={1.5}
+                    label={{ value: `${m.price}¢`, position: 'top', fill: '#fff', fontSize: 9, fontWeight: 'bold' }} />
+                );
+              })}
             </ComposedChart>
           </ResponsiveContainer>
-          <div className="flex items-center justify-center gap-6 mt-2 text-xs">
+          <div className="flex items-center justify-center gap-6 mt-2 text-xs flex-wrap">
             <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-yellow-500 inline-block"></span> BTC $</span>
-            <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-cyan-400 inline-block" style={{borderBottom:'1px dashed'}}></span> EMA10</span>
-            <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-purple-400 inline-block" style={{borderBottom:'1px dashed'}}></span> EMA30</span>
+            <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-cyan-400 inline-block" style={{borderBottom:'1px dashed'}}></span> EMA12</span>
+            <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-purple-400 inline-block" style={{borderBottom:'1px dashed'}}></span> EMA26</span>
             <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-green-400 inline-block"></span> Up</span>
             <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-red-400 inline-block"></span> Down</span>
+            {myTradeMarkers.some(m => m.isUp && m.isBuy) && (
+              <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-green-500 inline-block border border-white"></span> Up Buy</span>
+            )}
+            {myTradeMarkers.some(m => m.isUp && !m.isBuy) && (
+              <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-red-500 inline-block border border-white"></span> Up Sell</span>
+            )}
+            {myTradeMarkers.some(m => !m.isUp && m.isBuy) && (
+              <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-cyan-400 inline-block border border-white"></span> Down Buy</span>
+            )}
+            {myTradeMarkers.some(m => !m.isUp && !m.isBuy) && (
+              <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-orange-500 inline-block border border-white"></span> Down Sell</span>
+            )}
           </div>
           {/* MACD Histogram */}
           <ResponsiveContainer width="100%" height={100}>

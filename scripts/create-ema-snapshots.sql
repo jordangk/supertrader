@@ -1,0 +1,24 @@
+CREATE TABLE IF NOT EXISTS ema_snapshots (
+  id BIGSERIAL PRIMARY KEY,
+  ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+  event_slug TEXT,
+  btc_price DOUBLE PRECISION,
+  btc_delta DOUBLE PRECISION,
+  e12 DOUBLE PRECISION,
+  e26 DOUBLE PRECISION,
+  gap DOUBLE PRECISION,
+  histogram DOUBLE PRECISION,
+  f_e12 DOUBLE PRECISION,
+  f_e26 DOUBLE PRECISION,
+  f_gap DOUBLE PRECISION,
+  f_histogram DOUBLE PRECISION,
+  up_price DOUBLE PRECISION,
+  down_price DOUBLE PRECISION,
+  up_e12 DOUBLE PRECISION,
+  up_e26 DOUBLE PRECISION,
+  down_e12 DOUBLE PRECISION,
+  down_e26 DOUBLE PRECISION
+);
+
+CREATE INDEX idx_ema_snapshots_ts ON ema_snapshots (ts);
+CREATE INDEX idx_ema_snapshots_event ON ema_snapshots (event_slug);

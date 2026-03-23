@@ -23,7 +23,7 @@ const FEE_PCT = 0.02; // 2% Polymarket fee
 const API_BASE = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
 
 export default function App() {
-  const { prices, btc, binanceBtc, event, refreshTrigger, copyFeed, whaleTrades } = useWebSocket();
+  const { prices, btc, binanceBtc, serverEma, priceEma, event, refreshTrigger, copyFeed, whaleTrades } = useWebSocket();
   const [wallet, setWallet] = useState(null);
   const [orders, setOrders] = useState([]);
   const [positions, setPositions] = useState([]);
@@ -592,27 +592,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Tab bar */}
-      <div className="bg-gray-900 border-b border-gray-800 px-4 flex gap-1">
-        {[['trade', '⚡ Trade'], ['divergence', '📉 Divergence'], ['trades', '🔥 Live Trades'], ['mytrades', '📋 My Trades'], ['ematrades', '📊 EMA Trades']].map(([t, label]) => (
-          <button key={t} onClick={() => setTab(t)}
-            className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
-              tab === t ? 'border-orange-500 text-orange-400' : 'border-transparent text-gray-500 hover:text-gray-300'
-            }`}>{label}</button>
-        ))}
-      </div>
-
-      <div className={`flex-1 p-4 mx-auto w-full space-y-4 ${tab === 'divergence' || tab === 'ematrades' ? 'max-w-5xl' : 'max-w-2xl'}`}>
-        {tab === 'trades' && (
-          <div className="space-y-4">
-            <div>
-              <h2 className="text-lg font-bold text-gray-200">Live Trades</h2>
-              <p className="text-xs text-gray-500 mt-0.5">Copy k9&apos;s BTC Up/Down trades in real time. Select %, event time, and enable.</p>
-            </div>
-            <LiveBetsConfig copyFeed={copyFeed} />
-          </div>
-        )}
-        {tab === 'divergence' && (
+      <div className="flex-1 p-4 mx-auto w-full space-y-4 max-w-5xl">
           <div className="space-y-4">
             {/* Auto-Scalp Toggle */}
             <div className={`rounded-xl border p-3 space-y-2 ${autoScalp.enabled ? 'border-cyan-600 bg-cyan-950/30' : 'border-gray-800 bg-gray-900/50'}`}>
@@ -741,32 +721,27 @@ export default function App() {
                   {autoEma.enabled ? 'ON' : 'OFF'}
                 </button>
               </div>
-              {/* Live EMA state */}
+              {/* Live EMA state — from WebSocket (tick-by-tick) */}
               <div className="flex gap-3 text-[10px] font-mono flex-wrap">
-                <span className="text-cyan-400">EMA12: {autoEma.ema?.e12 != null ? `$${autoEma.ema.e12.toFixed(1)}` : '—'}</span>
-                <span className="text-purple-400">EMA26: {autoEma.ema?.e26 != null ? `$${autoEma.ema.e26.toFixed(1)}` : '—'}</span>
-                <span className={`${(autoEma.ema?.btcMoveSinceCross || 0) >= 10 ? 'text-yellow-400' : 'text-gray-600'}`}>
-                  BTC: ${(autoEma.ema?.btcMoveSinceCross || 0).toFixed(0)} since cross
-                </span>
+                <span className="text-cyan-400">EMA12: {serverEma?.e12 != null ? `$${serverEma.e12.toFixed(1)}` : '—'}</span>
+                <span className="text-purple-400">EMA26: {serverEma?.e26 != null ? `$${serverEma.e26.toFixed(1)}` : '—'}</span>
                 <span className={`font-bold ${
-                  Math.abs(autoEma.ema?.gap || 0) >= (autoEma.gapOpenThreshold || 5)
-                    ? (autoEma.ema?.gap || 0) > 0 ? 'text-green-400' : 'text-red-400'
+                  Math.abs(serverEma?.gap || 0) >= (autoEma.gapOpenThreshold || 5)
+                    ? (serverEma?.gap || 0) > 0 ? 'text-green-400' : 'text-red-400'
                     : 'text-gray-500'
                 }`}>
-                  Gap: ${Math.abs(autoEma.ema?.gap || 0).toFixed(1)} {(autoEma.ema?.gap || 0) > 0 ? 'UP' : (autoEma.ema?.gap || 0) < 0 ? 'DN' : ''}
-                  {Math.abs(autoEma.ema?.gap || 0) >= (autoEma.gapOpenThreshold || 5) && ' OPEN'}
-                  {Math.abs(autoEma.ema?.gap || 0) >= 2 && Math.abs(autoEma.ema?.gap || 0) < (autoEma.gapOpenThreshold || 5) && (autoEma.ema?.btcMoveSinceCross || 0) >= 10 && ' OPEN(BTC$' + (autoEma.ema?.btcMoveSinceCross || 0).toFixed(0) + ')'}
+                  Gap: ${Math.abs(serverEma?.gap || 0).toFixed(1)} {(serverEma?.gap || 0) > 0 ? 'UP' : (serverEma?.gap || 0) < 0 ? 'DN' : ''}
+                  {Math.abs(serverEma?.gap || 0) >= (autoEma.gapOpenThreshold || 5) && ' OPEN'}
                 </span>
-                <span className={`${(autoEma.ema?.histogram || 0) > 0 ? 'text-green-400' : (autoEma.ema?.histogram || 0) < 0 ? 'text-red-400' : 'text-gray-500'}`}>
-                  Hist: {(autoEma.ema?.histogram || 0).toFixed(2)}
+                <span className={`${(serverEma?.histogram || 0) > 0 ? 'text-green-400' : (serverEma?.histogram || 0) < 0 ? 'text-red-400' : 'text-gray-500'}`}>
+                  Hist: {(serverEma?.histogram || 0).toFixed(2)}
                 </span>
               </div>
               {autoEma.phase && (
                 <div className={`text-[10px] font-mono font-bold ${autoEma.phase === 'entered' ? 'text-yellow-400' : 'text-green-400'}`}>
                   {autoEma.entrySide?.toUpperCase()} @ {autoEma.entryPrice ? `${(autoEma.entryPrice * 100).toFixed(0)}¢` : '—'}
-                  {autoEma.peakGap > 0 && ` | peakGap: $${autoEma.peakGap.toFixed(1)}`}
-                  {autoEma.btcPeak != null && ` | btcPeak: $${autoEma.btcPeak.toFixed(0)}`}
-                  {autoEma.phase === 'entered' && ` | hedge on BTC reversal ≥$5`}
+                  {autoEma.peakProfit != null && ` | peak: +${autoEma.peakProfit}¢`}
+                  {autoEma.phase === 'entered' && ` | stop: -5¢ | exit on MACD cross`}
                 </div>
               )}
               {autoEma.log?.length > 0 && (
@@ -800,347 +775,10 @@ export default function App() {
                 <p>Gap ≥${autoEma.gapOpenThreshold || 5} & widening → buy winning side at mkt-3¢. Gap &lt;${autoEma.gapOpenThreshold || 5} → hedge opposite at mkt-3¢. Always 5sh. {autoEma.priceMin || 25}–{autoEma.priceMax || 85}¢. Timeout: {(autoEma.maxHedgeWaitMs || 30000) / 1000}s.</p>
               </div>
             </div>
-            <PriceDivergence key={event?.slug} prices={prices} btc={btc} binanceBtc={binanceBtc} event={event} autoEmaLog={autoEma.log || []} />
+            <PriceDivergence key={event?.slug} prices={prices} btc={btc} binanceBtc={binanceBtc} serverEma={serverEma} priceEma={priceEma} event={event} autoEmaLog={autoEma.log || []} />
           </div>
-        )}
-        {tab === 'mytrades' && <MyTrades />}
-        {tab === 'ematrades' && <EmaTradeLog />}
-        {tab === 'k9' && (
-          <>
-            <LiveBetsConfig copyFeed={copyFeed} />
-            <K9Trades />
-          </>
-        )}
-        {tab === 'sim' && <SimDashboard />}
-        {tab === 'prices' && <PriceTracker key={event?.slug} btc={btc} binanceBtc={binanceBtc} prices={prices} event={event} />}
-        {tab === 'trade' && <>
-        {/* Sim shortcut banner */}
-        <button
-          onClick={() => setTab('sim')}
-          className="w-full flex items-center justify-between bg-gray-900 border border-orange-900/50 hover:border-orange-500/50 rounded-lg px-4 py-3 transition-colors group"
-        >
-          <div className="flex items-center gap-3">
-            <span className="text-orange-400 text-lg">📊</span>
-            <div className="text-left">
-              <div className="text-sm font-medium text-gray-200">k9 Simulator</div>
-              <div className="text-xs text-gray-500">Live sim of what we'd trade at 1% of k9</div>
-            </div>
-          </div>
-          <span className="text-gray-600 group-hover:text-orange-400 transition-colors">→</span>
-        </button>
-        </>}
-        {tab === 'trade' && <>
-        {/* Event */}
-        <EventHeader event={event} />
-
-        {/* BTC Price Bar */}
-        <BTCBar btc={btc} />
-
-        {/* Compact price tracker link */}
-        <button
-          onClick={() => setTab('prices')}
-          className="w-full flex items-center justify-between bg-gray-900 border border-gray-800 hover:border-gray-700 rounded-lg px-4 py-2 transition-colors group text-xs font-mono"
-        >
-          <span className="text-gray-500">BTC <span className="text-white font-bold">${btc.current ? btc.current.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—'}</span></span>
-          {btc.start != null && btc.current != null && (
-            <span className={`${btc.current >= btc.start ? 'text-green-400' : 'text-red-400'}`}>
-              {btc.current >= btc.start ? '+' : ''}{(btc.current - btc.start).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-            </span>
-          )}
-          <span className="text-gray-600 group-hover:text-orange-400 transition-colors">📈 Price History →</span>
-        </button>
-
-        {/* Live Prices */}
-        <PricePanel prices={prices} />
-
-        {/* Threshold to increase expected ROI */}
-        {prices?.upPrice != null && prices?.downPrice != null && totalCost > 0 && (
-          <div className="rounded-lg border border-green-800/50 bg-green-950/20 px-4 py-2 flex items-center justify-between text-xs">
-            <span className="text-gray-400">Buy below to increase expected ROI:</span>
-            <span className="font-mono">
-              <span className="text-green-400">UP {(prices.upPrice / (1 + expectedROI) * 100).toFixed(1)}¢</span>
-              <span className="text-gray-600 mx-2">|</span>
-              <span className="text-red-400">DN {(prices.downPrice / (1 + expectedROI) * 100).toFixed(1)}¢</span>
-            </span>
-          </div>
-        )}
-
-        {/* Buy Panels */}
-        <div className="grid grid-cols-2 gap-3">
-          <BuyPanel
-            side="up"
-            price={prices.upPrice}
-            amounts={AMOUNTS}
-            buying={buying}
-            onBuy={handleBuy}
-            onRewardsBuy={handleRewardsBuy}
-            onRewardsSell={handleRewardsSell}
-            onSuperRewards={handleSuperRewards}
-            onSuperSell={handleSuperSell}
-            onWhaleStyleBuy={handleWhaleStyleBuy}
-            onSell={handleSell}
-            onSellAll={handleSellAll}
-            holdings={holdings}
-            tokenId={prices.tokenUp}
-            expectedROI={expectedROI}
-          />
-          <BuyPanel
-            side="down"
-            price={prices.downPrice}
-            amounts={AMOUNTS}
-            buying={buying}
-            onBuy={handleBuy}
-            onRewardsBuy={handleRewardsBuy}
-            onRewardsSell={handleRewardsSell}
-            onSuperRewards={handleSuperRewards}
-            onSuperSell={handleSuperSell}
-            onWhaleStyleBuy={handleWhaleStyleBuy}
-            onSell={handleSell}
-            onSellAll={handleSellAll}
-            holdings={holdings}
-            tokenId={prices.tokenDown}
-            expectedROI={expectedROI}
-          />
-        </div>
-
-        {/* Buy + Sell: buy at X, sell at X+profit */}
-        <div className="rounded-xl p-3 border bg-gray-800/40 border-gray-700/40">
-          <div className="text-xs font-bold text-blue-300 mb-2">Buy + Sell (+{buySell.profit}¢)</div>
-          <div className="flex gap-2 items-center mb-2">
-            <input
-              type="number"
-              placeholder="Price ¢"
-              value={buySell.price}
-              onChange={e => setBuySell(s => ({ ...s, price: e.target.value }))}
-              className="w-16 bg-gray-900 border border-gray-600 rounded px-2 py-1 text-xs text-white"
-            />
-            <input
-              type="number"
-              value={buySell.shares}
-              onChange={e => setBuySell(s => ({ ...s, shares: Math.max(1, parseInt(e.target.value) || 1) }))}
-              className="w-12 bg-gray-900 border border-gray-600 rounded px-2 py-1 text-xs text-white"
-            />
-            <span className="text-[10px] text-gray-400">sh</span>
-            <input
-              type="number"
-              value={buySell.profit}
-              onChange={e => setBuySell(s => ({ ...s, profit: Math.max(1, parseInt(e.target.value) || 1) }))}
-              className="w-10 bg-gray-900 border border-gray-600 rounded px-2 py-1 text-xs text-white"
-            />
-            <span className="text-[10px] text-gray-400">¢ profit</span>
-          </div>
-          <div className="flex gap-2 text-[10px]">
-            {buySell.price && <span className="text-gray-400">Buy@{buySell.price}¢ → Sell@{(parseFloat(buySell.price||0)+buySell.profit).toFixed(0)}¢</span>}
-          </div>
-          <div className="grid grid-cols-2 gap-2 mt-2">
-            <button
-              disabled={buying?.startsWith('bs-') || !buySell.price}
-              onClick={() => handleBuySell('up')}
-              className="py-1.5 rounded text-xs font-bold bg-green-900/40 hover:bg-green-800/40 border border-green-600/30 text-green-300 disabled:opacity-30"
-            >
-              {buying === 'bs-up' ? '...' : 'UP'}
-            </button>
-            <button
-              disabled={buying?.startsWith('bs-') || !buySell.price}
-              onClick={() => handleBuySell('down')}
-              className="py-1.5 rounded text-xs font-bold bg-red-900/40 hover:bg-red-800/40 border border-red-600/30 text-red-300 disabled:opacity-30"
-            >
-              {buying === 'bs-down' ? '...' : 'DOWN'}
-            </button>
-          </div>
-        </div>
-
-        {/* Auto-Lost Strategy: buy@2¢ sell@7¢ on each event */}
-        <div className={`rounded-xl p-3 border ${autoLost.enabled ? 'bg-purple-900/30 border-purple-500/50' : 'bg-gray-800/40 border-gray-700/40'}`}>
-          <div className="flex items-center justify-between mb-2">
-            <span className="text-xs font-bold text-purple-300">Auto-Lost (buy@{(autoLost.buyPrice*100).toFixed(0)}¢ sell@{(autoLost.sellPrice*100).toFixed(0)}¢)</span>
-            <button
-              onClick={toggleAutoLost}
-              className={`px-3 py-1 rounded text-xs font-bold ${autoLost.enabled ? 'bg-purple-600 text-white' : 'bg-gray-700 text-gray-400'}`}
-            >
-              {autoLost.enabled ? 'ON' : 'OFF'}
-            </button>
-          </div>
-          <div className="flex items-center gap-2 mb-2">
-            <span className="text-[10px] text-gray-400">Side:</span>
-            {['up', 'down', 'both'].map(s => (
-              <button
-                key={s}
-                onClick={() => setAutoLostSide(s)}
-                className={`px-2 py-0.5 rounded text-[10px] font-bold ${autoLost.side === s
-                  ? (s === 'up' ? 'bg-green-700 text-green-200' : s === 'down' ? 'bg-red-700 text-red-200' : 'bg-blue-700 text-blue-200')
-                  : 'bg-gray-700/50 text-gray-500'}`}
-              >
-                {s.toUpperCase()}
-              </button>
-            ))}
-            <span className="text-[10px] text-gray-400 ml-auto">{autoLost.shares}sh</span>
-          </div>
-          {/* Manual fire buttons */}
-          <div className="grid grid-cols-2 gap-2 mb-1">
-            <button
-              disabled={buying?.startsWith('lost-')}
-              onClick={() => handleLostScalp('up')}
-              className="py-1 rounded text-[10px] font-bold bg-green-900/40 hover:bg-green-800/40 border border-green-600/30 text-green-400 disabled:opacity-30"
-            >
-              {buying === 'lost-up' ? '...' : 'Fire UP now'}
-            </button>
-            <button
-              disabled={buying?.startsWith('lost-')}
-              onClick={() => handleLostScalp('down')}
-              className="py-1 rounded text-[10px] font-bold bg-red-900/40 hover:bg-red-800/40 border border-red-600/30 text-red-400 disabled:opacity-30"
-            >
-              {buying === 'lost-down' ? '...' : 'Fire DN now'}
-            </button>
-          </div>
-          {autoLost.log?.length > 0 && (
-            <div className="text-[9px] text-gray-500 mt-1">
-              {autoLost.log.slice(0, 3).map((l, i) => (
-                <div key={i}>{l.side?.toUpperCase()} {l.error ? `❌ ${l.error}` : `✓ buy=${l.buyId?.slice(0,6)} sell=${l.sellId?.slice(0,6)}`}</div>
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* Buy/Sell Both */}
-        <div className="grid grid-cols-2 gap-3">
-          <button
-            disabled={buying === 'buy-both' || !prices.upPrice || !prices.downPrice}
-            onClick={handleBuyBoth}
-            className={`py-2 rounded-lg text-sm font-bold transition-all ${
-              buying === 'buy-both' ? 'opacity-50 cursor-wait' : ''
-            } bg-blue-700/40 hover:bg-blue-600/40 border border-blue-500/40 text-blue-300 disabled:opacity-30`}
-          >
-            {buying === 'buy-both' ? '...' : 'Buy Both 10 (@ mid)'}
-          </button>
-          <button
-            disabled={buying === 'sell-both' || !prices.upPrice || !prices.downPrice}
-            onClick={handleSellBoth}
-            className={`py-2 rounded-lg text-sm font-bold transition-all ${
-              buying === 'sell-both' ? 'opacity-50 cursor-wait' : ''
-            } bg-purple-700/40 hover:bg-purple-600/40 border border-purple-500/40 text-purple-300 disabled:opacity-30`}
-          >
-            {buying === 'sell-both' ? '...' : 'Sell Both 10 (+1¢)'}
-          </button>
-          <button
-            disabled={buying === 'buy-then-sell-both' || !prices.upPrice || !prices.downPrice}
-            onClick={handleBuyThenSellBoth}
-            className={`col-span-2 py-2 rounded-lg text-sm font-bold transition-all ${
-              buying === 'buy-then-sell-both' ? 'opacity-50 cursor-wait' : ''
-            } bg-cyan-700/40 hover:bg-cyan-600/40 border border-cyan-500/40 text-cyan-300 disabled:opacity-30`}
-          >
-            {buying === 'buy-then-sell-both' ? '...' : 'Buy 10 Both @ mid → Sell @ p+1¢ when filled'}
-          </button>
-          <button
-            disabled={buying === 'split' || !event}
-            onClick={handleSplit}
-            className={`col-span-2 py-2 rounded-lg text-sm font-bold transition-all ${
-              buying === 'split' ? 'opacity-50 cursor-wait' : ''
-            } bg-orange-700/40 hover:bg-orange-600/40 border border-orange-500/40 text-orange-300 disabled:opacity-30`}
-          >
-            {buying === 'split' ? 'Splitting...' : 'Split $150 → 150 Up + 150 Down'}
-          </button>
-        </div>
-
-        {/* Pending Sells (limit sells resting on book) */}
-        {(() => {
-          const pendingSells = openOrders.filter(o => {
-            const aid = o.asset_id ?? o.asset;
-            return o.side === 'SELL' && (aid === prices.tokenUp || aid === prices.tokenDown);
-          });
-          return pendingSells.length > 0 ? (
-            <div className="rounded-xl border border-yellow-800/50 bg-yellow-950/20 p-4 space-y-2">
-              <h3 className="font-bold text-sm text-yellow-400">Pending Sells ({pendingSells.length})</h3>
-              <div className="space-y-1">
-                {pendingSells.map(o => {
-                  const aid = o.asset_id ?? o.asset;
-                  const side = aid === prices.tokenUp ? 'up' : 'down';
-                  const curPrice = side === 'up' ? prices.upPrice : prices.downPrice;
-                  const targetPrice = parseFloat(o.price || 0);
-                  const total = parseFloat(o.original_size || 0);
-                  const filled = parseFloat(o.size_matched || 0);
-                  const remaining = total - filled;
-                  const diff = curPrice != null ? (targetPrice - curPrice) : null;
-                  const sideColor = side === 'up' ? 'text-green-400' : 'text-red-400';
-                  return (
-                    <div key={o.id} className="flex items-center justify-between text-xs">
-                      <div className="flex items-center gap-2 font-mono flex-wrap">
-                        <span className="font-bold text-yellow-400">SELL</span>
-                        <span className={`font-bold ${sideColor}`}>{side.toUpperCase()}</span>
-                        <span className="text-gray-300">{(targetPrice * 100).toFixed(1)}¢</span>
-                        <span className="text-gray-500">{remaining.toFixed(1)} sh</span>
-                        {diff != null && (
-                          <span className={`text-[10px] ${diff <= 0 ? 'text-green-400' : 'text-orange-400'}`}>
-                            {diff <= 0 ? 'READY' : `${(diff * 100).toFixed(1)}¢ away`}
-                          </span>
-                        )}
-                      </div>
-                      <button onClick={() => handleCancelOrder(o.id)}
-                        className="px-2 py-0.5 rounded text-[10px] font-bold bg-gray-800 hover:bg-red-900 text-gray-400 hover:text-red-300 transition-colors">
-                        Cancel
-                      </button>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          ) : null;
-        })()}
-
-        {/* Open Orders */}
-        {openOrders.length > 0 && (
-          <div className="rounded-xl border border-blue-800/50 bg-blue-950/20 p-4 space-y-2">
-            <div className="flex items-center justify-between">
-              <h3 className="font-bold text-sm text-blue-400">Open Orders ({openOrders.length})</h3>
-              <button onClick={handleCancelAll}
-                className="px-2 py-1 rounded text-[10px] font-bold bg-gray-800 hover:bg-red-900 text-gray-400 hover:text-red-300 transition-colors">
-                Cancel All
-              </button>
-            </div>
-            <div className="space-y-1">
-              {openOrders.map(o => {
-                const assetId = o.asset_id ?? o.asset;
-                const oSide = assetId === prices.tokenUp ? 'UP' : assetId === prices.tokenDown ? 'DN' : /up|yes/i.test(o.outcome || '') ? 'UP' : 'DN';
-                const isSell = o.side === 'SELL';
-                const sideColor = oSide === 'UP' ? 'text-green-400' : 'text-red-400';
-                const filled = parseFloat(o.size_matched || 0);
-                const total = parseFloat(o.original_size || 0);
-                return (
-                  <div key={o.id} className="flex items-center justify-between text-xs">
-                    <div className="flex items-center gap-2 font-mono">
-                      <span className={`font-bold ${isSell ? 'text-yellow-400' : sideColor}`}>{isSell ? 'SELL' : 'BUY'}</span>
-                      <span className={`font-bold ${sideColor}`}>{oSide}</span>
-                      <span className="text-gray-300">{(parseFloat(o.price) * 100).toFixed(1)}¢</span>
-                      <span className="text-gray-500">{total.toFixed(1)} sh</span>
-                      {filled > 0 && <span className="text-blue-400">({filled.toFixed(1)} filled)</span>}
-                    </div>
-                    <button onClick={() => handleCancelOrder(o.id)}
-                      className="px-2 py-0.5 rounded text-[10px] font-bold bg-gray-800 hover:bg-red-900 text-gray-400 hover:text-red-300 transition-colors">
-                      Cancel
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        )}
-
-        {/* Positions — Polymarket API when available, else derive from orders */}
-        <Positions
-          positions={positions}
-          eventSlug={event?.slug}
-          fallbackOrders={eventOrders}
-          prices={prices}
-          onSell={handleSell}
-          selling={buying}
-        />
-
-        {/* Orders */}
-        <OrderHistory orders={eventOrders} prices={prices} />
-
-        {/* Toast */}
+          <MyTrades />
         <OrderToast toast={toast} onDismiss={() => setToast(null)} />
-        </>}
       </div>
     </div>
   );

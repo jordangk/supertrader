@@ -4,6 +4,8 @@ export function useWebSocket() {
   const [prices, setPrices] = useState({ upPrice: null, downPrice: null, upStartPrice: null, downStartPrice: null });
   const [btc, setBtc] = useState({ current: null, start: null });
   const [binanceBtc, setBinanceBtc] = useState(null);
+  const [serverEma, setServerEma] = useState({ e12: null, e26: null, gap: 0, histogram: 0 });
+  const [priceEma, setPriceEma] = useState({ upE12: null, upE26: null, downE12: null, downE26: null });
   const [event, setEvent] = useState(null);
   const [autoSell, setAutoSell] = useState(null);
   const [refreshTrigger, setRefreshTrigger] = useState(0);
@@ -26,6 +28,7 @@ export function useWebSocket() {
               const up = msg.upPrice != null ? parseFloat(msg.upPrice) : null;
               const down = msg.downPrice != null ? parseFloat(msg.downPrice) : null;
               const pendingSells = (msg.pendingSells || []).map(ps => ({ ...ps }));
+              if (msg.priceEma) setPriceEma(msg.priceEma);
               const next = { upPrice: up, downPrice: down, upStartPrice: msg.upStartPrice ?? prev.upStartPrice, downStartPrice: msg.downStartPrice ?? prev.downStartPrice, tokenUp: msg.tokenUp ?? prev.tokenUp, tokenDown: msg.tokenDown ?? prev.tokenDown, pendingSells };
               // Compare pending sells ignoring age (changes every tick)
               const psKey = ps => `${ps.id}|${ps.side}|${ps.shares}|${ps.targetPrice}`;
@@ -45,6 +48,7 @@ export function useWebSocket() {
             setEvent(msg.event);
           } else if (msg.type === 'binance_btc') {
             setBinanceBtc(msg.price != null ? parseFloat(msg.price) : null);
+            if (msg.ema) setServerEma(msg.ema);
           } else if (msg.type === 'auto-sell') {
             setAutoSell(msg);
           } else if (msg.type === 'refresh') {
@@ -60,8 +64,10 @@ export function useWebSocket() {
           } else if (msg.type === 'whale_trades') {
             setWhaleTrades(prev => {
               const entries = (msg.trades || []).map(t => ({
-                ts: t.ts * 1000, side: t.side, outcome: t.outcome,
+                ts: (t.ts || 0) * 1000, side: t.side, outcome: t.outcome,
                 shares: t.shares, price: t.price, usdc: t.usdcSize, slug: t.slug,
+                marketUp: t.marketUp, marketDown: t.marketDown, tx_hash: t.txHash,
+                blockNumber: t.blockNumber, logIndex: t.logIndex,
               }));
               return [...entries, ...prev].slice(0, 200);
             });
@@ -85,5 +91,5 @@ export function useWebSocket() {
     return () => ws.current?.close();
   }, []);
 
-  return { prices, btc, binanceBtc, event, autoSell, refreshTrigger, copyFeed, whaleTrades };
+  return { prices, btc, binanceBtc, serverEma, priceEma, event, autoSell, refreshTrigger, copyFeed, whaleTrades };
 }

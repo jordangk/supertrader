@@ -232,11 +232,11 @@ async function fireAutoLost() {
 let autoEma = {
   enabled: false,
   shares: 5,
-  gapOpenThreshold: 7,   // $7 EMA gap (tightened: only enter on strong divergence)
+  gapOpenThreshold: 5,   // $5 fast EMA gap + MACD zero-cross to trigger
   priceMin: 30,           // winning side 30-75¢ (tighter range)
   priceMax: 75,
   maxHedgeWaitMs: 30_000, // max 30s to wait for hedge signal
-  cooldownMs: 90_000,     // 90s between cycles (tighter: fewer trades, higher conviction)
+  cooldownMs: 0,          // no cooldown between cycles
   busy: false,
   phase: null,            // null | 'entered' | 'hedged'
   entrySide: null,        // 'up' | 'down' — the winning/trending side
@@ -245,16 +245,21 @@ let autoEma = {
   takeProfitOrderId: null,
   entryPrice: null,
   entryTime: null,
+  oppPriceAtEntry: null,  // opposite side ask at entry — used to compute stop loss threshold
+  stopLossOppPrice: null, // hedge at this opposite price = -5¢ loss
   peakGap: 0,
+  peakProfit: 0,          // highest unrealized profit in cents (for trailing stop)
   btcAtEntry: null,       // BTC price when entry filled
   btcPeak: null,          // highest BTC since entry (for UP trades) or lowest (for DOWN)
   lastTriggerTime: 0,
-  lastHedgeTime: 0,       // must see gap cross zero after this before next entry (one per episode)
+  lastHedgeTime: 0,
+  lastEntrySide: null,      // prevent same side twice in a row
   log: [],
 };
 
 // Server-side EMA state (computed from Binance BTC ticks)
 // Fast EMA sampled every 300ms for quicker trigger detection
+const EMA_STATE_FILE = path.join(__dirname, '.ema-state.json');
 let serverEma = {
   e12: null, e26: null, gap: 0,
   signal: null, histogram: 0, prevHistogram: 0,
@@ -262,11 +267,56 @@ let serverEma = {
   lastCandleTs: 0, lastDelta: 0,
   // Fast tick-level MACD for exit detection (only active when in trade)
   fE12: null, fE26: null, fSignal: null, fHistogram: 0, fPrevHistogram: 0,
+  // EMA for Polymarket Up/Down prices
+  upE12: null, upE26: null, downE12: null, downE26: null,
 };
-const EMA12_ALPHA = 2 / 13;  // MACD fast
-const EMA26_ALPHA = 2 / 27;  // MACD slow
-const EMA9_ALPHA = 2 / 10;   // MACD signal line
+
+// Persist EMA state to disk every 10s, restore on startup
+function saveEmaState() {
+  try {
+    const state = {
+      serverEma: { ...serverEma, gapHistory: serverEma.gapHistory.slice(-60) },
+      autoEmaLog: autoEma.log,
+      lastEntrySide: autoEma.lastEntrySide,
+      btcStart: liveState.btcStart,
+      savedAt: Date.now(),
+    };
+    fs.writeFileSync(EMA_STATE_FILE, JSON.stringify(state));
+  } catch {}
+}
+function restoreEmaState() {
+  try {
+    if (!fs.existsSync(EMA_STATE_FILE)) return;
+    const state = JSON.parse(fs.readFileSync(EMA_STATE_FILE, 'utf8'));
+    // Only restore if saved recently (< 5 min) and same btcStart
+    if (Date.now() - state.savedAt > 300_000) { console.log('[EMA] Saved state too old, skipping restore'); return; }
+    if (state.serverEma) {
+      Object.assign(serverEma, state.serverEma);
+      console.log(`[EMA] Restored — e12=$${serverEma.e12?.toFixed(1)} e26=$${serverEma.e26?.toFixed(1)} gap=$${serverEma.gap.toFixed(1)}`);
+    }
+    if (state.autoEmaLog) autoEma.log = state.autoEmaLog;
+    if (state.lastEntrySide) autoEma.lastEntrySide = state.lastEntrySide;
+  } catch (e) { console.error('[EMA] Restore error:', e?.message); }
+}
+restoreEmaState();
+setInterval(saveEmaState, 10_000);
+const EMA12_ALPHA = 2 / 13;  // MACD fast (candle-based)
+const EMA26_ALPHA = 2 / 27;  // MACD slow (candle-based)
+const EMA9_ALPHA = 2 / 10;   // MACD signal line (candle-based)
 const MACD_CANDLE_MS = 2000;  // 2-second candles for entry
+// Fast tick-level alphas: ~10 ticks/sec, so multiply periods by 10
+const FAST_EMA12_ALPHA = 2 / (12 * 10 + 1);  // ~120 ticks ≈ 12s
+const FAST_EMA26_ALPHA = 2 / (26 * 10 + 1);  // ~260 ticks ≈ 26s
+const FAST_EMA9_ALPHA = 2 / (9 * 10 + 1);    // ~90 ticks ≈ 9s
+
+// EMA log buffer — flush to Supabase every 5s
+const _emaLogBuffer = [];
+setInterval(async () => {
+  if (_emaLogBuffer.length === 0) return;
+  const batch = _emaLogBuffer.splice(0, _emaLogBuffer.length);
+  const { error } = await supabase.from('ema_snapshots').insert(batch);
+  if (error) console.error('[EMA-LOG] DB error:', error.message);
+}, 5000);
 
 function updateServerEma(btcPrice) {
   if (liveState.btcStart == null) return;
@@ -274,11 +324,11 @@ function updateServerEma(btcPrice) {
   const delta = btcPrice - liveState.btcStart;
   serverEma.lastDelta = delta;
 
-  // Fast tick-level MACD (always updated, used for exit when in trade)
-  serverEma.fE12 = serverEma.fE12 == null ? delta : delta * EMA12_ALPHA + serverEma.fE12 * (1 - EMA12_ALPHA);
-  serverEma.fE26 = serverEma.fE26 == null ? delta : delta * EMA26_ALPHA + serverEma.fE26 * (1 - EMA26_ALPHA);
+  // Fast tick-level MACD (always updated, used for trigger & exit)
+  serverEma.fE12 = serverEma.fE12 == null ? delta : delta * FAST_EMA12_ALPHA + serverEma.fE12 * (1 - FAST_EMA12_ALPHA);
+  serverEma.fE26 = serverEma.fE26 == null ? delta : delta * FAST_EMA26_ALPHA + serverEma.fE26 * (1 - FAST_EMA26_ALPHA);
   const fGap = serverEma.fE12 - serverEma.fE26;
-  const fSignalNew = serverEma.fSignal == null ? fGap : fGap * EMA9_ALPHA + serverEma.fSignal * (1 - EMA9_ALPHA);
+  const fSignalNew = serverEma.fSignal == null ? fGap : fGap * FAST_EMA9_ALPHA + serverEma.fSignal * (1 - FAST_EMA9_ALPHA);
   serverEma.fPrevHistogram = serverEma.fHistogram;
   serverEma.fHistogram = fGap - fSignalNew;
   serverEma.fSignal = fSignalNew;
@@ -305,19 +355,66 @@ function updateServerEma(btcPrice) {
 
   serverEma.gapHistory.push({ t: now, gap: serverEma.gap, hist: serverEma.histogram });
   if (serverEma.gapHistory.length > 600) serverEma.gapHistory.splice(0, serverEma.gapHistory.length - 600);
+
+  // Log EMA snapshot to DB every 2s for later analysis
+  _emaLogBuffer.push({
+    ts: new Date(now).toISOString(),
+    event_slug: liveState.eventSlug || null,
+    btc_price: btcPrice,
+    btc_delta: delta,
+    e12: serverEma.e12, e26: serverEma.e26, gap: serverEma.gap, histogram: serverEma.histogram,
+    f_e12: serverEma.fE12, f_e26: serverEma.fE26, f_gap: fGap, f_histogram: serverEma.fHistogram,
+    up_price: liveState.upPrice, down_price: liveState.downPrice,
+    up_e12: serverEma.upE12, up_e26: serverEma.upE26, down_e12: serverEma.downE12, down_e26: serverEma.downE26,
+  });
 }
 
 function resetServerEma() {
-  serverEma = { e12: null, e26: null, gap: 0, signal: null, histogram: 0, prevHistogram: 0, gapHistory: [], crossBtcPrice: null, crossTime: null, lastCandleTs: 0, lastDelta: 0, fE12: null, fE26: null, fSignal: null, fHistogram: 0, fPrevHistogram: 0 };
+  serverEma = { e12: null, e26: null, gap: 0, signal: null, histogram: 0, prevHistogram: 0, gapHistory: [], crossBtcPrice: null, crossTime: null, lastCandleTs: 0, lastDelta: 0, fE12: null, fE26: null, fSignal: null, fHistogram: 0, fPrevHistogram: 0, upE12: null, upE26: null, downE12: null, downE26: null };
 }
 
-function _autoEmaAbort() {
+// Seed EMA from Binance klines on startup so it doesn't start cold
+async function seedServerEma() {
+  try {
+    if (!liveState.btcStart) return;
+    const res = await fetch('https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1s&limit=180');
+    const klines = await res.json();
+    if (!Array.isArray(klines) || klines.length === 0) return;
+    for (const k of klines) {
+      const close = parseFloat(k[4]);
+      const delta = close - liveState.btcStart;
+      // Feed into slow EMA (every 2nd kline ≈ 2s candles)
+      serverEma.e12 = serverEma.e12 == null ? delta : delta * EMA12_ALPHA + serverEma.e12 * (1 - EMA12_ALPHA);
+      serverEma.e26 = serverEma.e26 == null ? delta : delta * EMA26_ALPHA + serverEma.e26 * (1 - EMA26_ALPHA);
+      // Feed into fast EMA (tick-level alphas)
+      serverEma.fE12 = serverEma.fE12 == null ? delta : delta * FAST_EMA12_ALPHA + serverEma.fE12 * (1 - FAST_EMA12_ALPHA);
+      serverEma.fE26 = serverEma.fE26 == null ? delta : delta * FAST_EMA26_ALPHA + serverEma.fE26 * (1 - FAST_EMA26_ALPHA);
+    }
+    serverEma.gap = (serverEma.e12 ?? 0) - (serverEma.e26 ?? 0);
+    serverEma.signal = serverEma.gap;
+    serverEma.histogram = 0;
+    const fGap = (serverEma.fE12 ?? 0) - (serverEma.fE26 ?? 0);
+    serverEma.fSignal = fGap;
+    serverEma.fHistogram = 0;
+    serverEma.lastCandleTs = Date.now();
+    console.log(`[AUTO-EMA] Seeded from ${klines.length} klines — e12=$${serverEma.e12?.toFixed(1)} e26=$${serverEma.e26?.toFixed(1)} gap=$${serverEma.gap.toFixed(1)}`);
+  } catch (e) {
+    console.error('[AUTO-EMA] Seed error:', e?.message);
+  }
+}
+
+function _autoEmaAbort(reason) {
   // Cancel pending orders when aborting (user disabled or error)
   // Don't cancel hedgeOrderId — if placed, let it fill to complete the pair
   if (clobClient) {
     if (autoEma.takeProfitOrderId) clobClient.cancelOrder({ orderID: autoEma.takeProfitOrderId }).catch(() => {});
     if (autoEma.entryOrderId) clobClient.cancelOrder({ orderID: autoEma.entryOrderId }).catch(() => {});
   }
+  // Update log entry if still pending (so UI shows why it aborted)
+  if (reason && autoEma.log.length > 0 && autoEma.log[0].result === 'pending') {
+    autoEma.log[0].result = reason;
+  }
+  autoEma.takeProfitPrice = null;
   // Cooldown starts from cycle completion (prevents rapid re-triggers)
   autoEma.lastTriggerTime = Date.now();
   autoEma.busy = false;
@@ -328,79 +425,61 @@ function _autoEmaAbort() {
   autoEma.takeProfitOrderId = null;
   autoEma.entryPrice = null;
   autoEma.entryTime = null;
+  autoEma.oppPriceAtEntry = null;
+  autoEma.stopLossOppPrice = null;
   autoEma.peakGap = 0;
   autoEma.btcAtEntry = null;
   autoEma.btcPeak = null;
+  autoEma.entryFillTime = null;
+  autoEma.peakProfit = 0;
 }
 
-// Step 1: Check if EMAs are diverging enough to enter winning side
+// Step 1: Enter when fast MACD crosses zero AND fast EMA gap ≥ threshold
+let _lastEmaDebug = 0;
 function checkEmaTrigger() {
   if (!autoEma.enabled || autoEma.busy) return;
   if (!activeEvent || !clobClient) return;
   if (isNoTradeZone()) return;
-  const cooldown = autoEma.cooldownMs ?? 30_000;
-  if (Date.now() - autoEma.lastTriggerTime < cooldown) return;
+  if (Date.now() - autoEma.lastTriggerTime < 4_000) return; // 4s cooldown between attempts
 
-  // One trade per episode: gap must have crossed zero since last hedge (new trend)
-  if (autoEma.lastHedgeTime > 0 && serverEma.crossTime <= autoEma.lastHedgeTime) return;
+  // Use fast tick-by-tick EMA
+  const fGap = (serverEma.fE12 ?? 0) - (serverEma.fE26 ?? 0);
+  const absGap = Math.abs(fGap);
+  const fHist = serverEma.fHistogram ?? 0;
+  const histAgreesWithGap = (fGap > 0 && fHist > 0) || (fGap < 0 && fHist < 0);
+  const winSide = fGap > 0 ? 'up' : 'down';
+  const winPrice = winSide === 'up' ? liveState.upPrice : liveState.downPrice;
+  const winCents = (winPrice ?? 0) * 100;
 
-  const absGap = Math.abs(serverEma.gap);
+  // Debug log every 10s
+  if (Date.now() - _lastEmaDebug > 10_000) {
+    _lastEmaDebug = Date.now();
+    console.log(`[AUTO-EMA-DBG] gap=$${fGap.toFixed(1)} (need≥${autoEma.gapOpenThreshold}) hist=${fHist.toFixed(2)} agrees=${histAgreesWithGap} win=${winCents.toFixed(0)}¢ (${autoEma.priceMin}-${autoEma.priceMax})`);
+  }
+
   if (absGap < autoEma.gapOpenThreshold) return;
 
-  // Determine trending side: positive gap = BTC going up = Up winning
-  const trendingSide = serverEma.gap > 0 ? 'up' : 'down';
+  // MACD histogram must agree with gap direction (same sign)
+  if (!histAgreesWithGap) return;
 
-  // Momentum confirmation: don't buy against current price direction (EMA lags!)
-  // lastDelta = BTC price - start. Buy Up only if BTC above start; Down only if below
-  const lastDelta = serverEma.lastDelta ?? 0;
-  const deltaThreshold = 4; // $4 buffer (tightened: require clear price move)
-  if (trendingSide === 'up' && lastDelta < deltaThreshold) {
-    return; // Gap says Up but BTC is at/below start — lag, skip
-  }
-  if (trendingSide === 'down' && lastDelta > -deltaThreshold) {
-    return; // Gap says Down but BTC is at/above start — lag, skip
-  }
-
-  // Fast histogram must STRONGLY agree (tightened: must actively confirm direction)
-  const fHist = serverEma.fHistogram ?? 0;
-  const histConfirmMin = 0.5; // histogram must be clearly in our favor
-  if (trendingSide === 'up' && fHist < histConfirmMin) return;  // Need bullish histogram for Up
-  if (trendingSide === 'down' && fHist > -histConfirmMin) return; // Need bearish histogram for Down
-
-  // 2s-candle histogram must also agree (double confirmation)
-  const hist = serverEma.histogram ?? 0;
-  if (trendingSide === 'up' && hist < 0.3) return;   // Slow MACD must be bullish
-  if (trendingSide === 'down' && hist > -0.3) return; // Slow MACD must be bearish
-
-  // Gap persistence: must have been above threshold in same direction for 2+ consecutive 2s candles (~4s)
-  const recent = serverEma.gapHistory?.slice(-3) || [];
-  const allConfirm = recent.length >= 2 && recent.every(r => {
-    const rg = r.gap ?? 0;
-    return trendingSide === 'up' ? (rg >= autoEma.gapOpenThreshold) : (rg <= -autoEma.gapOpenThreshold);
-  });
-  if (!allConfirm) return; // Not persistent enough — avoid false breakouts
-
-  const winningPrice = trendingSide === 'up' ? liveState.upPrice : liveState.downPrice;
-  if (winningPrice == null) return;
-  const winCents = winningPrice * 100;
+  if (winPrice == null) return;
   if (winCents < autoEma.priceMin || winCents > autoEma.priceMax) return;
 
-  const triggerReason = `gap≥$${autoEma.gapOpenThreshold} delta=$${lastDelta.toFixed(0)} fHist=${fHist.toFixed(1)}`;
-  console.log(`[AUTO-EMA] Trigger — ${trendingSide.toUpperCase()} trend, gap=$${Math.abs(serverEma.gap).toFixed(1)}, winning=${winCents.toFixed(0)}¢, reason=${triggerReason}`);
+  console.log(`[AUTO-EMA] Trigger — ${winSide.toUpperCase()}, fGap=$${fGap.toFixed(1)}, fHist=${fHist.toFixed(2)}, winning=${winCents.toFixed(0)}¢`);
   autoEma.busy = true;
   autoEma.lastTriggerTime = Date.now();
-  autoEma.log = [{ ts: Date.now(), side: trendingSide, triggerGap: serverEma.gap, entryPrice: null, entryFillTime: null, hedgePrice: null, hedgeReason: null, hedgeTime: null, peakGap: 0, tpPrice: null, profit: null, result: 'pending' }, ...autoEma.log].slice(0, 20);
-  broadcast({ type: 'auto_ema', status: 'triggered', side: trendingSide, gap: serverEma.gap });
-  fireAutoEmaEntry(trendingSide);
+  autoEma.log = [{ ts: Date.now(), side: winSide, triggerGap: fGap, fHist, entryPrice: null, entryFillTime: null, hedgePrice: null, hedgeReason: null, hedgeTime: null, peakGap: 0, tpPrice: null, profit: null, result: 'pending' }, ...autoEma.log].slice(0, 20);
+  broadcast({ type: 'auto_ema', status: 'triggered', side: winSide, gap: fGap });
+  fireAutoEmaEntry(winSide);
 }
 
 // Step 1 execution: buy the winning side at market - 2¢
 async function fireAutoEmaEntry(side) {
-  if (!clobClient || !activeEvent) { _autoEmaAbort(); return; }
-  if (isNoTradeZone()) { _autoEmaAbort(); return; }
+  if (!clobClient || !activeEvent) { _autoEmaAbort('no_client'); return; }
+  if (isNoTradeZone()) { _autoEmaAbort('no_trade_zone'); return; }
 
   const tokenId = side === 'up' ? liveState.tokenUp : liveState.tokenDown;
-  if (!tokenId) { _autoEmaAbort(); return; }
+  if (!tokenId) { _autoEmaAbort('no_token'); return; }
 
   const tickSize = activeEvent.tickSize || '0.01';
   const tick = parseFloat(tickSize);
@@ -408,148 +487,77 @@ async function fireAutoEmaEntry(side) {
   const sizeShares = 5; // always 5 shares
 
   try {
-    const oppTokenId = side === 'up' ? liveState.tokenDown : liveState.tokenUp;
-    const [mkt, oppMkt] = await Promise.all([fetchClobBidAsk(tokenId), oppTokenId ? fetchClobBidAsk(oppTokenId) : Promise.resolve(null)]);
+    const mkt = await fetchClobBidAsk(tokenId);
     const marketPrice = mkt.bestAsk ?? (side === 'up' ? liveState.upPrice : liveState.downPrice);
-    if (!marketPrice || marketPrice <= 0) { _autoEmaAbort(); return; }
+    if (!marketPrice || marketPrice <= 0) { _autoEmaAbort('no_market_price'); return; }
 
     const buyPrice = Math.max(0.01, Math.min(Math.round((marketPrice + 0.01) / tick) * tick, 0.99));
-    const oppAsk = oppMkt?.bestAsk ?? (side === 'up' ? liveState.downPrice : liveState.upPrice);
-    const minProfitCents = 3; // tightened: only enter when ≥3¢ locked profit possible
-    if (oppAsk != null && oppAsk > 0) {
-      const totalCost = Math.round((buyPrice + oppAsk) * 100);
-      if (totalCost > 100 - minProfitCents) {
-        console.log(`[AUTO-EMA] Entry SKIP — spread too tight: entry ${(buyPrice*100).toFixed(0)}¢ + opp ${(oppAsk*100).toFixed(0)}¢ = ${totalCost}¢ (need <${100 - minProfitCents}¢ for ≥${minProfitCents}¢ profit)`);
-        _autoEmaAbort();
-        return;
-      }
+
+    console.log(`[AUTO-EMA] Entry: BUY ${side.toUpperCase()} ${sizeShares}sh @ ${(buyPrice*100).toFixed(0)}¢ (ask ${(marketPrice*100).toFixed(0)}¢, +1¢)`);
+    const signedOrder = await clobClient.createOrder({ tokenID: tokenId, price: buyPrice, size: sizeShares, side: 'BUY' }, { tickSize, negRisk });
+    const result = await clobClient.postOrder(signedOrder, 'GTC');
+    const ok = result?.success || result?.status === 'matched' || result?.status === 'live';
+    const orderId = result?.orderID ?? result?.order_id;
+
+    if (!ok) {
+      console.log('[AUTO-EMA] Entry order failed:', JSON.stringify(result));
+      _autoEmaAbort('order_failed');
+      return;
     }
 
-    console.log(`[AUTO-EMA] Entry: GTC BUY ${side.toUpperCase()} ${sizeShares}sh @ ${(buyPrice*100).toFixed(0)}¢ (mkt ${(marketPrice*100).toFixed(0)}¢, +1¢)`);
-    const order = await clobClient.createOrder({ tokenID: tokenId, price: buyPrice, size: sizeShares, side: 'BUY' }, { tickSize, negRisk });
-    const result = await clobClient.postOrders([{ order, orderType: 'GTC' }]);
-    const arr = Array.isArray(result) ? result : (result?.responses || [result] || []);
-    const ok = arr[0]?.success || arr[0]?.status === 'matched' || arr[0]?.status === 'live';
-    const orderId = arr[0]?.orderID ?? arr[0]?.order_id;
+    console.log(`[AUTO-EMA] Entry result: status=${result?.status}, orderId=${orderId}`);
 
-    if (!ok) { console.log('[AUTO-EMA] Entry order failed'); _autoEmaAbort(); return; }
+    // Capture opposite side price NOW to lock in stop loss level
+    const oppAskNow = side === 'up' ? liveState.downPrice : liveState.upPrice;
+    // Stop loss: opposite price where hedge = -5¢ loss
+    // totalCost = buyPrice + hedgePrice, profit = 100¢ - totalCost
+    // -5¢ means totalCost = 105¢, so stopLossOppPrice = (105 - buyPrice*100) / 100
+    const stopLossOppPrice = (100 + 5 - Math.round(buyPrice * 100)) / 100;
 
-    autoEma.phase = 'pending';  // not 'entered' yet — wait for fill
+    autoEma.phase = 'entered';
     autoEma.entrySide = side;
+    autoEma.lastEntrySide = side;
     autoEma.entryOrderId = orderId;
     autoEma.entryPrice = buyPrice;
     autoEma.entryTime = Date.now();
-    autoEma.peakGap = Math.abs(serverEma.gap);
-
-    broadcast({ type: 'auto_ema', status: 'pending', side, buyPrice, gap: serverEma.gap });
-    console.log(`[AUTO-EMA] Entry placed @ ${(buyPrice*100).toFixed(0)}¢ — checking fill in 3s`);
-
-    // Poll entry fill: check every 3s, retry at new price if not filled & trend continues
-    let currentOrderId = orderId;
-    let currentPrice = buyPrice;
-    const maxRetries = 5; // max 5 attempts (15s total)
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
-      await new Promise(r => setTimeout(r, 3000));
-      if (!autoEma.busy) return; // aborted externally
-
-      try {
-        const raw = await clobClient.getOpenOrders();
-        const list = Array.isArray(raw) ? raw : (raw?.data ?? raw?.orders ?? []);
-        const oid = o => o?.id ?? o?.order_id ?? o?.orderID ?? o?.orderId;
-        const stillOpen = list.some(o => oid(o) === currentOrderId);
-
-        if (!stillOpen) {
-          // Filled!
-          console.log(`[AUTO-EMA] Entry FILLED @ ${(currentPrice*100).toFixed(0)}¢ (attempt ${attempt + 1})`);
-          break;
-        }
-
-        // Not filled — check if trend is still going
-        const absGap = Math.abs(serverEma.gap);
-        const trendOk = absGap >= autoEma.gapOpenThreshold;
-        if (!trendOk) {
-          console.log(`[AUTO-EMA] Trend faded (gap=$${absGap.toFixed(1)}) — canceling entry`);
-          if (autoEma.log.length > 0) autoEma.log[0].result = 'trend_faded';
-          try { await clobClient.cancelOrder({ orderID: currentOrderId }); } catch (ce) { console.error('[AUTO-EMA] Cancel error:', ce.message); }
-          _autoEmaAbort();
-          return;
-        }
-
-        // Trend still going — cancel and re-place at new market - 2¢
-        console.log(`[AUTO-EMA] Entry not filled, retrying at new price (attempt ${attempt + 2})`);
-        try { await clobClient.cancelOrder({ orderID: currentOrderId }); } catch (ce) { console.error('[AUTO-EMA] Cancel error:', ce.message); }
-
-        const newMkt = await fetchClobBidAsk(tokenId);
-        const newMarket = newMkt.bestAsk ?? (side === 'up' ? liveState.upPrice : liveState.downPrice);
-        if (!newMarket || newMarket <= 0) { _autoEmaAbort(); return; }
-        const newPrice = Math.max(0.01, Math.min(Math.round((newMarket + 0.01) / tick) * tick, 0.99));
-
-        const newOrder = await clobClient.createOrder({ tokenID: tokenId, price: newPrice, size: sizeShares, side: 'BUY' }, { tickSize, negRisk });
-        const newResult = await clobClient.postOrders([{ order: newOrder, orderType: 'GTC' }]);
-        const newArr = Array.isArray(newResult) ? newResult : (newResult?.responses || [newResult] || []);
-        const newOk = newArr[0]?.success || newArr[0]?.status === 'matched' || newArr[0]?.status === 'live';
-        const newId = newArr[0]?.orderID ?? newArr[0]?.order_id;
-        if (!newOk) { console.log('[AUTO-EMA] Retry order failed'); _autoEmaAbort(); return; }
-
-        currentOrderId = newId;
-        currentPrice = newPrice;
-        autoEma.entryOrderId = newId;
-        autoEma.entryPrice = newPrice;
-        console.log(`[AUTO-EMA] Retry entry @ ${(newPrice*100).toFixed(0)}¢ (mkt ${(newMarket*100).toFixed(0)}¢)`);
-        broadcast({ type: 'auto_ema', status: 'retrying', side, buyPrice: newPrice, attempt: attempt + 2 });
-      } catch (e) {
-        console.error('[AUTO-EMA] Fill check error:', e.message);
-      }
-    }
-
-    // If we got here, either filled or max retries — check one more time
-    if (autoEma.busy) {
-      const raw = await clobClient.getOpenOrders();
-      const list = Array.isArray(raw) ? raw : (raw?.data ?? raw?.orders ?? []);
-      const oid = o => o?.id ?? o?.order_id ?? o?.orderID ?? o?.orderId;
-      const stillOpen = list.some(o => oid(o) === currentOrderId);
-      if (stillOpen) {
-        console.log('[AUTO-EMA] Max retries — canceling entry');
-        if (autoEma.log.length > 0) autoEma.log[0].result = 'max_retries';
-        try { await clobClient.cancelOrder({ orderID: currentOrderId }); } catch {}
-        _autoEmaAbort();
-        return;
-      }
-    }
-
-    if (!autoEma.busy) return; // aborted
-
-    // Entry confirmed filled — now enable hedge monitoring
-    autoEma.phase = 'entered';
+    autoEma.entryFillTime = Date.now();
+    autoEma.oppPriceAtEntry = oppAskNow;
+    autoEma.stopLossOppPrice = stopLossOppPrice;
     autoEma.peakGap = Math.abs(serverEma.gap);
     autoEma.btcAtEntry = liveState.binanceBtc;
     autoEma.btcPeak = liveState.binanceBtc;
+    autoEma.peakProfit = 0;
+
+    console.log(`[AUTO-EMA] Stop loss locked: opp now=${(oppAskNow*100).toFixed(0)}¢, stop if opp ≥ ${(stopLossOppPrice*100).toFixed(0)}¢ (= -5¢ loss)`);
 
     // DB insert
     supabase.from('polymarket_trades').insert({
       polymarket_event_id: eventDbId(), direction: side,
-      purchase_price: currentPrice, purchase_amount: Math.round(sizeShares * currentPrice * 100) / 100,
+      purchase_price: buyPrice, purchase_amount: Math.round(sizeShares * buyPrice * 100) / 100,
       purchase_time: new Date().toISOString(), minute: Math.floor(Date.now() / 60000),
       btc_price_at_purchase: liveState.btcCurrent, order_type: 'live',
-      order_status: 'open', polymarket_order_id: currentOrderId, shares: sizeShares,
-      notes: JSON.stringify({ type: 'auto-ema-entry', side, buyPrice: currentPrice, gap: serverEma.gap, eventSlug: liveState.eventSlug, histogram: serverEma.histogram, e12: serverEma.e12, e26: serverEma.e26 }),
+      order_status: 'open', polymarket_order_id: orderId, shares: sizeShares,
+      notes: JSON.stringify({ type: 'auto-ema-entry', side, buyPrice, gap: serverEma.gap, eventSlug: liveState.eventSlug, histogram: serverEma.histogram, e12: serverEma.e12, e26: serverEma.e26 }),
     }).then(({ error: dbErr }) => { if (dbErr) console.error('[AUTO-EMA] DB error:', dbErr); });
 
-    broadcast({ type: 'auto_ema', status: 'entered', side, buyPrice: currentPrice, gap: serverEma.gap });
-    // Update log with entry details
+    broadcast({ type: 'auto_ema', status: 'entered', side, buyPrice, gap: serverEma.gap });
     if (autoEma.log.length > 0) {
-      autoEma.log[0].entryPrice = currentPrice;
+      autoEma.log[0].entryPrice = buyPrice;
       autoEma.log[0].entryFillTime = Date.now();
       autoEma.log[0].result = 'entered';
     }
-    console.log(`[AUTO-EMA] Entry confirmed @ ${(currentPrice*100).toFixed(0)}¢ — riding trend, stop loss at -5¢, exit on MACD cross`);
+    console.log(`[AUTO-EMA] ENTERED @ ${(buyPrice*100).toFixed(0)}¢ — trailing stop: -3¢ initial, ratchets at +5¢`);
   } catch (e) {
     console.error('[AUTO-EMA] Entry error:', e?.message ?? e);
     _autoEmaAbort();
   }
 }
 
-// Check for stop loss (-5¢) and MACD exit
+// Trailing stop: initial -3¢, ratchets up once profit reaches +5¢
+// Exit conditions:
+// 1. Stop loss: opposite ask ≥ locked stopLossOppPrice (= -5¢ real loss)
+// 2. Trailing profit stop: once peak profit ≥ 5¢, floor = peakProfit - 3¢, ratchets up 1:1
+// 3. MACD cross: only if profitable (≥ 0¢)
 function checkEmaHedge() {
   if (!autoEma.enabled || !autoEma.busy || autoEma.phase !== 'entered') return;
   if (!activeEvent || !clobClient) return;
@@ -557,58 +565,74 @@ function checkEmaHedge() {
   const absGap = Math.abs(serverEma.gap);
   autoEma.peakGap = Math.max(autoEma.peakGap, absGap);
 
-  // Stop loss: if entry side price dropped 5¢+ from entry, hedge immediately
-  const currentPrice = autoEma.entrySide === 'up' ? liveState.upPrice : liveState.downPrice;
-  if (currentPrice != null && autoEma.entryPrice != null) {
-    const unrealizedLoss = Math.round((autoEma.entryPrice - currentPrice) * 100);
-    if (unrealizedLoss >= 5) {
-      console.log(`[AUTO-EMA] STOP LOSS — ${autoEma.entrySide.toUpperCase()} dropped ${unrealizedLoss}¢ (entry ${(autoEma.entryPrice*100).toFixed(0)}¢ → ${(currentPrice*100).toFixed(0)}¢)`);
+  // Real P&L if we hedge right now: 100¢ - (entryPrice + oppAsk+1¢)
+  const oppPrice = autoEma.entrySide === 'up' ? liveState.downPrice : liveState.upPrice;
+  if (oppPrice == null || autoEma.entryPrice == null) return;
+  const hedgeCost = oppPrice + 0.01;
+  const totalCostCents = Math.round((autoEma.entryPrice + hedgeCost) * 100);
+  const profitCents = 100 - totalCostCents;
+
+  autoEma.peakProfit = Math.max(autoEma.peakProfit, profitCents);
+
+  // 1. Stop loss: locked at entry time — opposite ask ≥ threshold
+  if (autoEma.stopLossOppPrice && oppPrice >= autoEma.stopLossOppPrice) {
+    const reason = `stop_loss(${profitCents}¢, opp=${(oppPrice*100).toFixed(0)}¢≥${(autoEma.stopLossOppPrice*100).toFixed(0)}¢)`;
+    console.log(`[AUTO-EMA] STOP LOSS — ${autoEma.entrySide.toUpperCase()} opp=${(oppPrice*100).toFixed(0)}¢ ≥ stop=${(autoEma.stopLossOppPrice*100).toFixed(0)}¢ (entry ${(autoEma.entryPrice*100).toFixed(0)}¢, hedgeP&L=${profitCents}¢)`);
+    if (autoEma.log.length > 0) {
+      autoEma.log[0].hedgeReason = reason;
+      autoEma.log[0].hedgeTime = Date.now();
+      autoEma.log[0].peakGap = autoEma.peakGap;
+      autoEma.log[0].peakProfit = autoEma.peakProfit;
+    }
+    autoEma.phase = 'hedging';
+    broadcast({ type: 'auto_ema', status: 'stop_loss', side: autoEma.entrySide, profitCents });
+    fireAutoEmaExit(reason);
+    return;
+  }
+
+  // 2. Trailing profit stop: once we hit +5¢, lock in floor at peak - 3¢, ratchet 1:1
+  //    e.g. peak=5→floor=2, peak=6→floor=3, peak=10→floor=7
+  if (autoEma.peakProfit >= 5) {
+    const profitFloor = autoEma.peakProfit - 3;
+    if (profitCents <= profitFloor) {
+      const reason = `trailing_stop(+${profitCents}¢, peak=+${autoEma.peakProfit}¢, floor=+${profitFloor}¢)`;
+      console.log(`[AUTO-EMA] TRAILING STOP — ${autoEma.entrySide.toUpperCase()} profit=${profitCents}¢ ≤ floor=${profitFloor}¢ (peak=${autoEma.peakProfit}¢)`);
       if (autoEma.log.length > 0) {
-        autoEma.log[0].hedgeReason = 'stop_loss';
+        autoEma.log[0].hedgeReason = reason;
         autoEma.log[0].hedgeTime = Date.now();
         autoEma.log[0].peakGap = autoEma.peakGap;
+        autoEma.log[0].peakProfit = autoEma.peakProfit;
       }
       autoEma.phase = 'hedging';
-      broadcast({ type: 'auto_ema', status: 'stop_loss', side: autoEma.entrySide });
-      fireAutoEmaExit('stop_loss');
+      broadcast({ type: 'auto_ema', status: 'trailing_stop', side: autoEma.entrySide, profitCents, peakProfit: autoEma.peakProfit });
+      fireAutoEmaExit(reason);
       return;
     }
   }
 
-  // MACD histogram exit: use FAST tick-level histogram for quicker exit detection
-  const hist = serverEma.fHistogram;
-  const prevHist = serverEma.fPrevHistogram;
-  let reason = null;
-  const minCrossStrength = 0.3; // Ignore tiny wobbles — require |hist| ≥ this after cross
-
-  if (autoEma.entrySide === 'up' && prevHist >= 0 && hist < 0 && Math.abs(hist) >= minCrossStrength) {
-    reason = 'macd_cross';
-  } else if (autoEma.entrySide === 'down' && prevHist <= 0 && hist > 0 && Math.abs(hist) >= minCrossStrength) {
-    reason = 'macd_cross';
+  // 3. MACD cross exit: only if profitable (hedge would be ≥ break-even)
+  const hist = serverEma.histogram ?? 0;
+  const prevHist = serverEma.prevHistogram ?? 0;
+  const macdCrossedAgainst = (autoEma.entrySide === 'up' && prevHist >= 0 && hist < 0) ||
+                              (autoEma.entrySide === 'down' && prevHist <= 0 && hist > 0);
+  if (macdCrossedAgainst && profitCents >= 0) {
+    console.log(`[AUTO-EMA] MACD CROSS EXIT — ${autoEma.entrySide.toUpperCase()} hedgeP&L=+${profitCents}¢ hist=${hist.toFixed(2)}`);
+    if (autoEma.log.length > 0) {
+      autoEma.log[0].hedgeReason = `macd_cross(+${profitCents}¢)`;
+      autoEma.log[0].hedgeTime = Date.now();
+      autoEma.log[0].peakGap = autoEma.peakGap;
+      autoEma.log[0].peakProfit = autoEma.peakProfit;
+    }
+    autoEma.phase = 'hedging';
+    broadcast({ type: 'auto_ema', status: 'macd_cross', side: autoEma.entrySide, profitCents });
+    fireAutoEmaExit(`macd_cross(+${profitCents}¢)`);
+    return;
   }
-
-  if (!reason) return;
-
-  console.log(`[AUTO-EMA] MACD exit (fast) — histogram ${prevHist.toFixed(2)} → ${hist.toFixed(2)}, gap=$${absGap.toFixed(1)}`);
-  if (autoEma.log.length > 0) {
-    autoEma.log[0].hedgeReason = reason;
-    autoEma.log[0].hedgeTime = Date.now();
-    autoEma.log[0].peakGap = autoEma.peakGap;
-  }
-  autoEma.phase = 'hedging';
-  broadcast({ type: 'auto_ema', status: 'hedging', reason, gap: serverEma.gap });
-  fireAutoEmaExit(reason);
 }
 
-// On reversal: always hedge opposite side at price targeting 2¢ profit
+// Exit: sell entry-side shares at market-1¢ (no more opposite-side hedge)
 async function fireAutoEmaExit(reason) {
   if (!clobClient || !activeEvent) { _autoEmaAbort(); return; }
-
-  // Cancel take-profit sell if still open — we're closing instead
-  if (autoEma.takeProfitOrderId) {
-    try { await clobClient.cancelOrder({ orderID: autoEma.takeProfitOrderId }); } catch {}
-    autoEma.takeProfitOrderId = null;
-  }
 
   const oppSide = autoEma.entrySide === 'up' ? 'down' : 'up';
   const tokenId = oppSide === 'up' ? liveState.tokenUp : liveState.tokenDown;
@@ -620,7 +644,7 @@ async function fireAutoEmaExit(reason) {
   const sizeShares = 5;
 
   try {
-    // Hedge: buy opposite side at market+1¢
+    // Hedge: buy opposite side at ask+1¢ for quick fill
     const mkt = await fetchClobBidAsk(tokenId);
     const marketPrice = mkt.bestAsk ?? (oppSide === 'up' ? liveState.upPrice : liveState.downPrice);
     if (!marketPrice || marketPrice <= 0) { _autoEmaAbort(); return; }
@@ -628,23 +652,16 @@ async function fireAutoEmaExit(reason) {
     const buyPrice = Math.max(0.01, Math.min(Math.round((marketPrice + 0.01) / tick) * tick, 0.99));
     const totalCost = Math.round((autoEma.entryPrice + buyPrice) * 100);
     const profitCents = 100 - totalCost;
-    const maxLossCents = 5; // At end of episode: allow hedge up to 5¢ loss to close cleanly
 
-    if (profitCents < -maxLossCents) {
-      console.log(`[AUTO-EMA] Hedge SKIP — would lock ${profitCents}¢ (max loss ${maxLossCents}¢): entry ${(autoEma.entryPrice*100).toFixed(0)}¢ + hedge ${(buyPrice*100).toFixed(0)}¢ = ${totalCost}¢. Aborting.`);
-      _autoEmaAbort();
-      return;
-    }
+    console.log(`[AUTO-EMA] HEDGE: BUY ${oppSide.toUpperCase()} ${sizeShares}sh @ ${(buyPrice*100).toFixed(0)}¢ (entry ${(autoEma.entryPrice*100).toFixed(0)}¢ + ${(buyPrice*100).toFixed(0)}¢ = ${totalCost}¢, ${profitCents >= 0 ? '+' : ''}${profitCents}¢, reason=${reason})`);
 
-    console.log(`[AUTO-EMA] Hedge: BUY ${oppSide.toUpperCase()} ${sizeShares}sh @ ${(buyPrice*100).toFixed(0)}¢ (entry ${(autoEma.entryPrice*100).toFixed(0)}¢ + ${(buyPrice*100).toFixed(0)}¢ = ${totalCost}¢, +${profitCents}¢, reason=${reason})`);
+    const signedOrder = await clobClient.createOrder({ tokenID: tokenId, price: buyPrice, size: sizeShares, side: 'BUY' }, { tickSize, negRisk });
+    const result = await clobClient.postOrder(signedOrder, 'GTC');
+    const ok = result?.success || result?.status === 'matched' || result?.status === 'live';
+    const orderId = result?.orderID ?? result?.order_id;
 
-    const order = await clobClient.createOrder({ tokenID: tokenId, price: buyPrice, size: sizeShares, side: 'BUY' }, { tickSize, negRisk });
-    const result = await clobClient.postOrders([{ order, orderType: 'GTC' }]);
-    const arr = Array.isArray(result) ? result : (result?.responses || [result] || []);
-    const ok = arr[0]?.success || arr[0]?.status === 'matched' || arr[0]?.status === 'live';
-    const orderId = arr[0]?.orderID ?? arr[0]?.order_id;
-
-    if (!ok) { console.log('[AUTO-EMA] Hedge order failed'); _autoEmaAbort(); return; }
+    console.log(`[AUTO-EMA] Hedge result: status=${result?.status}, orderId=${orderId}`);
+    if (!ok) { console.log('[AUTO-EMA] Hedge order failed:', JSON.stringify(result)); _autoEmaAbort(); return; }
 
     if (autoEma.log.length > 0) {
       autoEma.log[0].hedgePrice = buyPrice;
@@ -659,11 +676,11 @@ async function fireAutoEmaExit(reason) {
       purchase_time: new Date().toISOString(), minute: Math.floor(Date.now() / 60000),
       btc_price_at_purchase: liveState.btcCurrent, order_type: 'live',
       order_status: 'open', polymarket_order_id: orderId, shares: sizeShares,
-      notes: JSON.stringify({ type: 'auto-ema-hedge', side: oppSide, buyPrice, entryPrice: autoEma.entryPrice, entrySide: autoEma.entrySide, profitCents, reason, eventSlug: liveState.eventSlug, gap: serverEma.gap, peakGap: autoEma.peakGap, histogram: serverEma.histogram }),
+      notes: JSON.stringify({ type: 'auto-ema-hedge', side: oppSide, buyPrice, entryPrice: autoEma.entryPrice, entrySide: autoEma.entrySide, profitCents, peakProfit: autoEma.peakProfit, reason, eventSlug: liveState.eventSlug, gap: serverEma.gap, peakGap: autoEma.peakGap, histogram: serverEma.histogram }),
     }).then(({ error: dbErr }) => { if (dbErr) console.error('[AUTO-EMA] DB error:', dbErr); });
 
     broadcast({ type: 'auto_ema', status: 'hedged', side: oppSide, buyPrice, profitCents });
-    autoEma.lastHedgeTime = Date.now(); // new episode required before next entry
+    autoEma.lastHedgeTime = Date.now();
     _autoEmaAbort();
 
   } catch (e) {
@@ -1523,18 +1540,26 @@ function connectClobStream(tokenIds) {
             liveState.upPrice = price;
             if (liveState.upStartPrice == null) liveState.upStartPrice = price;
             recordFlowTick('up', price);
+            // Update Up price EMA
+            const priceCents = price * 100;
+            serverEma.upE12 = serverEma.upE12 == null ? priceCents : priceCents * FAST_EMA12_ALPHA + serverEma.upE12 * (1 - FAST_EMA12_ALPHA);
+            serverEma.upE26 = serverEma.upE26 == null ? priceCents : priceCents * FAST_EMA26_ALPHA + serverEma.upE26 * (1 - FAST_EMA26_ALPHA);
             changed = true;
           } else if (assetId === liveState.tokenDown) {
             liveState.downPrice = price;
             if (liveState.downStartPrice == null) liveState.downStartPrice = price;
             recordFlowTick('down', price);
+            // Update Down price EMA
+            const priceCents = price * 100;
+            serverEma.downE12 = serverEma.downE12 == null ? priceCents : priceCents * FAST_EMA12_ALPHA + serverEma.downE12 * (1 - FAST_EMA12_ALPHA);
+            serverEma.downE26 = serverEma.downE26 == null ? priceCents : priceCents * FAST_EMA26_ALPHA + serverEma.downE26 * (1 - FAST_EMA26_ALPHA);
             changed = true;
           }
         }
       }
       if (changed) {
         lastWsPrice = Date.now();
-        broadcast({ type: 'prices', ...liveState });
+        broadcast({ type: 'prices', ...liveState, priceEma: { upE12: serverEma.upE12, upE26: serverEma.upE26, downE12: serverEma.downE12, downE26: serverEma.downE26 } });
       }
     } catch {}
   });
@@ -1565,10 +1590,13 @@ function connectBinanceStream() {
         const newPrice = parseFloat(msg.p);
         const changed = newPrice !== liveState.binanceBtc;
         liveState.binanceBtc = newPrice;
-        broadcast({ type: 'binance_btc', price: newPrice });
-        // Update server-side EMA on every BTC tick
+        // Update EMA BEFORE broadcasting so UI gets fresh values
         if (changed) {
           updateServerEma(newPrice);
+        }
+        const fGap = (serverEma.fE12 ?? 0) - (serverEma.fE26 ?? 0);
+        broadcast({ type: 'binance_btc', price: newPrice, ema: { e12: serverEma.fE12, e26: serverEma.fE26, gap: fGap, histogram: serverEma.fHistogram } });
+        if (changed) {
           checkEmaTrigger();
           checkEmaHedge();
         }
@@ -2287,6 +2315,8 @@ async function refreshEvent(clientBtcOpen) {
     liveState.binanceBtc = freshBtc; // update cached value too
     cachedOpenPrice = { slug: null, btc: null, up: null, down: null }; // invalidate cache for /api/event
     activeEvent = event;
+    resetServerEma();
+    seedServerEma(); // seed EMA from Binance history so it doesn't start cold
     broadcast({ type: 'event', event });
     // Save open price to database
     try {
@@ -3851,7 +3881,7 @@ app.post('/api/auto-flow', (req, res) => {
 app.get('/api/auto-ema', (req, res) => {
   res.json({
     ...autoEma,
-    ema: { e12: serverEma.e12, e26: serverEma.e26, gap: serverEma.gap, signal: serverEma.signal, histogram: serverEma.histogram, fHistogram: serverEma.fHistogram, crossBtcPrice: serverEma.crossBtcPrice, btcMoveSinceCross: serverEma.crossBtcPrice != null && liveState.binanceBtc ? Math.abs(liveState.binanceBtc - serverEma.crossBtcPrice) : 0 },
+    ema: { e12: serverEma.fE12, e26: serverEma.fE26, gap: (serverEma.fE12 ?? 0) - (serverEma.fE26 ?? 0), histogram: serverEma.fHistogram },
   });
 });
 
@@ -3862,7 +3892,7 @@ app.post('/api/auto-ema', (req, res) => {
   if (priceMin != null) autoEma.priceMin = Math.max(1, Math.min(99, parseInt(priceMin) || 25));
   if (priceMax != null) autoEma.priceMax = Math.max(1, Math.min(99, parseInt(priceMax) || 85));
   if (maxHedgeWaitMs != null) autoEma.maxHedgeWaitMs = Math.max(5000, Math.min(120000, parseInt(maxHedgeWaitMs) || 30000));
-  if (cooldownMs != null) autoEma.cooldownMs = Math.max(1000, Math.min(300000, parseInt(cooldownMs) || 60000));
+  if (cooldownMs != null) autoEma.cooldownMs = Math.max(0, Math.min(300000, parseInt(cooldownMs) ?? 0));
   if (enabled) {
     _autoEmaAbort();
     autoEma.enabled = true;
@@ -3940,7 +3970,7 @@ app.get('/api/ema-trades', async (req, res) => {
       });
     }
     // Auto-Scalp / Auto-Flow cycles (up + down placed together)
-    const pairScalp = (ups, downs, usedUps) => {
+    const pairScalp = (ups, downs, usedUps, source) => {
       for (const d of downs) {
         const u = ups.find((u, i) =>
           !usedUps.has(i) &&
@@ -3956,7 +3986,7 @@ app.get('/api/ema-trades', async (req, res) => {
         const shares = u.notes?.sizeShares ?? 5;
         cycles.push({
           id: d.id,
-          source: 'scalp',
+          source: source || 'scalp',
           eventSlug: `btc-updown-5m-${d.polymarket_event_id}`,
           polymarketEventId: d.polymarket_event_id,
           entryTime: u.purchase_time,
@@ -3971,7 +4001,7 @@ app.get('/api/ema-trades', async (req, res) => {
           histogram: null,
           e12: null,
           e26: null,
-          hedgeReason: 'scalp',
+          hedgeReason: source || 'scalp',
           profitCents,
           shares,
           btcAtEntry: u.btc_price_at_purchase ?? d.btc_price_at_purchase,
@@ -3980,8 +4010,8 @@ app.get('/api/ema-trades', async (req, res) => {
     };
     const usedScalpUps = new Set();
     const usedFlowUps = new Set();
-    pairScalp(scalpUps, scalpDowns, usedScalpUps);
-    pairScalp(flowUps, flowDowns, usedFlowUps);
+    pairScalp(scalpUps, scalpDowns, usedScalpUps, 'scalp');
+    pairScalp(flowUps, flowDowns, usedFlowUps, 'flow');
     // Sort by time desc, dedupe by id, limit
     cycles.sort((a, b) => new Date(b.entryTime || b.hedgeTime) - new Date(a.entryTime || a.hedgeTime));
     const seen = new Set();
