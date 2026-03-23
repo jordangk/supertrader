@@ -137,19 +137,814 @@ let autoScalp = {
   threshold: 5,        // $5 BTC move
   profitCents: 2,      // scalp with 2¢ profit
   shares: 5,           // shares per scalp
-  winningPriceMin: 45, // only trigger when winning side 45–85¢ (was 50–80)
-  winningPriceMax: 85,
-  cooldownSeconds: 15,  // (legacy, unused — scalp blocks until hedge fills)
+  winningPriceMin: 30, // only trigger when winning side 30–60¢
+  winningPriceMax: 60,
+  cooldownSeconds: 15,
   lastTriggerPrice: null,
-  lastTriggerTime: 0,   // timestamp of last trigger (or abort)
-  firing: false,
-  hedgeOrderId: null,
+  lastTriggerTime: 0,
+  busy: false,         // single global lock — 1 active trade at a time
+  upOrderId: null,
+  downOrderId: null,
+  unhedged: null,
+  // Keep sides for API compat but use global busy
+  sides: {
+    up:   { firing: false, inFlight: false, needsHedge: false, unhedged: null, hedgeOrderId: null, mainOrderId: null },
+    down: { firing: false, inFlight: false, needsHedge: false, unhedged: null, hedgeOrderId: null, mainOrderId: null },
+  },
   log: [],
-  inFlight: false,  // hard lock: exactly one scalp at a time
-  needsHedge: false, // true when holding unhedged shares — blocks all new scalps
-  unhedged: null,     // { side, shares, avgPrice, ts } — tracks the naked leg
 };
 let autoScalpLastDiagLog = 0;
+
+// ── Auto-flow: triggers on smooth directional price movement (low volatility trend) ──
+let autoFlow = {
+  enabled: false,
+  shares: 5,
+  windowSecs: 60,        // look at last 60s of ticks
+  monotonicity: 0.70,    // 70%+ of ticks flat or with-trend (smooth drift)
+  minMoveCents: 2,       // price must have moved at least 2¢ over the window
+  maxReversalPct: 0.30,  // max 30% of ticks can be against the trend
+  priceMin: 30,          // only when trending side is 30–60¢
+  priceMax: 60,
+  busy: false,           // single global lock — 1 active trade at a time
+  upOrderId: null,
+  downOrderId: null,
+  unhedged: null,
+  sides: {
+    up:   { firing: false, inFlight: false, needsHedge: false, unhedged: null, hedgeOrderId: null, mainOrderId: null },
+    down: { firing: false, inFlight: false, needsHedge: false, unhedged: null, hedgeOrderId: null, mainOrderId: null },
+  },
+  log: [],
+  lastTriggerTime: { up: 0, down: 0 },
+  cooldownMs: 30_000,
+};
+
+// ── Auto-Lost: on each new event, place GTC BUY@2¢ + GTC SELL@7¢ on chosen side ──
+let autoLost = {
+  enabled: false,
+  side: 'down',         // 'up' | 'down' | 'both'
+  shares: 10,
+  buyPrice: 0.02,
+  sellPrice: 0.07,
+  buyOrderIds: [],      // track placed buy order IDs
+  sellOrderIds: [],     // track placed sell order IDs
+  lastEventSlug: null,  // prevent duplicate fires on same event
+  log: [],              // recent results
+};
+
+async function fireAutoLost() {
+  if (!autoLost.enabled || !clobClient || !activeEvent) return;
+  if (autoLost.lastEventSlug === activeEvent.slug) return; // already fired for this event
+  autoLost.lastEventSlug = activeEvent.slug;
+
+  const sides = autoLost.side === 'both' ? ['up', 'down'] : [autoLost.side];
+  const tickSize = activeEvent.tickSize || '0.01';
+  const negRisk = activeEvent.negRisk || false;
+
+  for (const s of sides) {
+    const tokenId = s === 'up' ? liveState.tokenUp : liveState.tokenDown;
+    if (!tokenId) { console.log(`[AUTO-LOST] No token for ${s}`); continue; }
+
+    try {
+      console.log(`[AUTO-LOST] Placing GTC BUY ${s.toUpperCase()} ${autoLost.shares}sh @ ${(autoLost.buyPrice*100).toFixed(0)}¢ + GTC SELL @ ${(autoLost.sellPrice*100).toFixed(0)}¢`);
+      const buyOrder = await clobClient.createOrder({ tokenID: tokenId, price: autoLost.buyPrice, size: autoLost.shares, side: 'BUY' }, { tickSize, negRisk });
+      const sellOrder = await clobClient.createOrder({ tokenID: tokenId, price: autoLost.sellPrice, size: autoLost.shares, side: 'SELL' }, { tickSize, negRisk });
+      const results = await clobClient.postOrders([
+        { order: buyOrder, orderType: 'GTC' },
+        { order: sellOrder, orderType: 'GTC' },
+      ]);
+      const arr = Array.isArray(results) ? results : (results?.responses || [results] || []);
+      const buyId = arr[0]?.orderID ?? arr[0]?.order_id;
+      const sellId = arr[1]?.orderID ?? arr[1]?.order_id;
+      if (buyId) autoLost.buyOrderIds.push(buyId);
+      if (sellId) autoLost.sellOrderIds.push(sellId);
+      console.log(`[AUTO-LOST] ${s.toUpperCase()} orders placed — buy=${buyId?.slice(0,8)} sell=${sellId?.slice(0,8)}`);
+      autoLost.log.unshift({ time: Date.now(), side: s, event: activeEvent.slug, buyId, sellId });
+      if (autoLost.log.length > 20) autoLost.log.length = 20;
+      broadcast({ type: 'auto_lost', status: 'placed', side: s, buyId, sellId });
+    } catch (e) {
+      console.error(`[AUTO-LOST] Error placing ${s}:`, e?.message ?? e);
+      autoLost.log.unshift({ time: Date.now(), side: s, event: activeEvent.slug, error: e?.message });
+    }
+  }
+}
+
+// ── Auto-EMA: two-step scalp — buy winning side on EMA divergence, hedge on convergence ──
+let autoEma = {
+  enabled: false,
+  shares: 5,
+  gapOpenThreshold: 7,   // $7 EMA gap (tightened: only enter on strong divergence)
+  priceMin: 30,           // winning side 30-75¢ (tighter range)
+  priceMax: 75,
+  maxHedgeWaitMs: 30_000, // max 30s to wait for hedge signal
+  cooldownMs: 90_000,     // 90s between cycles (tighter: fewer trades, higher conviction)
+  busy: false,
+  phase: null,            // null | 'entered' | 'hedged'
+  entrySide: null,        // 'up' | 'down' — the winning/trending side
+  entryOrderId: null,
+  hedgeOrderId: null,
+  takeProfitOrderId: null,
+  entryPrice: null,
+  entryTime: null,
+  peakGap: 0,
+  btcAtEntry: null,       // BTC price when entry filled
+  btcPeak: null,          // highest BTC since entry (for UP trades) or lowest (for DOWN)
+  lastTriggerTime: 0,
+  lastHedgeTime: 0,       // must see gap cross zero after this before next entry (one per episode)
+  log: [],
+};
+
+// Server-side EMA state (computed from Binance BTC ticks)
+// Fast EMA sampled every 300ms for quicker trigger detection
+let serverEma = {
+  e12: null, e26: null, gap: 0,
+  signal: null, histogram: 0, prevHistogram: 0,
+  gapHistory: [], crossBtcPrice: null, crossTime: null,
+  lastCandleTs: 0, lastDelta: 0,
+  // Fast tick-level MACD for exit detection (only active when in trade)
+  fE12: null, fE26: null, fSignal: null, fHistogram: 0, fPrevHistogram: 0,
+};
+const EMA12_ALPHA = 2 / 13;  // MACD fast
+const EMA26_ALPHA = 2 / 27;  // MACD slow
+const EMA9_ALPHA = 2 / 10;   // MACD signal line
+const MACD_CANDLE_MS = 2000;  // 2-second candles for entry
+
+function updateServerEma(btcPrice) {
+  if (liveState.btcStart == null) return;
+  const now = Date.now();
+  const delta = btcPrice - liveState.btcStart;
+  serverEma.lastDelta = delta;
+
+  // Fast tick-level MACD (always updated, used for exit when in trade)
+  serverEma.fE12 = serverEma.fE12 == null ? delta : delta * EMA12_ALPHA + serverEma.fE12 * (1 - EMA12_ALPHA);
+  serverEma.fE26 = serverEma.fE26 == null ? delta : delta * EMA26_ALPHA + serverEma.fE26 * (1 - EMA26_ALPHA);
+  const fGap = serverEma.fE12 - serverEma.fE26;
+  const fSignalNew = serverEma.fSignal == null ? fGap : fGap * EMA9_ALPHA + serverEma.fSignal * (1 - EMA9_ALPHA);
+  serverEma.fPrevHistogram = serverEma.fHistogram;
+  serverEma.fHistogram = fGap - fSignalNew;
+  serverEma.fSignal = fSignalNew;
+
+  // Slow 2s candle MACD (used for entry trigger)
+  if (now - serverEma.lastCandleTs < MACD_CANDLE_MS) return;
+  serverEma.lastCandleTs = now;
+
+  serverEma.e12 = serverEma.e12 == null ? delta : delta * EMA12_ALPHA + serverEma.e12 * (1 - EMA12_ALPHA);
+  serverEma.e26 = serverEma.e26 == null ? delta : delta * EMA26_ALPHA + serverEma.e26 * (1 - EMA26_ALPHA);
+
+  const prevGap = serverEma.gap;
+  serverEma.gap = (serverEma.e12 != null && serverEma.e26 != null) ? serverEma.e12 - serverEma.e26 : 0;
+
+  serverEma.signal = serverEma.signal == null ? serverEma.gap : serverEma.gap * EMA9_ALPHA + serverEma.signal * (1 - EMA9_ALPHA);
+
+  serverEma.prevHistogram = serverEma.histogram;
+  serverEma.histogram = serverEma.gap - serverEma.signal;
+
+  if ((prevGap <= 0 && serverEma.gap > 0) || (prevGap >= 0 && serverEma.gap < 0)) {
+    serverEma.crossBtcPrice = btcPrice;
+    serverEma.crossTime = now;
+  }
+
+  serverEma.gapHistory.push({ t: now, gap: serverEma.gap, hist: serverEma.histogram });
+  if (serverEma.gapHistory.length > 600) serverEma.gapHistory.splice(0, serverEma.gapHistory.length - 600);
+}
+
+function resetServerEma() {
+  serverEma = { e12: null, e26: null, gap: 0, signal: null, histogram: 0, prevHistogram: 0, gapHistory: [], crossBtcPrice: null, crossTime: null, lastCandleTs: 0, lastDelta: 0, fE12: null, fE26: null, fSignal: null, fHistogram: 0, fPrevHistogram: 0 };
+}
+
+function _autoEmaAbort() {
+  // Cancel pending orders when aborting (user disabled or error)
+  // Don't cancel hedgeOrderId — if placed, let it fill to complete the pair
+  if (clobClient) {
+    if (autoEma.takeProfitOrderId) clobClient.cancelOrder({ orderID: autoEma.takeProfitOrderId }).catch(() => {});
+    if (autoEma.entryOrderId) clobClient.cancelOrder({ orderID: autoEma.entryOrderId }).catch(() => {});
+  }
+  // Cooldown starts from cycle completion (prevents rapid re-triggers)
+  autoEma.lastTriggerTime = Date.now();
+  autoEma.busy = false;
+  autoEma.phase = null;
+  autoEma.entrySide = null;
+  autoEma.entryOrderId = null;
+  autoEma.hedgeOrderId = null;
+  autoEma.takeProfitOrderId = null;
+  autoEma.entryPrice = null;
+  autoEma.entryTime = null;
+  autoEma.peakGap = 0;
+  autoEma.btcAtEntry = null;
+  autoEma.btcPeak = null;
+}
+
+// Step 1: Check if EMAs are diverging enough to enter winning side
+function checkEmaTrigger() {
+  if (!autoEma.enabled || autoEma.busy) return;
+  if (!activeEvent || !clobClient) return;
+  if (isNoTradeZone()) return;
+  const cooldown = autoEma.cooldownMs ?? 30_000;
+  if (Date.now() - autoEma.lastTriggerTime < cooldown) return;
+
+  // One trade per episode: gap must have crossed zero since last hedge (new trend)
+  if (autoEma.lastHedgeTime > 0 && serverEma.crossTime <= autoEma.lastHedgeTime) return;
+
+  const absGap = Math.abs(serverEma.gap);
+  if (absGap < autoEma.gapOpenThreshold) return;
+
+  // Determine trending side: positive gap = BTC going up = Up winning
+  const trendingSide = serverEma.gap > 0 ? 'up' : 'down';
+
+  // Momentum confirmation: don't buy against current price direction (EMA lags!)
+  // lastDelta = BTC price - start. Buy Up only if BTC above start; Down only if below
+  const lastDelta = serverEma.lastDelta ?? 0;
+  const deltaThreshold = 4; // $4 buffer (tightened: require clear price move)
+  if (trendingSide === 'up' && lastDelta < deltaThreshold) {
+    return; // Gap says Up but BTC is at/below start — lag, skip
+  }
+  if (trendingSide === 'down' && lastDelta > -deltaThreshold) {
+    return; // Gap says Down but BTC is at/above start — lag, skip
+  }
+
+  // Fast histogram must STRONGLY agree (tightened: must actively confirm direction)
+  const fHist = serverEma.fHistogram ?? 0;
+  const histConfirmMin = 0.5; // histogram must be clearly in our favor
+  if (trendingSide === 'up' && fHist < histConfirmMin) return;  // Need bullish histogram for Up
+  if (trendingSide === 'down' && fHist > -histConfirmMin) return; // Need bearish histogram for Down
+
+  // 2s-candle histogram must also agree (double confirmation)
+  const hist = serverEma.histogram ?? 0;
+  if (trendingSide === 'up' && hist < 0.3) return;   // Slow MACD must be bullish
+  if (trendingSide === 'down' && hist > -0.3) return; // Slow MACD must be bearish
+
+  // Gap persistence: must have been above threshold in same direction for 2+ consecutive 2s candles (~4s)
+  const recent = serverEma.gapHistory?.slice(-3) || [];
+  const allConfirm = recent.length >= 2 && recent.every(r => {
+    const rg = r.gap ?? 0;
+    return trendingSide === 'up' ? (rg >= autoEma.gapOpenThreshold) : (rg <= -autoEma.gapOpenThreshold);
+  });
+  if (!allConfirm) return; // Not persistent enough — avoid false breakouts
+
+  const winningPrice = trendingSide === 'up' ? liveState.upPrice : liveState.downPrice;
+  if (winningPrice == null) return;
+  const winCents = winningPrice * 100;
+  if (winCents < autoEma.priceMin || winCents > autoEma.priceMax) return;
+
+  const triggerReason = `gap≥$${autoEma.gapOpenThreshold} delta=$${lastDelta.toFixed(0)} fHist=${fHist.toFixed(1)}`;
+  console.log(`[AUTO-EMA] Trigger — ${trendingSide.toUpperCase()} trend, gap=$${Math.abs(serverEma.gap).toFixed(1)}, winning=${winCents.toFixed(0)}¢, reason=${triggerReason}`);
+  autoEma.busy = true;
+  autoEma.lastTriggerTime = Date.now();
+  autoEma.log = [{ ts: Date.now(), side: trendingSide, triggerGap: serverEma.gap, entryPrice: null, entryFillTime: null, hedgePrice: null, hedgeReason: null, hedgeTime: null, peakGap: 0, tpPrice: null, profit: null, result: 'pending' }, ...autoEma.log].slice(0, 20);
+  broadcast({ type: 'auto_ema', status: 'triggered', side: trendingSide, gap: serverEma.gap });
+  fireAutoEmaEntry(trendingSide);
+}
+
+// Step 1 execution: buy the winning side at market - 2¢
+async function fireAutoEmaEntry(side) {
+  if (!clobClient || !activeEvent) { _autoEmaAbort(); return; }
+  if (isNoTradeZone()) { _autoEmaAbort(); return; }
+
+  const tokenId = side === 'up' ? liveState.tokenUp : liveState.tokenDown;
+  if (!tokenId) { _autoEmaAbort(); return; }
+
+  const tickSize = activeEvent.tickSize || '0.01';
+  const tick = parseFloat(tickSize);
+  const negRisk = activeEvent.negRisk || false;
+  const sizeShares = 5; // always 5 shares
+
+  try {
+    const oppTokenId = side === 'up' ? liveState.tokenDown : liveState.tokenUp;
+    const [mkt, oppMkt] = await Promise.all([fetchClobBidAsk(tokenId), oppTokenId ? fetchClobBidAsk(oppTokenId) : Promise.resolve(null)]);
+    const marketPrice = mkt.bestAsk ?? (side === 'up' ? liveState.upPrice : liveState.downPrice);
+    if (!marketPrice || marketPrice <= 0) { _autoEmaAbort(); return; }
+
+    const buyPrice = Math.max(0.01, Math.min(Math.round((marketPrice + 0.01) / tick) * tick, 0.99));
+    const oppAsk = oppMkt?.bestAsk ?? (side === 'up' ? liveState.downPrice : liveState.upPrice);
+    const minProfitCents = 3; // tightened: only enter when ≥3¢ locked profit possible
+    if (oppAsk != null && oppAsk > 0) {
+      const totalCost = Math.round((buyPrice + oppAsk) * 100);
+      if (totalCost > 100 - minProfitCents) {
+        console.log(`[AUTO-EMA] Entry SKIP — spread too tight: entry ${(buyPrice*100).toFixed(0)}¢ + opp ${(oppAsk*100).toFixed(0)}¢ = ${totalCost}¢ (need <${100 - minProfitCents}¢ for ≥${minProfitCents}¢ profit)`);
+        _autoEmaAbort();
+        return;
+      }
+    }
+
+    console.log(`[AUTO-EMA] Entry: GTC BUY ${side.toUpperCase()} ${sizeShares}sh @ ${(buyPrice*100).toFixed(0)}¢ (mkt ${(marketPrice*100).toFixed(0)}¢, +1¢)`);
+    const order = await clobClient.createOrder({ tokenID: tokenId, price: buyPrice, size: sizeShares, side: 'BUY' }, { tickSize, negRisk });
+    const result = await clobClient.postOrders([{ order, orderType: 'GTC' }]);
+    const arr = Array.isArray(result) ? result : (result?.responses || [result] || []);
+    const ok = arr[0]?.success || arr[0]?.status === 'matched' || arr[0]?.status === 'live';
+    const orderId = arr[0]?.orderID ?? arr[0]?.order_id;
+
+    if (!ok) { console.log('[AUTO-EMA] Entry order failed'); _autoEmaAbort(); return; }
+
+    autoEma.phase = 'pending';  // not 'entered' yet — wait for fill
+    autoEma.entrySide = side;
+    autoEma.entryOrderId = orderId;
+    autoEma.entryPrice = buyPrice;
+    autoEma.entryTime = Date.now();
+    autoEma.peakGap = Math.abs(serverEma.gap);
+
+    broadcast({ type: 'auto_ema', status: 'pending', side, buyPrice, gap: serverEma.gap });
+    console.log(`[AUTO-EMA] Entry placed @ ${(buyPrice*100).toFixed(0)}¢ — checking fill in 3s`);
+
+    // Poll entry fill: check every 3s, retry at new price if not filled & trend continues
+    let currentOrderId = orderId;
+    let currentPrice = buyPrice;
+    const maxRetries = 5; // max 5 attempts (15s total)
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      await new Promise(r => setTimeout(r, 3000));
+      if (!autoEma.busy) return; // aborted externally
+
+      try {
+        const raw = await clobClient.getOpenOrders();
+        const list = Array.isArray(raw) ? raw : (raw?.data ?? raw?.orders ?? []);
+        const oid = o => o?.id ?? o?.order_id ?? o?.orderID ?? o?.orderId;
+        const stillOpen = list.some(o => oid(o) === currentOrderId);
+
+        if (!stillOpen) {
+          // Filled!
+          console.log(`[AUTO-EMA] Entry FILLED @ ${(currentPrice*100).toFixed(0)}¢ (attempt ${attempt + 1})`);
+          break;
+        }
+
+        // Not filled — check if trend is still going
+        const absGap = Math.abs(serverEma.gap);
+        const trendOk = absGap >= autoEma.gapOpenThreshold;
+        if (!trendOk) {
+          console.log(`[AUTO-EMA] Trend faded (gap=$${absGap.toFixed(1)}) — canceling entry`);
+          if (autoEma.log.length > 0) autoEma.log[0].result = 'trend_faded';
+          try { await clobClient.cancelOrder({ orderID: currentOrderId }); } catch (ce) { console.error('[AUTO-EMA] Cancel error:', ce.message); }
+          _autoEmaAbort();
+          return;
+        }
+
+        // Trend still going — cancel and re-place at new market - 2¢
+        console.log(`[AUTO-EMA] Entry not filled, retrying at new price (attempt ${attempt + 2})`);
+        try { await clobClient.cancelOrder({ orderID: currentOrderId }); } catch (ce) { console.error('[AUTO-EMA] Cancel error:', ce.message); }
+
+        const newMkt = await fetchClobBidAsk(tokenId);
+        const newMarket = newMkt.bestAsk ?? (side === 'up' ? liveState.upPrice : liveState.downPrice);
+        if (!newMarket || newMarket <= 0) { _autoEmaAbort(); return; }
+        const newPrice = Math.max(0.01, Math.min(Math.round((newMarket + 0.01) / tick) * tick, 0.99));
+
+        const newOrder = await clobClient.createOrder({ tokenID: tokenId, price: newPrice, size: sizeShares, side: 'BUY' }, { tickSize, negRisk });
+        const newResult = await clobClient.postOrders([{ order: newOrder, orderType: 'GTC' }]);
+        const newArr = Array.isArray(newResult) ? newResult : (newResult?.responses || [newResult] || []);
+        const newOk = newArr[0]?.success || newArr[0]?.status === 'matched' || newArr[0]?.status === 'live';
+        const newId = newArr[0]?.orderID ?? newArr[0]?.order_id;
+        if (!newOk) { console.log('[AUTO-EMA] Retry order failed'); _autoEmaAbort(); return; }
+
+        currentOrderId = newId;
+        currentPrice = newPrice;
+        autoEma.entryOrderId = newId;
+        autoEma.entryPrice = newPrice;
+        console.log(`[AUTO-EMA] Retry entry @ ${(newPrice*100).toFixed(0)}¢ (mkt ${(newMarket*100).toFixed(0)}¢)`);
+        broadcast({ type: 'auto_ema', status: 'retrying', side, buyPrice: newPrice, attempt: attempt + 2 });
+      } catch (e) {
+        console.error('[AUTO-EMA] Fill check error:', e.message);
+      }
+    }
+
+    // If we got here, either filled or max retries — check one more time
+    if (autoEma.busy) {
+      const raw = await clobClient.getOpenOrders();
+      const list = Array.isArray(raw) ? raw : (raw?.data ?? raw?.orders ?? []);
+      const oid = o => o?.id ?? o?.order_id ?? o?.orderID ?? o?.orderId;
+      const stillOpen = list.some(o => oid(o) === currentOrderId);
+      if (stillOpen) {
+        console.log('[AUTO-EMA] Max retries — canceling entry');
+        if (autoEma.log.length > 0) autoEma.log[0].result = 'max_retries';
+        try { await clobClient.cancelOrder({ orderID: currentOrderId }); } catch {}
+        _autoEmaAbort();
+        return;
+      }
+    }
+
+    if (!autoEma.busy) return; // aborted
+
+    // Entry confirmed filled — now enable hedge monitoring
+    autoEma.phase = 'entered';
+    autoEma.peakGap = Math.abs(serverEma.gap);
+    autoEma.btcAtEntry = liveState.binanceBtc;
+    autoEma.btcPeak = liveState.binanceBtc;
+
+    // DB insert
+    supabase.from('polymarket_trades').insert({
+      polymarket_event_id: eventDbId(), direction: side,
+      purchase_price: currentPrice, purchase_amount: Math.round(sizeShares * currentPrice * 100) / 100,
+      purchase_time: new Date().toISOString(), minute: Math.floor(Date.now() / 60000),
+      btc_price_at_purchase: liveState.btcCurrent, order_type: 'live',
+      order_status: 'open', polymarket_order_id: currentOrderId, shares: sizeShares,
+      notes: JSON.stringify({ type: 'auto-ema-entry', side, buyPrice: currentPrice, gap: serverEma.gap, eventSlug: liveState.eventSlug, histogram: serverEma.histogram, e12: serverEma.e12, e26: serverEma.e26 }),
+    }).then(({ error: dbErr }) => { if (dbErr) console.error('[AUTO-EMA] DB error:', dbErr); });
+
+    broadcast({ type: 'auto_ema', status: 'entered', side, buyPrice: currentPrice, gap: serverEma.gap });
+    // Update log with entry details
+    if (autoEma.log.length > 0) {
+      autoEma.log[0].entryPrice = currentPrice;
+      autoEma.log[0].entryFillTime = Date.now();
+      autoEma.log[0].result = 'entered';
+    }
+    console.log(`[AUTO-EMA] Entry confirmed @ ${(currentPrice*100).toFixed(0)}¢ — riding trend, stop loss at -5¢, exit on MACD cross`);
+  } catch (e) {
+    console.error('[AUTO-EMA] Entry error:', e?.message ?? e);
+    _autoEmaAbort();
+  }
+}
+
+// Check for stop loss (-5¢) and MACD exit
+function checkEmaHedge() {
+  if (!autoEma.enabled || !autoEma.busy || autoEma.phase !== 'entered') return;
+  if (!activeEvent || !clobClient) return;
+
+  const absGap = Math.abs(serverEma.gap);
+  autoEma.peakGap = Math.max(autoEma.peakGap, absGap);
+
+  // Stop loss: if entry side price dropped 5¢+ from entry, hedge immediately
+  const currentPrice = autoEma.entrySide === 'up' ? liveState.upPrice : liveState.downPrice;
+  if (currentPrice != null && autoEma.entryPrice != null) {
+    const unrealizedLoss = Math.round((autoEma.entryPrice - currentPrice) * 100);
+    if (unrealizedLoss >= 5) {
+      console.log(`[AUTO-EMA] STOP LOSS — ${autoEma.entrySide.toUpperCase()} dropped ${unrealizedLoss}¢ (entry ${(autoEma.entryPrice*100).toFixed(0)}¢ → ${(currentPrice*100).toFixed(0)}¢)`);
+      if (autoEma.log.length > 0) {
+        autoEma.log[0].hedgeReason = 'stop_loss';
+        autoEma.log[0].hedgeTime = Date.now();
+        autoEma.log[0].peakGap = autoEma.peakGap;
+      }
+      autoEma.phase = 'hedging';
+      broadcast({ type: 'auto_ema', status: 'stop_loss', side: autoEma.entrySide });
+      fireAutoEmaExit('stop_loss');
+      return;
+    }
+  }
+
+  // MACD histogram exit: use FAST tick-level histogram for quicker exit detection
+  const hist = serverEma.fHistogram;
+  const prevHist = serverEma.fPrevHistogram;
+  let reason = null;
+  const minCrossStrength = 0.3; // Ignore tiny wobbles — require |hist| ≥ this after cross
+
+  if (autoEma.entrySide === 'up' && prevHist >= 0 && hist < 0 && Math.abs(hist) >= minCrossStrength) {
+    reason = 'macd_cross';
+  } else if (autoEma.entrySide === 'down' && prevHist <= 0 && hist > 0 && Math.abs(hist) >= minCrossStrength) {
+    reason = 'macd_cross';
+  }
+
+  if (!reason) return;
+
+  console.log(`[AUTO-EMA] MACD exit (fast) — histogram ${prevHist.toFixed(2)} → ${hist.toFixed(2)}, gap=$${absGap.toFixed(1)}`);
+  if (autoEma.log.length > 0) {
+    autoEma.log[0].hedgeReason = reason;
+    autoEma.log[0].hedgeTime = Date.now();
+    autoEma.log[0].peakGap = autoEma.peakGap;
+  }
+  autoEma.phase = 'hedging';
+  broadcast({ type: 'auto_ema', status: 'hedging', reason, gap: serverEma.gap });
+  fireAutoEmaExit(reason);
+}
+
+// On reversal: always hedge opposite side at price targeting 2¢ profit
+async function fireAutoEmaExit(reason) {
+  if (!clobClient || !activeEvent) { _autoEmaAbort(); return; }
+
+  // Cancel take-profit sell if still open — we're closing instead
+  if (autoEma.takeProfitOrderId) {
+    try { await clobClient.cancelOrder({ orderID: autoEma.takeProfitOrderId }); } catch {}
+    autoEma.takeProfitOrderId = null;
+  }
+
+  const oppSide = autoEma.entrySide === 'up' ? 'down' : 'up';
+  const tokenId = oppSide === 'up' ? liveState.tokenUp : liveState.tokenDown;
+  if (!tokenId) { _autoEmaAbort(); return; }
+
+  const tickSize = activeEvent.tickSize || '0.01';
+  const tick = parseFloat(tickSize);
+  const negRisk = activeEvent.negRisk || false;
+  const sizeShares = 5;
+
+  try {
+    // Hedge: buy opposite side at market+1¢
+    const mkt = await fetchClobBidAsk(tokenId);
+    const marketPrice = mkt.bestAsk ?? (oppSide === 'up' ? liveState.upPrice : liveState.downPrice);
+    if (!marketPrice || marketPrice <= 0) { _autoEmaAbort(); return; }
+
+    const buyPrice = Math.max(0.01, Math.min(Math.round((marketPrice + 0.01) / tick) * tick, 0.99));
+    const totalCost = Math.round((autoEma.entryPrice + buyPrice) * 100);
+    const profitCents = 100 - totalCost;
+    const maxLossCents = 5; // At end of episode: allow hedge up to 5¢ loss to close cleanly
+
+    if (profitCents < -maxLossCents) {
+      console.log(`[AUTO-EMA] Hedge SKIP — would lock ${profitCents}¢ (max loss ${maxLossCents}¢): entry ${(autoEma.entryPrice*100).toFixed(0)}¢ + hedge ${(buyPrice*100).toFixed(0)}¢ = ${totalCost}¢. Aborting.`);
+      _autoEmaAbort();
+      return;
+    }
+
+    console.log(`[AUTO-EMA] Hedge: BUY ${oppSide.toUpperCase()} ${sizeShares}sh @ ${(buyPrice*100).toFixed(0)}¢ (entry ${(autoEma.entryPrice*100).toFixed(0)}¢ + ${(buyPrice*100).toFixed(0)}¢ = ${totalCost}¢, +${profitCents}¢, reason=${reason})`);
+
+    const order = await clobClient.createOrder({ tokenID: tokenId, price: buyPrice, size: sizeShares, side: 'BUY' }, { tickSize, negRisk });
+    const result = await clobClient.postOrders([{ order, orderType: 'GTC' }]);
+    const arr = Array.isArray(result) ? result : (result?.responses || [result] || []);
+    const ok = arr[0]?.success || arr[0]?.status === 'matched' || arr[0]?.status === 'live';
+    const orderId = arr[0]?.orderID ?? arr[0]?.order_id;
+
+    if (!ok) { console.log('[AUTO-EMA] Hedge order failed'); _autoEmaAbort(); return; }
+
+    if (autoEma.log.length > 0) {
+      autoEma.log[0].hedgePrice = buyPrice;
+      autoEma.log[0].profit = profitCents;
+      autoEma.log[0].result = `hedge ${profitCents >= 0 ? '+' : ''}${profitCents}¢`;
+    }
+
+    // DB insert
+    supabase.from('polymarket_trades').insert({
+      polymarket_event_id: eventDbId(), direction: oppSide,
+      purchase_price: buyPrice, purchase_amount: Math.round(sizeShares * buyPrice * 100) / 100,
+      purchase_time: new Date().toISOString(), minute: Math.floor(Date.now() / 60000),
+      btc_price_at_purchase: liveState.btcCurrent, order_type: 'live',
+      order_status: 'open', polymarket_order_id: orderId, shares: sizeShares,
+      notes: JSON.stringify({ type: 'auto-ema-hedge', side: oppSide, buyPrice, entryPrice: autoEma.entryPrice, entrySide: autoEma.entrySide, profitCents, reason, eventSlug: liveState.eventSlug, gap: serverEma.gap, peakGap: autoEma.peakGap, histogram: serverEma.histogram }),
+    }).then(({ error: dbErr }) => { if (dbErr) console.error('[AUTO-EMA] DB error:', dbErr); });
+
+    broadcast({ type: 'auto_ema', status: 'hedged', side: oppSide, buyPrice, profitCents });
+    autoEma.lastHedgeTime = Date.now(); // new episode required before next entry
+    _autoEmaAbort();
+
+  } catch (e) {
+    console.error('[AUTO-EMA] Hedge error:', e?.message ?? e);
+    _autoEmaAbort();
+  }
+}
+
+// Price tick history for flow detection
+const flowTicks = { up: [], down: [] }; // [{ t: ms, p: price }]
+const FLOW_TICK_MAX = 300; // keep last 300 ticks (~5 min at 1/s)
+
+function recordFlowTick(side, price) {
+  const arr = flowTicks[side];
+  arr.push({ t: Date.now(), p: price });
+  if (arr.length > FLOW_TICK_MAX) arr.splice(0, arr.length - FLOW_TICK_MAX);
+}
+
+function detectFlow(side) {
+  const arr = flowTicks[side];
+  const cutoff = Date.now() - autoFlow.windowSecs * 1000;
+  const recent = arr.filter(t => t.t >= cutoff);
+  if (recent.length < 10) return null; // need at least 10 ticks
+
+  // Net direction from first to last
+  const netMove = recent[recent.length - 1].p - recent[0].p;
+  if (netMove === 0) return null; // no movement at all
+  const goingUp = netMove > 0;
+  const moveCents = Math.abs(netMove) * 100;
+
+  // Count ALL ticks (including flat). Flat = holding the trend = good.
+  // "Against" = moved opposite to net direction
+  let withTrend = 0, againstTrend = 0;
+  const total = recent.length - 1;
+  for (let i = 1; i < recent.length; i++) {
+    const d = recent[i].p - recent[i - 1].p;
+    if (d === 0) {
+      withTrend++; // flat = price holding = flow
+    } else if ((goingUp && d > 0) || (!goingUp && d < 0)) {
+      withTrend++;
+    } else {
+      againstTrend++;
+    }
+  }
+  if (total < 5) return null;
+
+  // Monotonicity: % of ticks that are flat or with-trend
+  const mono = withTrend / total;
+
+  // Reversals: how many ticks went against the trend (fewer = smoother)
+  const reversals = againstTrend;
+
+  // Max drawback: largest single move against the trend
+  let maxReverse = 0;
+  for (let i = 1; i < recent.length; i++) {
+    const d = recent[i].p - recent[i - 1].p;
+    if ((goingUp && d < 0) || (!goingUp && d > 0)) {
+      maxReverse = Math.max(maxReverse, Math.abs(d));
+    }
+  }
+  const maxReverseCents = maxReverse * 100;
+
+  return { mono, moveCents, goingUp, ticks: recent.length, side, reversals, maxReverseCents };
+}
+
+function checkFlowTrigger() {
+  if (!autoFlow.enabled) return;
+  if (!activeEvent || !clobClient) return;
+
+  if (autoFlow.busy) return;
+
+  for (const side of ['up', 'down']) {
+    if (Date.now() - (autoFlow.lastTriggerTime[side] || 0) < autoFlow.cooldownMs) continue;
+
+    const f = detectFlow(side);
+    if (!f) continue;
+
+    // Check winning side is in range (30-60¢)
+    const winningPrice = Math.max(liveState.upPrice || 0, liveState.downPrice || 0);
+    const winCents = winningPrice * 100;
+    if (winCents < autoFlow.priceMin || winCents > autoFlow.priceMax) continue;
+
+    const ticks = flowTicks[side];
+    let last10trending = false;
+    if (ticks.length >= 10) {
+      const last10 = ticks.slice(-10);
+      const first5avg = last10.slice(0, 5).reduce((s, t) => s + t.p, 0) / 5;
+      const last5avg = last10.slice(-5).reduce((s, t) => s + t.p, 0) / 5;
+      last10trending = f.goingUp ? (last5avg >= first5avg) : (last5avg <= first5avg);
+    }
+
+    const maxRevAllowed = Math.max(3, Math.floor(f.ticks * (autoFlow.maxReversalPct ?? 0.20)));
+    const triggered = f.mono >= autoFlow.monotonicity
+      && f.moveCents >= autoFlow.minMoveCents
+      && f.reversals <= maxRevAllowed
+      && last10trending;
+
+    if (triggered) {
+      autoFlow.busy = true;
+      autoFlow.lastTriggerTime[side] = Date.now();
+      const logEntry = { ts: Date.now(), side, mono: f.mono.toFixed(2), move: f.moveCents.toFixed(1), reversals: f.reversals, maxRev: f.maxReverseCents.toFixed(1), ticks: f.ticks, buyPrice: null, oppBuyPrice: null };
+      autoFlow.log = [logEntry, ...autoFlow.log].slice(0, 20);
+      console.log(`[AUTO-FLOW] Triggered ${side.toUpperCase()} — mono=${(f.mono*100).toFixed(0)}% move=${f.moveCents.toFixed(1)}¢ reversals=${f.reversals} ticks=${f.ticks}`);
+      broadcast({ type: 'auto_flow', status: 'triggered', ...logEntry });
+      fireAutoFlow(side);
+      return; // only 1 at a time
+    }
+  }
+}
+
+// Returns true if we're in the no-trade zone (first 15s or last 45s of event)
+function isNoTradeZone() {
+  if (!activeEvent) return false;
+  const now = Date.now();
+  const start = activeEvent.startDate ? new Date(activeEvent.startDate).getTime() : null;
+  const end = activeEvent.endDate ? new Date(activeEvent.endDate).getTime() : null;
+  if (start && now - start < 15_000) return true;  // first 15 seconds
+  if (end && end - now < 45_000) return true;       // last 45 seconds
+  return false;
+}
+
+async function fireAutoFlow(side) {
+  if (!clobClient || !activeEvent) { _autoFlowAbort(); return; }
+  if (isNoTradeZone()) { console.log('[AUTO-FLOW] Skipping — no-trade zone (first 15s / last 45s)'); _autoFlowAbort(); return; }
+  const upTokenId = liveState.tokenUp;
+  const downTokenId = liveState.tokenDown;
+  if (!upTokenId || !downTokenId) { _autoFlowAbort(); return; }
+
+  const tickSize = activeEvent.tickSize || '0.01';
+  const tick = parseFloat(tickSize);
+  const negRisk = activeEvent.negRisk || false;
+  const sizeShares = autoFlow.shares;
+
+  try {
+    const [upMkt, downMkt] = await Promise.all([fetchClobBidAsk(upTokenId), fetchClobBidAsk(downTokenId)]);
+    const upMarket = upMkt.bestAsk ?? liveState.upPrice;
+    const downMarket = downMkt.bestAsk ?? liveState.downPrice;
+    if (!upMarket || upMarket <= 0 || !downMarket || downMarket <= 0) { _autoFlowAbort(); return; }
+
+    // Winning side (higher price) → -1¢, losing side (hammered) → -3¢
+    const upWinning = upMarket >= downMarket;
+    const upDiscount = upWinning ? 0.01 : 0.03;
+    const downDiscount = upWinning ? 0.03 : 0.01;
+    const upBuyPrice = Math.max(0.01, Math.min(Math.round((upMarket - upDiscount) / tick) * tick, 0.99));
+    const downBuyPrice = Math.max(0.01, Math.min(Math.round((downMarket - downDiscount) / tick) * tick, 0.99));
+    const totalCost = Math.round((upBuyPrice + downBuyPrice) * 100);
+    const profitCentsActual = 100 - totalCost;
+
+    if (profitCentsActual <= 0) { _autoFlowAbort(); return; }
+
+    console.log(`[AUTO-FLOW] GTC UP ${sizeShares}sh @ ${(upBuyPrice*100).toFixed(0)}¢ + GTC DN @ ${(downBuyPrice*100).toFixed(0)}¢ (mkt ${(upMarket*100).toFixed(0)}/${(downMarket*100).toFixed(0)}¢, +${profitCentsActual}¢)`);
+
+    const upOrder = await clobClient.createOrder({ tokenID: upTokenId, price: upBuyPrice, size: sizeShares, side: 'BUY' }, { tickSize, negRisk });
+    const downOrder = await clobClient.createOrder({ tokenID: downTokenId, price: downBuyPrice, size: sizeShares, side: 'BUY' }, { tickSize, negRisk });
+
+    const results = await clobClient.postOrders([
+      { order: upOrder, orderType: 'GTC' },
+      { order: downOrder, orderType: 'GTC' },
+    ]);
+    const arr = Array.isArray(results) ? results : (results?.responses || [results] || []);
+    const upResult = arr[0];
+    const downResult = arr[1];
+    const upOk = upResult?.success || upResult?.status === 'matched' || upResult?.status === 'live';
+    const downOk = downResult?.success || downResult?.status === 'live' || downResult?.status === 'matched';
+    let upId = upResult?.orderID ?? upResult?.order_id;
+    let downId = downResult?.orderID ?? downResult?.order_id;
+
+    if (!upOk && !downOk) { _autoFlowAbort(); return; }
+
+    autoFlow.upOrderId = upId;
+    autoFlow.downOrderId = downId;
+    autoFlow.unhedged = { shares: sizeShares, upBuyPrice, downBuyPrice, ts: Date.now() };
+    broadcast({ type: 'auto_flow', status: 'placed', upBuyPrice, downBuyPrice, sizeShares, profitCents: profitCentsActual });
+
+    if (upOk && upId) {
+      supabase.from('polymarket_trades').insert({
+        polymarket_event_id: eventDbId(), direction: 'up',
+        purchase_price: upBuyPrice, purchase_amount: Math.round(sizeShares * upBuyPrice * 100) / 100,
+        purchase_time: new Date().toISOString(), minute: Math.floor(Date.now() / 60000),
+        btc_price_at_purchase: liveState.btcCurrent, order_type: 'live',
+        order_status: 'open', polymarket_order_id: upId, shares: sizeShares,
+        notes: JSON.stringify({ type: 'auto-flow-up', upBuyPrice, sizeShares }),
+      }).then(({ error: dbErr }) => { if (dbErr) console.error('[AUTO-FLOW] DB error (up):', dbErr); });
+    }
+    if (downOk && downId) {
+      supabase.from('polymarket_trades').insert({
+        polymarket_event_id: eventDbId(), direction: 'down',
+        purchase_price: downBuyPrice, purchase_amount: Math.round(sizeShares * downBuyPrice * 100) / 100,
+        purchase_time: new Date().toISOString(), minute: Math.floor(Date.now() / 60000),
+        btc_price_at_purchase: liveState.btcCurrent, order_type: 'live',
+        order_status: 'open', polymarket_order_id: downId, shares: sizeShares,
+        notes: JSON.stringify({ type: 'auto-flow-down', downBuyPrice, sizeShares, profitCentsActual }),
+      }).then(({ error: dbErr }) => { if (dbErr) console.error('[AUTO-FLOW] DB error (down):', dbErr); });
+    }
+
+    // Update log entry with order prices
+    if (autoFlow.log.length > 0) {
+      autoFlow.log[0].buyPrice = upBuyPrice;
+      autoFlow.log[0].oppBuyPrice = downBuyPrice;
+      autoFlow.log[0].profit = profitCentsActual;
+    }
+    console.log(`[AUTO-FLOW] GTC UP @ ${(upBuyPrice*100).toFixed(0)}¢ + GTC DN @ ${(downBuyPrice*100).toFixed(0)}¢ → ${profitCentsActual}¢ profit when both fill`);
+
+    // Chase logic: after 4s, if one filled but other hasn't, cancel & re-place at market-1¢
+    let chased = false;
+    setTimeout(async () => {
+      if (chased) return;
+      try {
+        const raw = await clobClient.getOpenOrders();
+        const list = Array.isArray(raw) ? raw : (raw?.data ?? raw?.orders ?? []);
+        const oid = o => o?.id ?? o?.order_id ?? o?.orderID ?? o?.orderId;
+        const upStill = upId && list.some(o => oid(o) === upId);
+        const downStill = downId && list.some(o => oid(o) === downId);
+
+        if (!upStill && !downStill) return; // both filled already
+        if (upStill && downStill) return; // neither filled, keep waiting
+
+        chased = true;
+        const unfilledSide = upStill ? 'up' : 'down';
+        const unfilledId = upStill ? upId : downId;
+        const unfilledTokenId = upStill ? upTokenId : downTokenId;
+
+        console.log(`[AUTO-FLOW] Chase ${unfilledSide} — canceling and re-placing at market-1¢`);
+        try { await clobClient.cancelOrder({ orderID: unfilledId }); } catch (ce) { console.error('[AUTO-FLOW] Cancel error:', ce.message); }
+
+        const mkt = await fetchClobBidAsk(unfilledTokenId);
+        const marketPrice = mkt.bestAsk ?? (upStill ? liveState.upPrice : liveState.downPrice);
+        const chasePrice = Math.max(0.01, Math.min(Math.round((marketPrice - 0.01) / tick) * tick, 0.99));
+        const filledPrice = upStill ? downBuyPrice : upBuyPrice;
+        const chaseTotalCost = Math.round((filledPrice + chasePrice) * 100);
+        if (chaseTotalCost >= 100) {
+          console.log(`[AUTO-FLOW] Chase SKIP — would lock loss: ${chaseTotalCost}¢ total. Aborting.`);
+          _autoFlowAbort();
+          return;
+        }
+
+        console.log(`[AUTO-FLOW] Chase ${unfilledSide} @ ${(chasePrice*100).toFixed(0)}¢ (mkt ${(marketPrice*100).toFixed(0)}¢)`);
+        const chaseOrder = await clobClient.createOrder({ tokenID: unfilledTokenId, price: chasePrice, size: sizeShares, side: 'BUY' }, { tickSize, negRisk });
+        const chaseResult = await clobClient.postOrders([{ order: chaseOrder, orderType: 'GTC' }]);
+        const chaseArr = Array.isArray(chaseResult) ? chaseResult : (chaseResult?.responses || [chaseResult] || []);
+        const newId = chaseArr[0]?.orderID ?? chaseArr[0]?.order_id;
+
+        if (upStill) { upId = newId; autoFlow.upOrderId = newId; }
+        else { downId = newId; autoFlow.downOrderId = newId; }
+        broadcast({ type: 'auto_flow', status: 'chasing', side: unfilledSide, chasePrice });
+      } catch (e) {
+        console.error('[AUTO-FLOW] Chase error:', e.message);
+      }
+    }, 4000);
+
+    // Poll until BOTH fill
+    const pollBoth = setInterval(async () => {
+      try {
+        const raw = await clobClient.getOpenOrders();
+        const list = Array.isArray(raw) ? raw : (raw?.data ?? raw?.orders ?? []);
+        const oid = o => o?.id ?? o?.order_id ?? o?.orderID ?? o?.orderId;
+        const upStill = upId && (list || []).some(o => oid(o) === upId);
+        const downStill = downId && (list || []).some(o => oid(o) === downId);
+        if (!upStill && !downStill) {
+          console.log(`[AUTO-FLOW] Both filled — profit locked`);
+          broadcast({ type: 'auto_flow', status: 'filled', profit: chased ? '~1¢ (chased)' : profitCentsActual });
+          _autoFlowAbort(); // releases busy lock
+          clearInterval(pollBoth);
+        }
+      } catch (e) {
+        console.error('[AUTO-FLOW] Poll error:', e.message);
+      }
+    }, 3000);
+  } catch (e) {
+    console.error('[AUTO-FLOW] Error:', e?.message ?? e);
+    broadcast({ type: 'auto_flow', status: 'error', error: e?.message });
+    _autoFlowAbort();
+  }
+}
+
+function _autoFlowAbort() {
+  autoFlow.busy = false;
+  autoFlow.upOrderId = null;
+  autoFlow.downOrderId = null;
+  autoFlow.unhedged = null;
+}
 
 // ── Stop-loss state (persisted in memory + DB, survives frontend refresh & restart) ──
 let stopLossState = null; // { side: 'up'|'down', trigger: cents, shares: number }
@@ -443,7 +1238,8 @@ async function executeCopyOrder({ outcome, side, shares, slug }) {
   const tick = parseFloat(tickSize);
 
   if (side === 'buy') {
-    const buyPrice = Math.min(Number((Math.round((price + 0.04) / tick) * tick).toFixed(2)), 0.99);
+    // Use +1¢ (was +4¢) — overpaying caused significant losses when price reverted
+    const buyPrice = Math.min(Number((Math.round((price + 0.01) / tick) * tick).toFixed(2)), 0.99);
     // Use createMarketOrder — pass USDC amount directly (avoids 2dp mismatch)
     const sizeUsd = Number((shares * buyPrice).toFixed(2));
     if (sizeUsd < 1.0) { k9Copy.stats.skipped++; return; }
@@ -726,10 +1522,12 @@ function connectClobStream(tokenIds) {
           if (assetId === liveState.tokenUp) {
             liveState.upPrice = price;
             if (liveState.upStartPrice == null) liveState.upStartPrice = price;
+            recordFlowTick('up', price);
             changed = true;
           } else if (assetId === liveState.tokenDown) {
             liveState.downPrice = price;
             if (liveState.downStartPrice == null) liveState.downStartPrice = price;
+            recordFlowTick('down', price);
             changed = true;
           }
         }
@@ -768,42 +1566,60 @@ function connectBinanceStream() {
         const changed = newPrice !== liveState.binanceBtc;
         liveState.binanceBtc = newPrice;
         broadcast({ type: 'binance_btc', price: newPrice });
+        // Update server-side EMA on every BTC tick
+        if (changed) {
+          updateServerEma(newPrice);
+          checkEmaTrigger();
+          checkEmaHedge();
+        }
         // if (changed) pushSnapshot(); // paused
-        // Auto-scalp: check for $threshold BTC move in winning direction
-        const hasPendingHedge = !!autoScalp.hedgeOrderId;
-        const busy = autoScalp.firing || hasPendingHedge || autoScalp.inFlight || autoScalp.needsHedge;
-        if (changed && autoScalp.enabled && !busy && activeEvent && liveState.btcStart != null) {
+        // Auto-scalp: $threshold BTC move arms, then wait 500ms of stability to fire
+        if (changed && autoScalp.enabled && !autoScalp.busy && activeEvent && liveState.btcStart != null) {
           const ref = autoScalp.lastTriggerPrice ?? liveState.btcStart;
           const delta = newPrice - ref;
-          const upWinning = liveState.upPrice != null && liveState.downPrice != null && liveState.upPrice > liveState.downPrice;
-          let triggerSide = null;
-          const winningPrice = upWinning ? liveState.upPrice : liveState.downPrice;
           const thresh = autoScalp.threshold || 5;
           const absDelta = Math.abs(delta);
-          const dirOk = (upWinning && delta > 0) || (!upWinning && delta < 0);
-          // only scalp when winning side is 45-85¢ (configurable range)
-          const winMin = (autoScalp.winningPriceMin ?? 45) / 100;
-          const winMax = (autoScalp.winningPriceMax ?? 85) / 100;
+          const winningPrice = liveState.upPrice != null && liveState.downPrice != null
+            ? Math.max(liveState.upPrice, liveState.downPrice) : null;
+          const winMin = (autoScalp.winningPriceMin ?? 30) / 100;
+          const winMax = (autoScalp.winningPriceMax ?? 60) / 100;
           const inRange = winningPrice != null && winningPrice >= winMin && winningPrice <= winMax;
           if (!inRange) {
+            autoScalp._armed = false;
+            if (autoScalp._settleTimer) { clearTimeout(autoScalp._settleTimer); autoScalp._settleTimer = null; }
             if (Date.now() - autoScalpLastDiagLog > 60000) {
               autoScalpLastDiagLog = Date.now();
-              console.log(`[AUTO-SCALP] No trigger: winning side ${winningPrice != null ? (winningPrice * 100).toFixed(0) : '?'}¢ outside ${(winMin*100).toFixed(0)}–${(winMax*100).toFixed(0)}¢ | Up=${liveState.upPrice != null ? (liveState.upPrice * 100).toFixed(0) : '?'}¢ Dn=${liveState.downPrice != null ? (liveState.downPrice * 100).toFixed(0) : '?'}¢`);
+              console.log(`[AUTO-SCALP] No trigger: winning side ${winningPrice != null ? (winningPrice * 100).toFixed(0) : '?'}¢ outside ${(winMin*100).toFixed(0)}–${(winMax*100).toFixed(0)}¢`);
             }
-          } else if (!dirOk || absDelta < thresh) {
+          } else if (absDelta < thresh) {
+            autoScalp._armed = false;
+            if (autoScalp._settleTimer) { clearTimeout(autoScalp._settleTimer); autoScalp._settleTimer = null; }
             if (Date.now() - autoScalpLastDiagLog > 60000) {
               autoScalpLastDiagLog = Date.now();
-              console.log(`[AUTO-SCALP] No trigger: delta=$${delta.toFixed(1)} (need $${thresh}+ ${upWinning ? 'UP' : 'DOWN'}) | ref=$${ref?.toFixed(0)} btc=$${newPrice.toFixed(0)}`);
+              console.log(`[AUTO-SCALP] No trigger: delta=$${delta.toFixed(1)} (need $${thresh}+) | ref=$${ref?.toFixed(0)} btc=$${newPrice.toFixed(0)}`);
             }
           } else {
-            triggerSide = upWinning ? 'up' : 'down';
-            autoScalp.firing = true;
-            autoScalp.lastTriggerTime = Date.now();
-            const logEntry = { ts: Date.now(), side: triggerSide, btc: newPrice, delta: Math.round(delta) };
-            autoScalp.log = [logEntry, ...autoScalp.log].slice(0, 20);
-            console.log(`[AUTO-SCALP] Triggered ${triggerSide.toUpperCase()} — BTC $${delta >= 0 ? '+' : ''}${delta.toFixed(0)} from ref $${ref.toFixed(0)}`);
-            broadcast({ type: 'auto_scalp', status: 'triggered', side: triggerSide, delta: Math.round(delta), btc: newPrice });
-            fireAutoScalp(triggerSide);
+            // Threshold hit — arm and reset 500ms settle timer on every tick
+            if (!autoScalp._armed) {
+              autoScalp._armed = true;
+              console.log(`[AUTO-SCALP] ARMED — BTC $${delta >= 0 ? '+' : ''}${delta.toFixed(0)} from ref, waiting for settle...`);
+            }
+            autoScalp._armedDelta = delta;
+            if (autoScalp._settleTimer) clearTimeout(autoScalp._settleTimer);
+            autoScalp._settleTimer = setTimeout(() => {
+              autoScalp._settleTimer = null;
+              autoScalp._armed = false;
+              if (autoScalp.busy || !autoScalp.enabled) return;
+              autoScalp.busy = true; // LOCK immediately
+              const finalDelta = autoScalp._armedDelta;
+              const triggerSide = finalDelta > 0 ? 'up' : 'down';
+              autoScalp.lastTriggerTime = Date.now();
+              const logEntry = { ts: Date.now(), side: triggerSide, btc: liveState.binanceBtc, delta: Math.round(finalDelta) };
+              autoScalp.log = [logEntry, ...autoScalp.log].slice(0, 20);
+              console.log(`[AUTO-SCALP] SETTLED — firing. BTC $${finalDelta >= 0 ? '+' : ''}${finalDelta.toFixed(0)} from ref $${ref.toFixed(0)} (Up=${(liveState.upPrice*100).toFixed(0)}¢ Dn=${(liveState.downPrice*100).toFixed(0)}¢)`);
+              broadcast({ type: 'auto_scalp', status: 'triggered', side: triggerSide, delta: Math.round(finalDelta), btc: liveState.binanceBtc });
+              fireAutoScalp(triggerSide);
+            }, 500);
           }
         }
       }
@@ -818,20 +1634,15 @@ function connectBinanceStream() {
 }
 
 // ── Auto-scalp fire function ─────────────────────────────────────────────
-// 1. FAK buy winning side
-// 2. Confirm fill
-// 3. Wait 1.5s, check price is stable (no change)
-// 4. FAK buy opposite side at current price + 1¢ (aggressive sweep)
-function _autoScalpAbort({ boughtLeg = false } = {}) {
-  if (boughtLeg) {
-    // We hold unhedged shares — stay locked until hedge fills
-    autoScalp.needsHedge = true;
-    console.log('[AUTO-SCALP] LOCKED — holding unhedged shares, waiting for hedge opportunity');
-    return;
-  }
-  autoScalp.firing = false;
-  autoScalp.inFlight = false;
-  autoScalp.needsHedge = false;
+// 1. Fetch market (best ask) for winning side
+// 2. FAK buy at (ask - 1¢) to ensure fill (aggressive taker)
+// 3. GTC sell at (ask + 3¢) — lock in ≥2¢ profit when filled
+// 4. Send both via postOrders at the same time
+function _autoScalpAbort() {
+  autoScalp.busy = false;
+  autoScalp.upOrderId = null;
+  autoScalp.downOrderId = null;
+  autoScalp.unhedged = null;
   if (liveState.binanceBtc != null) {
     autoScalp.lastTriggerPrice = liveState.binanceBtc;
     autoScalp.lastTriggerTime = Date.now();
@@ -839,147 +1650,149 @@ function _autoScalpAbort({ boughtLeg = false } = {}) {
 }
 
 async function fireAutoScalp(side) {
-  if (autoScalp.inFlight) {
-    console.log('[AUTO-SCALP] BLOCKED: scalp already in progress');
-    return;
-  }
-  autoScalp.inFlight = true;
   if (!clobClient || !activeEvent) { _autoScalpAbort(); return; }
-  const currentPrice = side === 'up' ? liveState.upPrice : liveState.downPrice;
-  const tokenId = side === 'up' ? liveState.tokenUp : liveState.tokenDown;
-  const otherSide = side === 'up' ? 'down' : 'up';
-  const otherTokenId = side === 'up' ? liveState.tokenDown : liveState.tokenUp;
-  if (!currentPrice || !tokenId || !otherTokenId) {
-    console.error('[AUTO-SCALP] Missing price or token — skipping');
-    _autoScalpAbort();
-    return;
-  }
+  if (isNoTradeZone()) { console.log('[AUTO-SCALP] Skipping — no-trade zone (first 15s / last 45s)'); _autoScalpAbort(); return; }
+  const upTokenId = liveState.tokenUp;
+  const downTokenId = liveState.tokenDown;
+  if (!upTokenId || !downTokenId) { _autoScalpAbort(); return; }
   const tickSize = activeEvent.tickSize || '0.01';
   const tick = parseFloat(tickSize);
   const negRisk = activeEvent.negRisk || false;
   const sizeShares = autoScalp.shares;
 
-  const buyPrice = Math.max(0.01, Math.min(Math.round(Math.round(currentPrice * 100) / 100 / tick) * tick, 0.99));
-
   try {
-    // ── Step 1: FAK buy winning side ──
-    const minFakPrice = Math.ceil(100 / sizeShares) / 100;
-    const fakPrice = Math.max(minFakPrice, Math.min(Math.round((buyPrice + 0.02) / tick) * tick, 0.99));
-    console.log(`[AUTO-SCALP] Step 1: FAK ${sizeShares}sh ${side.toUpperCase()} @ ${fakPrice}`);
-    const buyOrder = await clobClient.createOrder({ tokenID: tokenId, price: fakPrice, size: sizeShares, side: 'BUY' }, { tickSize, negRisk });
-    const buyResult = await clobClient.postOrder(buyOrder, 'FAK');
-    if (!buyResult?.success && !buyResult?.orderID && !buyResult?.takingAmount) {
-      console.error('[AUTO-SCALP] FAK failed:', buyResult?.error || JSON.stringify(buyResult));
-      broadcast({ type: 'auto_scalp', status: 'error', error: 'FAK failed' });
-      _autoScalpAbort();
-      return;
-    }
-    const rawTaking = parseFloat(buyResult?.takingAmount ?? 0);
-    const rawMaking = parseFloat(buyResult?.makingAmount ?? 0);
-    const sizeMatched = parseFloat(buyResult?.size_matched ?? 0);
-    let filled, spent;
-    if (rawTaking > 0 && rawMaking > 0) {
-      if (rawTaking > sizeShares * 2 && rawMaking <= sizeShares * 2) {
-        filled = rawMaking; spent = rawTaking;
-      } else {
-        filled = rawTaking; spent = rawMaking;
-      }
-    } else {
-      filled = sizeMatched || sizeShares;
-      spent = filled * buyPrice;
-    }
-    const avgPrice = spent > 0 && filled > 0 ? spent / filled : buyPrice;
-    const gotShares = filled > 0 ? Math.round(Math.min(filled, sizeShares * 1.5) * 100) / 100 : sizeShares;
-    if (gotShares <= 0) {
-      console.error('[AUTO-SCALP] FAK got 0 shares — no hedge');
-      broadcast({ type: 'auto_scalp', status: 'error', error: '0 shares filled' });
-      _autoScalpAbort();
-      return;
-    }
-    console.log(`[AUTO-SCALP] Step 1 done: Got ${gotShares}sh ${side.toUpperCase()} @ ~${(avgPrice*100).toFixed(0)}¢`);
-    // From here on, we hold unhedged shares — all aborts must keep the lock
-    autoScalp.unhedged = { side, shares: gotShares, avgPrice, ts: Date.now() };
-    broadcast({ type: 'auto_scalp', status: 'bought', side, avgPrice, gotShares });
+    const [upMkt, downMkt] = await Promise.all([fetchClobBidAsk(upTokenId), fetchClobBidAsk(downTokenId)]);
+    const upMarket = upMkt.bestAsk ?? liveState.upPrice;
+    const downMarket = downMkt.bestAsk ?? liveState.downPrice;
+    if (!upMarket || upMarket <= 0 || !downMarket || downMarket <= 0) { _autoScalpAbort(); return; }
 
-    supabase.from('polymarket_trades').insert({
-      polymarket_event_id: eventDbId(), direction: side,
-      purchase_price: avgPrice, purchase_amount: Math.round(spent * 100) / 100,
-      purchase_time: new Date().toISOString(), minute: Math.floor(Date.now() / 60000),
-      btc_price_at_purchase: liveState.btcCurrent, order_type: 'live',
-      order_status: 'filled', polymarket_order_id: buyResult?.orderID || `auto-scalp-buy-${Date.now()}`,
-      shares: gotShares,
-      notes: JSON.stringify({ type: 'auto-scalp-buy', side, avgPrice, gotShares, spent }),
-    }).select().single().then(({ error: dbErr }) => { if (dbErr) console.error('[AUTO-SCALP] DB error (buy):', dbErr); });
+    // Winning side (higher price) → -1¢, losing side (hammered) → -3¢
+    const upWinning = upMarket >= downMarket;
+    const upDiscount = upWinning ? 0.01 : 0.03;
+    const downDiscount = upWinning ? 0.03 : 0.01;
+    const upBuyPrice = Math.max(0.01, Math.min(Math.round((upMarket - upDiscount) / tick) * tick, 0.99));
+    const downBuyPrice = Math.max(0.01, Math.min(Math.round((downMarket - downDiscount) / tick) * tick, 0.99));
+    const totalCost = Math.round((upBuyPrice + downBuyPrice) * 100);
+    const profitCentsActual = 100 - totalCost;
 
-    // ── Step 2: Immediately place hedge — always lock in profit ──
-    const hedgePrice = Math.max(0.01, Math.min(
-      Math.round(Math.round((1.0 - avgPrice - 0.01) * 100) / 100 / tick) * tick,
-      0.99
-    ));
-    if (hedgePrice <= 0.01) {
-      console.log(`[AUTO-SCALP] Hedge price too low (${(hedgePrice*100).toFixed(0)}¢) — LOCKED, holding unhedged`);
-      broadcast({ type: 'auto_scalp', status: 'locked_unhedged', reason: 'hedge price too low', side, gotShares });
-      _autoScalpAbort({ boughtLeg: true });
-      return;
-    }
-    const totalCost = avgPrice + hedgePrice;
-    const profitCents = Math.round((1.0 - totalCost) * 100);
-    console.log(`[AUTO-SCALP] Step 3: GTC ${gotShares}sh ${otherSide.toUpperCase()} @ ${(hedgePrice*100).toFixed(0)}¢ (${profitCents}¢ profit locked when filled)`);
-    const hedgeOrder = await clobClient.createOrder({ tokenID: otherTokenId, price: hedgePrice, size: gotShares, side: 'BUY' }, { tickSize, negRisk });
-    const hedgeResult = await clobClient.postOrder(hedgeOrder, 'GTC');
-    const hedgeId = hedgeResult?.orderID ?? hedgeResult?.order_id;
-    console.log(`[AUTO-SCALP] Hedge posted: id=${hedgeId}`);
-    // Only now reset the ref — failed/aborted scalps keep the old ref so they don't re-trigger
+    if (profitCentsActual <= 0) { _autoScalpAbort(); return; }
+
+    console.log(`[AUTO-SCALP] GTC UP ${sizeShares}sh @ ${(upBuyPrice*100).toFixed(0)}¢ + GTC DN @ ${(downBuyPrice*100).toFixed(0)}¢ (mkt ${(upMarket*100).toFixed(0)}/${(downMarket*100).toFixed(0)}¢, +${profitCentsActual}¢)`);
+    const upOrder = await clobClient.createOrder({ tokenID: upTokenId, price: upBuyPrice, size: sizeShares, side: 'BUY' }, { tickSize, negRisk });
+    const downOrder = await clobClient.createOrder({ tokenID: downTokenId, price: downBuyPrice, size: sizeShares, side: 'BUY' }, { tickSize, negRisk });
+
+    const results = await clobClient.postOrders([
+      { order: upOrder, orderType: 'GTC' },
+      { order: downOrder, orderType: 'GTC' },
+    ]);
+    const arr = Array.isArray(results) ? results : (results?.responses || [results] || []);
+    const upResult = arr[0];
+    const downResult = arr[1];
+    const upOk = upResult?.success || upResult?.status === 'matched' || upResult?.status === 'live';
+    const downOk = downResult?.success || downResult?.status === 'live' || downResult?.status === 'matched';
+    let upId = upResult?.orderID ?? upResult?.order_id;
+    let downId = downResult?.orderID ?? downResult?.order_id;
+
+    if (!upOk && !downOk) { _autoScalpAbort(); return; }
+
     autoScalp.lastTriggerPrice = liveState.binanceBtc;
+    autoScalp.upOrderId = upId;
+    autoScalp.downOrderId = downId;
+    autoScalp.unhedged = { shares: sizeShares, upBuyPrice, downBuyPrice, ts: Date.now() };
+    broadcast({ type: 'auto_scalp', status: 'placed', upBuyPrice, downBuyPrice, sizeShares, profitCents: profitCentsActual });
 
-    supabase.from('polymarket_trades').insert({
-      polymarket_event_id: eventDbId(), direction: otherSide,
-      purchase_price: hedgePrice, purchase_amount: Math.round(gotShares * hedgePrice * 100) / 100,
-      purchase_time: new Date().toISOString(), minute: Math.floor(Date.now() / 60000),
-      btc_price_at_purchase: liveState.btcCurrent, order_type: 'live',
-      order_status: 'open', polymarket_order_id: hedgeId || `auto-scalp-hedge-${Date.now()}`,
-      shares: gotShares,
-      notes: JSON.stringify({ type: 'auto-scalp-hedge', side: otherSide, hedgePrice, gotShares, method: 'gtc-1c-profit' }),
-    }).select().single().then(({ error: dbErr }) => { if (dbErr) console.error('[AUTO-SCALP] DB error (hedge):', dbErr); });
-
-    console.log(`[AUTO-SCALP] Hedge placed: ${side.toUpperCase()} @ ${(avgPrice*100).toFixed(0)}¢ + GTC ${otherSide.toUpperCase()} @ ${(hedgePrice*100).toFixed(0)}¢ = ${(totalCost*100).toFixed(0)}¢ → ${profitCents}¢ profit when filled`);
-    broadcast({ type: 'auto_scalp', status: 'placed', side, otherSide, buyPrice: avgPrice, hedgePrice, gotShares, profitCents });
-
-    // Track hedge order — block new scalps until filled or cancelled
-    if (hedgeId) {
-      autoScalp.hedgeOrderId = hedgeId;
-      console.log(`[AUTO-SCALP] Waiting for hedge ${hedgeId} to fill or be cancelled...`);
-      // Poll every 3s to check if hedge order is still open
-      const pollHedge = setInterval(async () => {
-        try {
-          const raw = await clobClient.getOpenOrders();
-          const list = Array.isArray(raw) ? raw : (raw?.data ?? raw?.orders ?? []);
-          const oid = o => o?.id ?? o?.order_id ?? o?.orderID ?? o?.orderId;
-          const still = (list || []).some(o => oid(o) === hedgeId);
-          if (!still) {
-            console.log(`[AUTO-SCALP] Hedge ${hedgeId} filled or cancelled — ready for next scalp`);
-            broadcast({ type: 'auto_scalp', status: 'hedge_done', hedgeId });
-            autoScalp.hedgeOrderId = null;
-            autoScalp.firing = false;
-            autoScalp.inFlight = false;
-            autoScalp.needsHedge = false;
-            autoScalp.unhedged = null;
-            clearInterval(pollHedge);
-          }
-        } catch (e) {
-          console.error('[AUTO-SCALP] Hedge poll error:', e.message);
-        }
-      }, 3000);
-    } else {
-      // Hedge posted but no ID — still holding unhedged shares
-      _autoScalpAbort({ boughtLeg: true });
+    if (upOk && upId) {
+      supabase.from('polymarket_trades').insert({
+        polymarket_event_id: eventDbId(), direction: 'up',
+        purchase_price: upBuyPrice, purchase_amount: Math.round(sizeShares * upBuyPrice * 100) / 100,
+        purchase_time: new Date().toISOString(), minute: Math.floor(Date.now() / 60000),
+        btc_price_at_purchase: liveState.btcCurrent, order_type: 'live',
+        order_status: 'open', polymarket_order_id: upId, shares: sizeShares,
+        notes: JSON.stringify({ type: 'auto-scalp-up', upBuyPrice, sizeShares }),
+      }).then(({ error: dbErr }) => { if (dbErr) console.error('[AUTO-SCALP] DB error (up):', dbErr); });
     }
+    if (downOk && downId) {
+      supabase.from('polymarket_trades').insert({
+        polymarket_event_id: eventDbId(), direction: 'down',
+        purchase_price: downBuyPrice, purchase_amount: Math.round(sizeShares * downBuyPrice * 100) / 100,
+        purchase_time: new Date().toISOString(), minute: Math.floor(Date.now() / 60000),
+        btc_price_at_purchase: liveState.btcCurrent, order_type: 'live',
+        order_status: 'open', polymarket_order_id: downId, shares: sizeShares,
+        notes: JSON.stringify({ type: 'auto-scalp-down', downBuyPrice, sizeShares, profitCentsActual }),
+      }).then(({ error: dbErr }) => { if (dbErr) console.error('[AUTO-SCALP] DB error (down):', dbErr); });
+    }
+
+    console.log(`[AUTO-SCALP] GTC UP @ ${(upBuyPrice*100).toFixed(0)}¢ + GTC DN @ ${(downBuyPrice*100).toFixed(0)}¢ → ${profitCentsActual}¢ profit when both fill`);
+
+    // Chase logic: after 4s, if one filled but other hasn't, cancel & re-place at market-1¢
+    let chased = false;
+    setTimeout(async () => {
+      if (chased) return;
+      try {
+        const raw = await clobClient.getOpenOrders();
+        const list = Array.isArray(raw) ? raw : (raw?.data ?? raw?.orders ?? []);
+        const oid = o => o?.id ?? o?.order_id ?? o?.orderID ?? o?.orderId;
+        const upStill = upId && list.some(o => oid(o) === upId);
+        const downStill = downId && list.some(o => oid(o) === downId);
+
+        if (!upStill && !downStill) return; // both filled already
+        if (upStill && downStill) return; // neither filled, keep waiting
+
+        chased = true;
+        const unfilledSide = upStill ? 'up' : 'down';
+        const unfilledId = upStill ? upId : downId;
+        const unfilledTokenId = upStill ? upTokenId : downTokenId;
+
+        console.log(`[AUTO-SCALP] Chase ${unfilledSide} — canceling and re-placing at market-1¢`);
+        try { await clobClient.cancelOrder({ orderID: unfilledId }); } catch (ce) { console.error('[AUTO-SCALP] Cancel error:', ce.message); }
+
+        const mkt = await fetchClobBidAsk(unfilledTokenId);
+        const marketPrice = mkt.bestAsk ?? (upStill ? liveState.upPrice : liveState.downPrice);
+        const chasePrice = Math.max(0.01, Math.min(Math.round((marketPrice - 0.01) / tick) * tick, 0.99));
+        const filledPrice = upStill ? downBuyPrice : upBuyPrice;
+        const chaseTotalCost = Math.round((filledPrice + chasePrice) * 100);
+        if (chaseTotalCost >= 100) {
+          console.log(`[AUTO-SCALP] Chase SKIP — would lock loss: ${chaseTotalCost}¢ total. Aborting.`);
+          _autoScalpAbort();
+          return;
+        }
+
+        console.log(`[AUTO-SCALP] Chase ${unfilledSide} @ ${(chasePrice*100).toFixed(0)}¢ (mkt ${(marketPrice*100).toFixed(0)}¢)`);
+        const chaseOrder = await clobClient.createOrder({ tokenID: unfilledTokenId, price: chasePrice, size: sizeShares, side: 'BUY' }, { tickSize, negRisk });
+        const chaseResult = await clobClient.postOrders([{ order: chaseOrder, orderType: 'GTC' }]);
+        const chaseArr = Array.isArray(chaseResult) ? chaseResult : (chaseResult?.responses || [chaseResult] || []);
+        const newId = chaseArr[0]?.orderID ?? chaseArr[0]?.order_id;
+
+        if (upStill) { upId = newId; autoScalp.upOrderId = newId; }
+        else { downId = newId; autoScalp.downOrderId = newId; }
+        broadcast({ type: 'auto_scalp', status: 'chasing', side: unfilledSide, chasePrice });
+      } catch (e) {
+        console.error('[AUTO-SCALP] Chase error:', e.message);
+      }
+    }, 4000);
+
+    // Poll until BOTH fill
+    const pollBoth = setInterval(async () => {
+      try {
+        const raw = await clobClient.getOpenOrders();
+        const list = Array.isArray(raw) ? raw : (raw?.data ?? raw?.orders ?? []);
+        const oid = o => o?.id ?? o?.order_id ?? o?.orderID ?? o?.orderId;
+        const upStill = upId && (list || []).some(o => oid(o) === upId);
+        const downStill = downId && (list || []).some(o => oid(o) === downId);
+        if (!upStill && !downStill) {
+          console.log(`[AUTO-SCALP] Both filled — profit locked`);
+          broadcast({ type: 'auto_scalp', status: 'filled', profit: chased ? '~1¢ (chased)' : profitCentsActual });
+          _autoScalpAbort(); // releases busy lock
+          clearInterval(pollBoth);
+        }
+      } catch (e) {
+        console.error('[AUTO-SCALP] Poll error:', e.message);
+      }
+    }, 3000);
   } catch (e) {
     console.error('[AUTO-SCALP] Error:', e?.message ?? e);
     broadcast({ type: 'auto_scalp', status: 'error', error: e?.message });
-    autoScalp.hedgeOrderId = null;
-    // If we already bought the first leg, stay locked
-    _autoScalpAbort({ boughtLeg: !!autoScalp.unhedged });
+    _autoScalpAbort();
   }
 }
 
@@ -1434,11 +2247,27 @@ async function refreshEvent(clientBtcOpen) {
       inMemoryShares = { up: 0, down: 0 };
     }
     console.log('[EVENT] new active event:', event.slug);
+    // Clear stop-loss on event change — shouldn't carry to new events
+    if (stopLossState) {
+      console.log('[SL] Clearing stop-loss on event change');
+      stopLossState = null;
+      stopLossFiring = false;
+      saveStopLossToDb(null);
+      broadcast({ type: 'stop_loss', armed: false });
+    }
+    // Reset auto-scalp/flow/ema busy locks on event change
+    _autoScalpAbort();
+    _autoFlowAbort();
+    _autoEmaAbort();
+    autoEma.lastHedgeTime = 0; // new event = fresh episode
+    resetServerEma();
     autoScalp.lastTriggerPrice = null; // reset reference on event change
     liveState.eventSlug = event.slug;
     liveState.eventTitle = event.title;
     liveState.tokenUp = event.tokenUp;
     liveState.tokenDown = event.tokenDown;
+    // Fire auto-lost orders for new event (delay so CLOB prices settle)
+    setTimeout(() => fireAutoLost(), 3000);
     liveState.upPrice = null;
     liveState.downPrice = null;
     liveState.upStartPrice = null;
@@ -1716,143 +2545,226 @@ app.post('/api/buy', async (req, res) => {
   })();
 });
 
-// ── Scalp: FAK buy one side → GTC hedge other side for profit ──────────────
-// Up+Down=$1, so buy Up@45¢ + buy Down@50¢ = 95¢ cost, $1 payout = 5¢ profit
-app.post('/api/scalp', async (req, res) => {
-  const { side, shares: reqShares, profitCents } = req.body;
-  const profit = parseInt(profitCents) || 2;
-
-  if (!activeEvent) return res.status(400).json({ error: 'No active event' });
-  if (!['up', 'down'].includes(side)) return res.status(400).json({ error: 'Invalid side' });
-  if (!clobClient) return res.status(500).json({ error: 'CLOB client not ready' });
-
-  const currentPrice = side === 'up' ? liveState.upPrice : liveState.downPrice;
-  const tokenId = side === 'up' ? liveState.tokenUp : liveState.tokenDown;
-  const otherSide = side === 'up' ? 'down' : 'up';
-  const otherTokenId = side === 'up' ? liveState.tokenDown : liveState.tokenUp;
-  if (!currentPrice) return res.status(400).json({ error: 'No price available' });
-  if (!tokenId || !otherTokenId) return res.status(400).json({ error: 'No token ID' });
-
-  const tickSize = activeEvent.tickSize || '0.01';
-  const tick = parseFloat(tickSize);
-  const negRisk = activeEvent.negRisk || false;
-  const sizeShares = Math.max(5, Math.round(parseFloat(reqShares) || 5));
-
-  const buyPrice = Math.max(0.01, Math.min(Math.round(Math.round(currentPrice * 100) / 100 / tick) * tick, 0.99));
-  const hedgePrice = Math.max(0.01, Math.min(
-    Math.round(Math.round((1.0 - currentPrice - profit / 100) * 100) / 100 / tick) * tick,
-    0.99
-  ));
-
-  if (buyPrice + hedgePrice >= 1.0) {
-    return res.status(400).json({ error: `No room for ${profit}¢ profit: ${(buyPrice*100).toFixed(0)}¢ + ${(hedgePrice*100).toFixed(0)}¢ ≥ 100¢` });
-  }
-
+// ── Scalp: GTC BUY clicked side @ market, GTC BUY opposite @ 100-market-profit ──
+// ── Lost strategy: buy cheap side at 2¢, sell at 7¢ ─────────────────────────
+app.get('/api/auto-lost', (req, res) => {
   res.json({
-    success: true,
-    buy: { price: buyPrice, shares: sizeShares, side },
-    hedge: { price: hedgePrice, shares: sizeShares, side: otherSide },
-    profitCents: profit,
-    status: 'sending',
+    enabled: autoLost.enabled,
+    side: autoLost.side,
+    shares: autoLost.shares,
+    buyPrice: autoLost.buyPrice,
+    sellPrice: autoLost.sellPrice,
+    lastEventSlug: autoLost.lastEventSlug,
+    log: autoLost.log.slice(0, 10),
   });
+});
 
-  // Fire-and-forget: FAK buy → read fill → GTC hedge with matching size
-  (async () => {
+app.post('/api/auto-lost', (req, res) => {
+  const { enabled, side, shares, buyPrice, sellPrice } = req.body || {};
+  if (typeof enabled === 'boolean') autoLost.enabled = enabled;
+  if (side && ['up', 'down', 'both'].includes(side)) autoLost.side = side;
+  if (shares) autoLost.shares = Math.max(1, Math.round(shares));
+  if (buyPrice) autoLost.buyPrice = Math.max(0.01, Math.min(parseFloat(buyPrice), 0.10));
+  if (sellPrice) autoLost.sellPrice = Math.max(0.02, Math.min(parseFloat(sellPrice), 0.20));
+  console.log(`[AUTO-LOST] ${autoLost.enabled ? 'ENABLED' : 'DISABLED'} — side=${autoLost.side} ${autoLost.shares}sh buy@${(autoLost.buyPrice*100).toFixed(0)}¢ sell@${(autoLost.sellPrice*100).toFixed(0)}¢`);
+  broadcast({ type: 'auto_lost', status: autoLost.enabled ? 'enabled' : 'disabled', side: autoLost.side });
+  res.json({ success: true, ...autoLost, log: autoLost.log.slice(0, 10) });
+});
+
+app.post('/api/lost-scalp', async (req, res) => {
+  try {
+    const { side } = req.body || {};
+    if (!activeEvent) return res.status(400).json({ error: 'No active event' });
+    if (!['up', 'down'].includes(side)) return res.status(400).json({ error: 'Invalid side' });
+    if (!clobClient) return res.status(500).json({ error: 'CLOB client not ready' });
+
+    const tokenId = side === 'up' ? liveState.tokenUp : liveState.tokenDown;
+    if (!tokenId) return res.status(400).json({ error: 'No token ID' });
+
+    const tickSize = activeEvent.tickSize || '0.01';
+    const negRisk = activeEvent.negRisk || false;
+    const shares = 10;
+    const buyPrice = 0.02;
+    const sellPrice = 0.07;
+
+    console.log(`[LOST] GTC BUY ${side.toUpperCase()} ${shares}sh @ 2¢ + GTC SELL @ 7¢`);
+
+    const buyOrder = await clobClient.createOrder({ tokenID: tokenId, price: buyPrice, size: shares, side: 'BUY' }, { tickSize, negRisk });
+    const sellOrder = await clobClient.createOrder({ tokenID: tokenId, price: sellPrice, size: shares, side: 'SELL' }, { tickSize, negRisk });
+
+    const results = await clobClient.postOrders([
+      { order: buyOrder, orderType: 'GTC' },
+      { order: sellOrder, orderType: 'GTC' },
+    ]);
+    const arr = Array.isArray(results) ? results : (results?.responses || [results] || []);
+
+    console.log(`[LOST] Orders placed — buy=${arr[0]?.orderID?.slice(0,8)} sell=${arr[1]?.orderID?.slice(0,8)}`);
+    res.json({ success: true, buy: arr[0], sell: arr[1] });
+  } catch (e) {
+    console.error('[LOST] Error:', e?.message ?? e);
+    res.status(500).json({ error: e?.message });
+  }
+});
+
+// Buy at X, auto-sell at X+3¢
+app.post('/api/buy-sell', async (req, res) => {
+  try {
+    const { side, price, shares: reqShares, profitCents: reqProfit } = req.body || {};
+    if (!activeEvent) return res.status(400).json({ error: 'No active event' });
+    if (!['up', 'down'].includes(side)) return res.status(400).json({ error: 'Invalid side' });
+    if (!clobClient) return res.status(500).json({ error: 'CLOB client not ready' });
+    if (!price || price <= 0 || price >= 1) return res.status(400).json({ error: 'Invalid price' });
+
+    const tokenId = side === 'up' ? liveState.tokenUp : liveState.tokenDown;
+    if (!tokenId) return res.status(400).json({ error: 'No token ID' });
+
+    const tickSize = activeEvent.tickSize || '0.01';
+    const tick = parseFloat(tickSize);
+    const negRisk = activeEvent.negRisk || false;
+    const sizeShares = Math.max(1, Math.round(parseFloat(reqShares) || 5));
+    const profit = parseFloat(reqProfit) || 3;
+    const buyPrice = Math.round(price / tick) * tick;
+    const sellPrice = Math.max(0.01, Math.min(Math.round((buyPrice + profit / 100) / tick) * tick, 0.99));
+
+    console.log(`[BUY-SELL] GTC BUY ${side.toUpperCase()} ${sizeShares}sh @ ${(buyPrice*100).toFixed(0)}¢ + GTC SELL @ ${(sellPrice*100).toFixed(0)}¢ (+${profit}¢)`);
+
+    const buyOrder = await clobClient.createOrder({ tokenID: tokenId, price: buyPrice, size: sizeShares, side: 'BUY' }, { tickSize, negRisk });
+    const sellOrder = await clobClient.createOrder({ tokenID: tokenId, price: sellPrice, size: sizeShares, side: 'SELL' }, { tickSize, negRisk });
+
+    const results = await clobClient.postOrders([
+      { order: buyOrder, orderType: 'GTC' },
+      { order: sellOrder, orderType: 'GTC' },
+    ]);
+    const arr = Array.isArray(results) ? results : (results?.responses || [results] || []);
+
+    console.log(`[BUY-SELL] Orders placed — buy=${arr[0]?.orderID?.slice(0,8)} sell=${arr[1]?.orderID?.slice(0,8)}`);
+    res.json({ success: true, buyPrice, sellPrice, profit, shares: sizeShares, buy: arr[0], sell: arr[1] });
+  } catch (e) {
+    console.error('[BUY-SELL] Error:', e?.message ?? e);
+    res.status(500).json({ error: e?.message });
+  }
+});
+
+// S↑ 1¢: Buy Up @ current, Buy Down @ (100 - upPrice - 1)¢ → 1¢ profit
+// S↓ 5¢: Buy Down @ current, Buy Up @ (100 - downPrice - 5)¢ → 5¢ profit
+app.post('/api/scalp', async (req, res) => {
+  if (isNoTradeZone()) return res.json({ ok: false, error: 'No-trade zone (first 15s / last 45s)' });
+  try {
+    const { side, shares: reqShares, profitCents } = req.body || {};
+    const profit = parseInt(profitCents) || 2;
+
+    if (!activeEvent) return res.status(400).json({ error: 'No active event' });
+    if (!['up', 'down'].includes(side)) return res.status(400).json({ error: 'Invalid side' });
+    if (!clobClient) return res.status(500).json({ error: 'CLOB client not ready' });
+
+    const mainTokenId = side === 'up' ? liveState.tokenUp : liveState.tokenDown;
+    const oppSide = side === 'up' ? 'down' : 'up';
+    const oppTokenId = side === 'up' ? liveState.tokenDown : liveState.tokenUp;
+    if (!mainTokenId || !oppTokenId) return res.status(400).json({ error: 'No token IDs' });
+
+    const tickSize = activeEvent.tickSize || '0.01';
+    const tick = parseFloat(tickSize);
+    const negRisk = activeEvent.negRisk || false;
+    const sizeShares = Math.max(5, Math.round(parseFloat(reqShares) || 5));
+
+    // Fetch current market for clicked side
+    const mainMkt = await fetchClobBidAsk(mainTokenId);
+    const mainMarket = mainMkt.bestAsk ?? (side === 'up' ? liveState.upPrice : liveState.downPrice);
+    if (!mainMarket || mainMarket <= 0) return res.status(400).json({ error: 'No market price' });
+
+    // Main side: GTC at market + 1¢ (ensures fill)
+    const mainBuyPrice = Math.max(0.01, Math.min(Math.round((mainMarket + 0.01) / tick) * tick, 0.99));
+    // Opposite side: GTC at 100 - mainPrice - profit (guarantees profitCents when both fill)
+    const oppBuyPrice = Math.max(0.01, Math.min(Math.round((1.00 - mainBuyPrice - profit / 100) / tick) * tick, 0.99));
+    const totalCost = Math.round((mainBuyPrice + oppBuyPrice) * 100);
+    const profitCentsActual = 100 - totalCost;
+
+    if (profitCentsActual <= 0) return res.status(400).json({ error: `No profit: ${(mainBuyPrice*100).toFixed(0)}+${(oppBuyPrice*100).toFixed(0)}=${totalCost}¢ ≥100¢` });
+
+    res.json({
+      success: true,
+      main: { price: mainBuyPrice, shares: sizeShares, side },
+      opp: { price: oppBuyPrice, shares: sizeShares, side: oppSide },
+      profitCents: profitCentsActual,
+      status: 'sending',
+    });
+
+    // Fire-and-forget: send both GTC limit orders
+    (async () => {
     try {
       const t0 = Date.now();
-      const minFakPrice = Math.ceil(100 / sizeShares) / 100;
-      const fakPrice = Math.max(minFakPrice, Math.min(Math.round((buyPrice + 0.02) / tick) * tick, 0.99));
-      console.log(`[SCALP] FAK ${sizeShares}sh @ ${fakPrice} ($${(sizeShares * fakPrice).toFixed(2)})`);
-      const buyOrder = await clobClient.createOrder({ tokenID: tokenId, price: fakPrice, size: sizeShares, side: 'BUY' }, { tickSize, negRisk });
-      const buyResult = await clobClient.postOrder(buyOrder, 'FAK');
-      console.log(`[SCALP] FAK done in ${Date.now() - t0}ms:`, JSON.stringify(buyResult));
+      console.log(`[SCALP] GTC BUY ${side.toUpperCase()} ${sizeShares}sh @ ${(mainBuyPrice*100).toFixed(0)}¢ + GTC BUY ${oppSide.toUpperCase()} @ ${(oppBuyPrice*100).toFixed(0)}¢ (mkt ${(mainMarket*100).toFixed(0)}¢, +${profitCentsActual}¢)`);
+      const mainOrder = await clobClient.createOrder({ tokenID: mainTokenId, price: mainBuyPrice, size: sizeShares, side: 'BUY' }, { tickSize, negRisk });
+      const oppOrder = await clobClient.createOrder({ tokenID: oppTokenId, price: oppBuyPrice, size: sizeShares, side: 'BUY' }, { tickSize, negRisk });
 
-      if (!buyResult?.success && !buyResult?.orderID && !buyResult?.takingAmount) {
-        console.error('[SCALP] FAK failed:', buyResult?.error || JSON.stringify(buyResult));
-        broadcast({ type: 'scalp', status: 'error', error: buyResult?.error || 'FAK failed' });
+      const results = await clobClient.postOrders([
+        { order: mainOrder, orderType: 'GTC' },
+        { order: oppOrder, orderType: 'GTC' },
+      ]);
+      const arr = Array.isArray(results) ? results : (results?.responses || [results] || []);
+      const mainResult = arr[0];
+      const oppResult = arr[1];
+
+      const mainOk = mainResult?.success || mainResult?.status === 'matched' || mainResult?.status === 'live';
+      const oppOk = oppResult?.success || oppResult?.status === 'live' || oppResult?.status === 'matched';
+      const mainId = mainResult?.orderID ?? mainResult?.order_id;
+      const oppId = oppResult?.orderID ?? oppResult?.order_id;
+
+      if (!mainOk && !oppOk) {
+        console.error('[SCALP] Both orders failed:', mainResult?.error, oppResult?.error);
+        broadcast({ type: 'scalp', status: 'error', error: 'Both orders failed' });
         return;
       }
 
-      const rawTaking = parseFloat(buyResult?.takingAmount ?? 0);
-      const rawMaking = parseFloat(buyResult?.makingAmount ?? 0);
-      const sizeMatched = parseFloat(buyResult?.size_matched ?? 0);
-      console.log(`[SCALP] FAK raw: takingAmount=${rawTaking}, makingAmount=${rawMaking}, size_matched=${sizeMatched}, requested=${sizeShares}`);
-      let filled, spent;
-      if (rawTaking > 0 && rawMaking > 0) {
-        if (rawTaking > sizeShares * 2 && rawMaking <= sizeShares * 2) {
-          filled = rawMaking; spent = rawTaking;
-          console.log(`[SCALP] Detected swapped taking/making — shares=${filled}, usdc=${spent}`);
-        } else {
-          filled = rawTaking; spent = rawMaking;
-        }
-      } else {
-        filled = sizeMatched || sizeShares;
-        spent = filled * buyPrice;
+      // Log to DB
+      if (mainOk && mainId) {
+        supabase.from('polymarket_trades').insert({
+          polymarket_event_id: eventDbId(), direction: side,
+          purchase_price: mainBuyPrice, purchase_amount: Math.round(sizeShares * mainBuyPrice * 100) / 100,
+          purchase_time: new Date().toISOString(), minute: Math.floor(Date.now() / 60000),
+          btc_price_at_purchase: liveState.btcCurrent, order_type: 'live',
+          order_status: 'open', polymarket_order_id: mainId, shares: sizeShares,
+          notes: JSON.stringify({ type: 'scalp-main', side, mainBuyPrice, sizeShares }),
+        }).then(({ error: dbErr }) => { if (dbErr) console.error('[SCALP] DB error (main):', dbErr); });
       }
-      const avgPrice = spent > 0 && filled > 0 ? spent / filled : buyPrice;
-      const gotShares = filled > 0 ? Math.round(Math.min(filled, sizeShares * 1.5) * 100) / 100 : sizeShares;
-      console.log(`[SCALP] Got ${gotShares} shares @ ~${(avgPrice*100).toFixed(0)}¢ (filled=${filled}, spent=${spent})`);
-
-      if (gotShares <= 0) {
-        console.error('[SCALP] FAK got 0 shares — no hedge');
-        broadcast({ type: 'scalp', status: 'error', error: 'FAK fill was 0 shares' });
-        return;
+      if (oppOk && oppId) {
+        supabase.from('polymarket_trades').insert({
+          polymarket_event_id: eventDbId(), direction: oppSide,
+          purchase_price: oppBuyPrice, purchase_amount: Math.round(sizeShares * oppBuyPrice * 100) / 100,
+          purchase_time: new Date().toISOString(), minute: Math.floor(Date.now() / 60000),
+          btc_price_at_purchase: liveState.btcCurrent, order_type: 'live',
+          order_status: 'open', polymarket_order_id: oppId, shares: sizeShares,
+          notes: JSON.stringify({ type: 'scalp-opp', oppSide, oppBuyPrice, sizeShares, profitCentsActual }),
+        }).then(({ error: dbErr }) => { if (dbErr) console.error('[SCALP] DB error (opp):', dbErr); });
       }
 
-      supabase.from('polymarket_trades').insert({
-        polymarket_event_id: eventDbId(), direction: side,
-        purchase_price: avgPrice, purchase_amount: Math.round(spent * 100) / 100,
-        purchase_time: new Date().toISOString(), minute: Math.floor(Date.now() / 60000),
-        btc_price_at_purchase: liveState.btcCurrent, order_type: 'live',
-        order_status: 'filled', polymarket_order_id: buyResult?.orderID || `scalp-buy-${Date.now()}`,
-        shares: gotShares,
-        notes: JSON.stringify({ type: 'scalp-buy', side, tokenId, avgPrice, gotShares, spent }),
-      }).select().single().then(({ error: dbErr }) => { if (dbErr) console.error('[SCALP] DB error (buy):', dbErr); });
+      broadcast({ type: 'scalp', status: 'placed', mainId, oppId, side, oppSide, mainBuyPrice, oppBuyPrice, sizeShares, profit: profitCentsActual });
+      console.log(`[SCALP] ${side.toUpperCase()} @ ${(mainBuyPrice*100).toFixed(0)}¢ + ${oppSide.toUpperCase()} @ ${(oppBuyPrice*100).toFixed(0)}¢ → ${profitCentsActual}¢ profit (${Date.now()-t0}ms)`);
 
-      const actualHedgePrice = Math.max(0.01, Math.min(
-        Math.round(Math.round((1.0 - avgPrice - profit / 100) * 100) / 100 / tick) * tick,
-        0.99
-      ));
-      console.log(`[SCALP] Hedge: ${gotShares}sh ${otherSide.toUpperCase()} @ ${actualHedgePrice}`);
-      const hedgeOrder = await clobClient.createOrder({ tokenID: otherTokenId, price: actualHedgePrice, size: gotShares, side: 'BUY' }, { tickSize, negRisk });
-      const hedgeResult = await clobClient.postOrder(hedgeOrder, 'GTC');
-      const hedgeId = hedgeResult?.orderID ?? hedgeResult?.order_id;
-      console.log(`[SCALP] Hedge posted in ${Date.now() - t0}ms — id: ${hedgeId}`);
-
-      supabase.from('polymarket_trades').insert({
-        polymarket_event_id: eventDbId(), direction: otherSide,
-        purchase_price: actualHedgePrice, purchase_amount: Math.round(gotShares * actualHedgePrice * 100) / 100,
-        purchase_time: new Date().toISOString(), minute: Math.floor(Date.now() / 60000),
-        btc_price_at_purchase: liveState.btcCurrent, order_type: 'live',
-        order_status: 'open', polymarket_order_id: hedgeId || `scalp-hedge-${Date.now()}`,
-        shares: gotShares,
-        notes: JSON.stringify({ type: 'scalp-hedge', side: otherSide, tokenId: otherTokenId, hedgePrice: actualHedgePrice, gotShares }),
-      }).select().single().then(({ error: dbErr }) => { if (dbErr) console.error('[SCALP] DB error (hedge):', dbErr); });
-
-      broadcast({ type: 'scalp', status: 'placed', hedgeId, buyPrice: avgPrice, hedgePrice: actualHedgePrice, gotShares, side, otherSide, profit });
-
-      // Monitor: cancel hedge if not filled within 4 min
-      if (hedgeId) {
-        for (let i = 0; i < 120; i++) {
-          await new Promise(r => setTimeout(r, 2000));
-          try {
-            const orders = await clobClient.getOpenOrders();
-            const list = Array.isArray(orders) ? orders : (orders?.data ?? orders?.orders ?? []);
-            if (!list.find(o => (o.id || o.order_id || o.orderID) === hedgeId)) {
-              console.log(`[SCALP] Hedge filled — ${profit}¢ profit locked`);
-              broadcast({ type: 'scalp', status: 'complete', profit });
-              return;
-            }
-          } catch {}
-        }
-        console.log(`[SCALP] Hedge timeout — cancelling`);
-        try { await clobClient.cancelOrder({ orderID: hedgeId }); } catch {}
-      }
+      // Poll until BOTH fill
+      const pollBoth = setInterval(async () => {
+        try {
+          const raw = await clobClient.getOpenOrders();
+          const list = Array.isArray(raw) ? raw : (raw?.data ?? raw?.orders ?? []);
+          const oid = o => o?.id ?? o?.order_id ?? o?.orderID ?? o?.orderId;
+          const mainStill = mainId && (list || []).some(o => oid(o) === mainId);
+          const oppStill = oppId && (list || []).some(o => oid(o) === oppId);
+          if (!mainStill && !oppStill) {
+            console.log(`[SCALP] Both orders filled — ${profitCentsActual}¢ profit locked`);
+            broadcast({ type: 'scalp', status: 'complete', profit: profitCentsActual });
+            clearInterval(pollBoth);
+          }
+        } catch (e) { console.error('[SCALP] Poll error:', e.message); }
+      }, 3000);
     } catch (e) {
       console.error('[SCALP] Error:', e.message);
       broadcast({ type: 'scalp', status: 'error', error: e.message });
     }
-  })();
+    })();
+  } catch (e) {
+    console.error('[SCALP] Route error:', e.message);
+    if (!res.headersSent) res.status(500).json({ error: e.message });
+  }
 });
 
 // ── Stop-loss config: arm / disarm / query ─────────────────────────────────
@@ -2653,6 +3565,116 @@ app.post('/api/super-sell', async (req, res) => {
   }
 });
 
+// ── Whale-style buy (limit at best BID - N¢ — opportunistic: rest behind bids, fill only on dips)
+app.post('/api/whale-style-buy', async (req, res) => {
+  const { side, shares: reqShares, discountCents } = req.body;
+  if (!activeEvent) return res.status(400).json({ error: 'No active event' });
+  if (!['up', 'down'].includes(side)) return res.status(400).json({ error: 'Invalid side' });
+  if (!clobClient) return res.status(500).json({ error: 'CLOB client not ready' });
+
+  const tokenId = side === 'up' ? liveState.tokenUp : liveState.tokenDown;
+  if (!tokenId) return res.status(400).json({ error: 'No token ID' });
+
+  const discount = Math.min(10, Math.max(1, parseInt(discountCents, 10) || 2)) / 100;
+  const shares = Math.max(5, Math.min(100, parseInt(reqShares, 10) || 5));
+
+  const { bestAsk, bestBid } = await fetchClobBidAsk(tokenId);
+  // Use best BID as anchor — place BELOW the front of the queue so we rest behind, fill only on dips
+  const anchor = bestBid != null && bestBid > 0 ? bestBid : bestAsk;
+  if (!anchor || anchor <= 0) return res.status(400).json({ error: 'Could not fetch best bid/ask' });
+
+  const tickSize = activeEvent.tickSize || '0.01';
+  const tick = parseFloat(tickSize);
+  const buyPrice = Math.max(0.01, Math.round((anchor - discount) / tick) * tick);
+
+  try {
+    console.log(`[WHALE-STYLE] ${side.toUpperCase()} BUY ${shares}@${buyPrice} (bid ${anchor ? (anchor*100).toFixed(0) : '?'}¢ - ${(discount*100).toFixed(0)}¢)`);
+    const negRisk = activeEvent.negRisk || false;
+    const buyOrder = await clobClient.createOrder({ tokenID: tokenId, price: buyPrice, size: shares, side: 'BUY' }, { tickSize, negRisk });
+    const buyResult = await clobClient.postOrder(buyOrder, 'GTC');
+    console.log('[WHALE-STYLE] Order posted:', buyResult?.orderID || buyResult);
+
+    const { error: dbErr } = await supabase.from('polymarket_trades').insert({
+      polymarket_event_id: eventDbId(), direction: side,
+      purchase_price: buyPrice, purchase_amount: shares * buyPrice,
+      purchase_time: new Date().toISOString(), btc_price_at_purchase: liveState.btcCurrent,
+      order_type: 'live', order_status: buyResult?.orderID ? 'open' : 'failed',
+      polymarket_order_id: buyResult?.orderID || `whale-style-${Date.now()}`,
+      shares, notes: JSON.stringify({ type: 'whale-style-buy', tokenId, bestBid: anchor, discount, orderType: 'GTC' }),
+    });
+    if (dbErr) console.error('[WHALE-STYLE] DB error:', dbErr);
+
+    broadcast({ type: 'order', status: 'placed', side, price: buyPrice, shares, orderID: buyResult?.orderID });
+    res.json({ success: true, buyPrice, bestBid: anchor, discount, shares, order: { orderID: buyResult?.orderID } });
+  } catch (e) {
+    console.error('[WHALE-STYLE] Error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// ── Whale flip: batch SELL Up + BUY Down in one request (same tx when matched)
+app.post('/api/whale-flip', async (req, res) => {
+  const { sellUp, buyDown } = req.body;
+  if (!activeEvent) return res.status(400).json({ error: 'No active event' });
+  if (!clobClient) return res.status(500).json({ error: 'CLOB client not ready' });
+
+  const sellShares = Math.max(5, Math.min(100, parseFloat(sellUp) || 5));
+  const buyShares = Math.max(5, Math.min(100, parseFloat(buyDown) || 5));
+
+  const tokenUp = liveState.tokenUp;
+  const tokenDown = liveState.tokenDown;
+  if (!tokenUp || !tokenDown) return res.status(400).json({ error: 'No token IDs' });
+
+  try {
+    const bal = await clobClient.getBalanceAllowance({ asset_type: 'CONDITIONAL', token_id: tokenUp });
+    const held = parseFloat(bal?.balance || '0') / 1e6;
+    if (held < sellShares) return res.status(400).json({ error: `Only ${held.toFixed(1)} Up, need ${sellShares}` });
+  } catch (e) {
+    console.warn('[WHALE-FLIP] Balance check failed:', e.message);
+  }
+
+  const tickSize = activeEvent.tickSize || '0.01';
+  const tick = parseFloat(tickSize);
+  const negRisk = activeEvent.negRisk || false;
+
+  try {
+    const [upBook, downBook] = await Promise.all([
+      fetchClobBidAsk(tokenUp),
+      fetchClobBidAsk(tokenDown),
+    ]);
+    const sellPrice = Math.max(0.01, Math.round(((upBook.bestBid || liveState.upPrice || 0.5) - 0.01) / tick) * tick);
+    const buyPrice = Math.min(0.99, Math.round(((downBook.bestAsk || liveState.downPrice || 0.5) + 0.01) / tick) * tick);
+
+    const sellOrder = await clobClient.createOrder(
+      { tokenID: tokenUp, price: sellPrice, size: sellShares, side: 'SELL' },
+      { tickSize, negRisk },
+    );
+    const buyOrder = await clobClient.createOrder(
+      { tokenID: tokenDown, price: buyPrice, size: buyShares, side: 'BUY' },
+      { tickSize, negRisk },
+    );
+
+    const results = await clobClient.postOrders([
+      { order: sellOrder, orderType: 'FAK' },
+      { order: buyOrder, orderType: 'FAK' },
+    ]);
+    const arr = Array.isArray(results) ? results : (results?.responses || [results] || []);
+
+    const sellOk = arr[0]?.success || arr[0]?.status === 'matched';
+    const buyOk = arr[1]?.success || arr[1]?.status === 'matched';
+    console.log(`[WHALE-FLIP] SELL ${sellShares} Up @ ${sellPrice} (${sellOk ? 'OK' : 'fail'}) | BUY ${buyShares} Down @ ${buyPrice} (${buyOk ? 'OK' : 'fail'})`);
+
+    res.json({
+      success: sellOk || buyOk,
+      sellUp: { shares: sellShares, price: sellPrice, ok: sellOk, result: arr[0] },
+      buyDown: { shares: buyShares, price: buyPrice, ok: buyOk, result: arr[1] },
+    });
+  } catch (e) {
+    console.error('[WHALE-FLIP] Error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 // ── Cancel order ─────────────────────────────────────────────────────────────
 app.post('/api/cancel', async (req, res) => {
   const { orderID } = req.body;
@@ -2761,8 +3783,7 @@ app.get('/api/auto-scalp', (req, res) => {
     winningPriceMax: autoScalp.winningPriceMax,
     cooldownSeconds: autoScalp.cooldownSeconds,
     lastTriggerPrice: autoScalp.lastTriggerPrice,
-    firing: autoScalp.firing,
-    hedgeOrderId: autoScalp.hedgeOrderId || null,
+    sides: autoScalp.sides,
     ref: autoScalp.lastTriggerPrice ?? liveState.btcStart,
     btc: liveState.binanceBtc,
     log: autoScalp.log,
@@ -2779,11 +3800,201 @@ app.post('/api/auto-scalp', (req, res) => {
   if (winningPriceMax != null) autoScalp.winningPriceMax = Math.max(1, Math.min(99, parseInt(winningPriceMax) || 85));
   if (cooldownSeconds != null) autoScalp.cooldownSeconds = Math.max(5, Math.min(120, parseInt(cooldownSeconds) || 15));
   if (enabled) {
-    // Use Binance price as ref; fallback to Polymarket btcStart if Binance not connected yet
     autoScalp.lastTriggerPrice = liveState.binanceBtc ?? liveState.btcStart;
+    autoScalp.busy = false;
+    autoScalp.upOrderId = null;
+    autoScalp.downOrderId = null;
+    autoScalp.unhedged = null;
+    autoScalp._armed = false;
+    if (autoScalp._settleTimer) { clearTimeout(autoScalp._settleTimer); autoScalp._settleTimer = null; }
   }
   console.log(`[AUTO-SCALP] ${autoScalp.enabled ? 'ON' : 'OFF'} — $${autoScalp.threshold} threshold, ${autoScalp.profitCents}¢ profit, ${autoScalp.shares}sh, ${autoScalp.cooldownSeconds}s cooldown, winning ${autoScalp.winningPriceMin}–${autoScalp.winningPriceMax}¢`);
   res.json({ success: true, ...autoScalp });
+});
+
+// ── Auto-flow API ────────────────────────────────────────────────────────────
+app.get('/api/auto-flow', (req, res) => {
+  // Include live flow scores for debugging
+  const upFlow = detectFlow('up');
+  const downFlow = detectFlow('down');
+  res.json({
+    ...autoFlow,
+    upFlow: upFlow ? { mono: upFlow.mono, moveCents: upFlow.moveCents, goingUp: upFlow.goingUp, ticks: upFlow.ticks, reversals: upFlow.reversals, maxReverseCents: upFlow.maxReverseCents } : null,
+    downFlow: downFlow ? { mono: downFlow.mono, moveCents: downFlow.moveCents, goingUp: downFlow.goingUp, ticks: downFlow.ticks, reversals: downFlow.reversals, maxReverseCents: downFlow.maxReverseCents } : null,
+  });
+});
+
+app.post('/api/auto-flow', (req, res) => {
+  const { enabled, shares, windowSecs, monotonicity, minMoveCents, maxTickStdDev, priceMin, priceMax, cooldownMs } = req.body;
+  if (typeof enabled === 'boolean') autoFlow.enabled = enabled;
+  if (shares != null) autoFlow.shares = Math.max(5, parseInt(shares) || 5);
+  if (windowSecs != null) autoFlow.windowSecs = Math.max(10, Math.min(300, parseInt(windowSecs) || 60));
+  if (monotonicity != null) autoFlow.monotonicity = Math.max(0.5, Math.min(1.0, parseFloat(monotonicity) || 0.75));
+  if (minMoveCents != null) autoFlow.minMoveCents = Math.max(1, Math.min(20, parseInt(minMoveCents) || 3));
+  const { maxReversalPct } = req.body;
+  if (maxReversalPct != null) autoFlow.maxReversalPct = Math.max(0.05, Math.min(0.50, parseFloat(maxReversalPct) || 0.20));
+  if (priceMin != null) autoFlow.priceMin = Math.max(1, Math.min(99, parseInt(priceMin) || 30));
+  if (priceMax != null) autoFlow.priceMax = Math.max(1, Math.min(99, parseInt(priceMax) || 70));
+  if (cooldownMs != null) autoFlow.cooldownMs = Math.max(10000, Math.min(300000, parseInt(cooldownMs) || 60000));
+  if (enabled) {
+    autoFlow.busy = false;
+    autoFlow.upOrderId = null;
+    autoFlow.downOrderId = null;
+    autoFlow.unhedged = null;
+    autoFlow.lastTriggerTime = { up: 0, down: 0 };
+  }
+  console.log(`[AUTO-FLOW] ${autoFlow.enabled ? 'ON' : 'OFF'} — window=${autoFlow.windowSecs}s mono≥${(autoFlow.monotonicity*100).toFixed(0)}% move≥${autoFlow.minMoveCents}¢ maxRev≤${(autoFlow.maxReversalPct*100).toFixed(0)}% price=${autoFlow.priceMin}-${autoFlow.priceMax}¢`);
+  res.json({ success: true, ...autoFlow });
+});
+
+// ── Auto-EMA endpoints ───────────────────────────────────────────────────────
+app.get('/api/auto-ema', (req, res) => {
+  res.json({
+    ...autoEma,
+    ema: { e12: serverEma.e12, e26: serverEma.e26, gap: serverEma.gap, signal: serverEma.signal, histogram: serverEma.histogram, fHistogram: serverEma.fHistogram, crossBtcPrice: serverEma.crossBtcPrice, btcMoveSinceCross: serverEma.crossBtcPrice != null && liveState.binanceBtc ? Math.abs(liveState.binanceBtc - serverEma.crossBtcPrice) : 0 },
+  });
+});
+
+app.post('/api/auto-ema', (req, res) => {
+  const { enabled, gapOpenThreshold, priceMin, priceMax, maxHedgeWaitMs, cooldownMs } = req.body;
+  if (typeof enabled === 'boolean') autoEma.enabled = enabled;
+  if (gapOpenThreshold != null) autoEma.gapOpenThreshold = Math.max(1, Math.min(50, parseFloat(gapOpenThreshold) || 5));
+  if (priceMin != null) autoEma.priceMin = Math.max(1, Math.min(99, parseInt(priceMin) || 25));
+  if (priceMax != null) autoEma.priceMax = Math.max(1, Math.min(99, parseInt(priceMax) || 85));
+  if (maxHedgeWaitMs != null) autoEma.maxHedgeWaitMs = Math.max(5000, Math.min(120000, parseInt(maxHedgeWaitMs) || 30000));
+  if (cooldownMs != null) autoEma.cooldownMs = Math.max(1000, Math.min(300000, parseInt(cooldownMs) || 60000));
+  if (enabled) {
+    _autoEmaAbort();
+    autoEma.enabled = true;
+  } else if (enabled === false) {
+    _autoEmaAbort(); // Stop all trading when disabled — cancel pending orders, clear busy
+  }
+  console.log(`[AUTO-EMA] ${autoEma.enabled ? 'ON' : 'OFF'} — gap≥$${autoEma.gapOpenThreshold} (open & close) price=${autoEma.priceMin}-${autoEma.priceMax}¢ hedgeWait=${autoEma.maxHedgeWaitMs/1000}s`);
+  res.json({ success: true, ...autoEma });
+});
+
+// ── Hedged trade log (Auto-EMA, Auto-Scalp, Auto-Flow — all profitable cycle records) ─
+app.get('/api/ema-trades', async (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit || '100', 10) || 100, 300);
+  try {
+    const { data: rows } = await supabase
+      .from('polymarket_trades')
+      .select('id, direction, purchase_price, purchase_amount, purchase_time, polymarket_event_id, btc_price_at_purchase, notes')
+      .eq('order_type', 'live')
+      .order('purchase_time', { ascending: false })
+      .limit(limit * 4);
+    const entries = [];
+    const hedges = [];
+    const scalpUps = [];
+    const scalpDowns = [];
+    const flowUps = [];
+    const flowDowns = [];
+    for (const r of rows || []) {
+      try {
+        const n = r.notes ? JSON.parse(r.notes) : {};
+        if (n.type === 'auto-ema-entry') entries.push({ ...r, notes: n });
+        else if (n.type === 'auto-ema-hedge') hedges.push({ ...r, notes: n });
+        else if (n.type === 'auto-scalp-up') scalpUps.push({ ...r, notes: n });
+        else if (n.type === 'auto-scalp-down') scalpDowns.push({ ...r, notes: n });
+        else if (n.type === 'auto-flow-up') flowUps.push({ ...r, notes: n });
+        else if (n.type === 'auto-flow-down') flowDowns.push({ ...r, notes: n });
+      } catch {}
+    }
+    const cycles = [];
+    // Auto-EMA cycles (entry + hedge)
+    for (const h of hedges) {
+      const n = h.notes;
+      const entrySide = n.entrySide || (n.side === 'up' ? 'down' : 'up');
+      const entry = entries.find(e =>
+        String(e.polymarket_event_id) === String(h.polymarket_event_id) &&
+        e.notes?.side === entrySide &&
+        new Date(e.purchase_time).getTime() < new Date(h.purchase_time).getTime()
+      );
+      const entryPrice = n.entryPrice ?? entry?.purchase_price;
+      const entryNotes = entry?.notes || {};
+      const upPrice = entrySide === 'up' ? entryPrice : n.buyPrice;
+      const downPrice = entrySide === 'down' ? entryPrice : n.buyPrice;
+      const totalCost = (parseFloat(upPrice) || 0) + (parseFloat(downPrice) || 0);
+      const profitCents = n.profitCents != null ? Math.round(n.profitCents) : Math.round((1 - totalCost) * 100);
+      cycles.push({
+        id: h.id,
+        source: 'ema',
+        eventSlug: n.eventSlug || `btc-updown-5m-${h.polymarket_event_id}`,
+        polymarketEventId: h.polymarket_event_id,
+        entryTime: entry?.purchase_time || h.purchase_time,
+        hedgeTime: h.purchase_time,
+        entrySide: entrySide,
+        entryPriceCents: Math.round((entryPrice || 0) * 100),
+        hedgePriceCents: Math.round((n.buyPrice || 0) * 100),
+        upPaidCents: Math.round((upPrice || 0) * 100),
+        downPaidCents: Math.round((downPrice || 0) * 100),
+        gap: n.gap != null ? parseFloat(n.gap).toFixed(1) : null,
+        peakGap: n.peakGap != null ? parseFloat(n.peakGap).toFixed(1) : null,
+        histogram: n.histogram != null ? parseFloat(n.histogram).toFixed(2) : null,
+        e12: entryNotes.e12 != null ? parseFloat(entryNotes.e12).toFixed(2) : null,
+        e26: entryNotes.e26 != null ? parseFloat(entryNotes.e26).toFixed(2) : null,
+        hedgeReason: n.reason || 'macd_cross',
+        profitCents,
+        shares: n.sizeShares || 5,
+        btcAtEntry: entry?.btc_price_at_purchase ?? h.btc_price_at_purchase,
+      });
+    }
+    // Auto-Scalp / Auto-Flow cycles (up + down placed together)
+    const pairScalp = (ups, downs, usedUps) => {
+      for (const d of downs) {
+        const u = ups.find((u, i) =>
+          !usedUps.has(i) &&
+          String(u.polymarket_event_id) === String(d.polymarket_event_id) &&
+          Math.abs(new Date(u.purchase_time) - new Date(d.purchase_time)) < 15000
+        );
+        if (!u) continue;
+        const uIdx = ups.indexOf(u);
+        usedUps.add(uIdx);
+        const upPrice = u.notes?.upBuyPrice ?? u.purchase_price;
+        const downPrice = d.notes?.downBuyPrice ?? d.purchase_price;
+        const profitCents = d.notes?.profitCentsActual ?? Math.round((1 - upPrice - downPrice) * 100);
+        const shares = u.notes?.sizeShares ?? 5;
+        cycles.push({
+          id: d.id,
+          source: 'scalp',
+          eventSlug: `btc-updown-5m-${d.polymarket_event_id}`,
+          polymarketEventId: d.polymarket_event_id,
+          entryTime: u.purchase_time,
+          hedgeTime: d.purchase_time,
+          entrySide: 'both',
+          entryPriceCents: Math.round((upPrice || 0) * 100),
+          hedgePriceCents: Math.round((downPrice || 0) * 100),
+          upPaidCents: Math.round((upPrice || 0) * 100),
+          downPaidCents: Math.round((downPrice || 0) * 100),
+          gap: null,
+          peakGap: null,
+          histogram: null,
+          e12: null,
+          e26: null,
+          hedgeReason: 'scalp',
+          profitCents,
+          shares,
+          btcAtEntry: u.btc_price_at_purchase ?? d.btc_price_at_purchase,
+        });
+      }
+    };
+    const usedScalpUps = new Set();
+    const usedFlowUps = new Set();
+    pairScalp(scalpUps, scalpDowns, usedScalpUps);
+    pairScalp(flowUps, flowDowns, usedFlowUps);
+    // Sort by time desc, dedupe by id, limit
+    cycles.sort((a, b) => new Date(b.entryTime || b.hedgeTime) - new Date(a.entryTime || a.hedgeTime));
+    const seen = new Set();
+    const deduped = cycles.filter(c => {
+      const key = `${c.source}-${c.polymarketEventId}-${c.hedgeTime}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    res.json({ cycles: deduped.slice(0, limit) });
+  } catch (e) {
+    res.json({ cycles: [], error: e.message });
+  }
 });
 
 // ── Cancel all open orders ───────────────────────────────────────────────────
@@ -2837,14 +4048,69 @@ app.get('/api/liquidity-rewards', async (req, res) => {
   }
 });
 
+// ── My trades from Polymarket (on-chain, source of truth for your wallet) ──
+// Note: Don't use market=conditionId - neg-risk Up/Down may use different condition IDs per outcome
+app.get('/api/my-trades', async (req, res) => {
+  const slug = req.query.slug;
+  const tokenUp = req.query.tokenUp || '';
+  const tokenDown = req.query.tokenDown || '';
+  const user = (process.env.PROXY_WALLET || process.env.FUNDER_ADDRESS || '').toLowerCase();
+  if (!user) return res.json({ trades: [], error: 'Wallet not configured' });
+  if (!slug) return res.json({ trades: [], error: 'Missing slug' });
+  try {
+    const url = `https://data-api.polymarket.com/trades?user=${user}&limit=500&takerOnly=false`;
+    const r = await fetch(url);
+    const poly = await r.json();
+    const slugLower = slug.toLowerCase();
+    const slugNum = slug.match(/(\d{10,})/)?.[1];
+    const trades = (poly || [])
+      .filter(t => {
+        const tSlug = ((t.eventSlug || t.slug || '') + '').toLowerCase();
+        return tSlug === slugLower || (slugNum && tSlug.includes(slugNum));
+      })
+      .map(t => {
+        const asset = t.asset || t.token_id || '';
+        let outcome = 'down';
+        if (tokenUp && asset === tokenUp) outcome = 'up';
+        else if (tokenDown && asset === tokenDown) outcome = 'down';
+        else {
+          const o = (t.outcome || '').trim();
+          const idx = t.outcomeIndex;
+          if (/up|yes/i.test(o)) outcome = 'up';
+          else if (/down|no/i.test(o)) outcome = 'down';
+          else if (typeof idx === 'number') outcome = idx === 0 ? 'up' : 'down';
+        }
+        return {
+          ts: t.timestamp ? t.timestamp * 1000 : 0,
+          side: (t.side || '').toLowerCase(),
+          outcome,
+          shares: parseFloat(t.size || 0),
+          price: parseFloat(t.price || 0),
+          usdc: parseFloat(t.size || 0) * parseFloat(t.price || 0),
+        };
+      });
+    res.json({ trades });
+  } catch (e) {
+    res.json({ trades: [], error: e.message });
+  }
+});
+
 // ── Recent orders ──────────────────────────────────────────────────────────
 app.get('/api/orders', async (req, res) => {
-  const { data, error } = await supabase
+  const slug = req.query.slug;
+  let q = supabase
     .from('polymarket_trades')
     .select('*')
     .in('order_type', ['supertrader', 'paper', 'live'])
     .order('created_at', { ascending: false })
-    .limit(50);
+    .limit(slug ? 200 : 50);
+  if (slug) {
+    const slugNum = (slug.match(/(\d{10,})/) || [])[1];
+    // polymarket_event_id can be slug string or numeric id
+    if (slugNum) q = q.or(`polymarket_event_id.eq.${slug},polymarket_event_id.eq.${slugNum}`);
+    else q = q.eq('polymarket_event_id', slug);
+  }
+  const { data, error } = await q;
   res.json({ orders: data || [], error });
 });
 
@@ -3248,8 +4514,8 @@ async function pushSnapshot() {
   });
 }
 
-// Capture a snapshot every 1s
-setInterval(() => { pushSnapshot(); }, 1000);
+// Capture a snapshot every 5s (was 1s — reduced to lower Supabase + Polymarket API load)
+setInterval(() => { pushSnapshot(); }, 5000);
 
 // Flush buffer to Supabase every 5s
 setInterval(async () => {
@@ -3261,7 +4527,7 @@ setInterval(async () => {
   } catch (e) {
     console.error('[SNAPSHOT] flush error:', e.message);
   }
-}, 1000);
+}, 5000);
 
 // ── Event archive (from price_change_analysis + live snapshots) ──────────────
 app.get('/api/event-archive', async (req, res) => {
@@ -4163,9 +5429,7 @@ let k9Pending      = {};   // txHash -> { detectedAt }
 let k9SeenTx       = new Set();
 const k9TxBuffer   = {};   // txHash -> [fills] — buffer to detect complete sets
 
-// Whale (0x8dxd) watcher state
-let whaleSeenTx       = new Set();
-const whaleTxBuffer   = {};
+// Whale watcher DISABLED to save resources
 
 // Seed k9SeenTx from Supabase so we don't re-insert after restart
 async function seedK9SeenTx() {
@@ -4380,12 +5644,13 @@ function decodeOrderFilledLog(log, wallet = K9_WALLET, seenSet = k9SeenTx) {
   if (!info) return null;
 
   const logIdx = log.logIndex || '0';
+  const blockNum = log.blockNumber ? parseInt(log.blockNumber, 16) : null;
   const dedup = `${txHash}:${logIdx}`;
   if (seenSet.has(dedup)) return null;
   seenSet.add(dedup);
   if (seenSet.size > 10000) seenSet = new Set([...seenSet].slice(-5000));
 
-  return { txHash, logIndex: logIdx, slug: info.slug, outcome: info.outcome, side,
+  return { txHash, logIndex: logIdx, blockNumber: blockNum, slug: info.slug, outcome: info.outcome, side,
            price, shares, usdcSize, coin: info.coin,
            tf: info.tf, timeframe: info.timeframe, ts: Math.floor(Date.now() / 1000) };
 }
@@ -4417,7 +5682,8 @@ function decodeRebateTransfer(log, wallet = K9_WALLET, seenSet = k9SeenTx) {
   if (seenSet.has(dedup)) return null;
   seenSet.add(dedup);
 
-  return { txHash, logIndex: logIdx, slug: info.slug, outcome: info.outcome, side: 'buy',
+  const blockNum = log.blockNumber ? parseInt(log.blockNumber, 16) : null;
+  return { txHash, logIndex: logIdx, blockNumber: blockNum, slug: info.slug, outcome: info.outcome, side: 'buy',
            price: 0, shares: amount, usdcSize: 0, coin: info.coin,
            tf: info.tf, timeframe: info.timeframe, ts: Math.floor(Date.now() / 1000),
            isRebate: true };
@@ -4594,6 +5860,24 @@ async function k9HttpPoll() {
 // WHALE WATCHER (0x8dxd) — 15m events only
 // ══════════════════════════════════════════════════════════════════════════
 
+async function fetchBlockTimestamp(blockNumber) {
+  if (!blockNumber) return null;
+  try {
+    const r = await fetch(ALCHEMY_HTTP, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 1, method: 'eth_getBlockByNumber',
+        params: ['0x' + blockNumber.toString(16), false],
+      }),
+    });
+    const d = await r.json();
+    const ts = d?.result?.timestamp;
+    return ts ? parseInt(ts, 16) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 async function seedWhaleSeenTx() {
   try {
     const { data } = await supabase.from('k9_observed_trades')
@@ -4611,22 +5895,90 @@ async function seedWhaleSeenTx() {
   }
 }
 
+async function fetchClobBidAsk(tokenId) {
+  try {
+    const [buyRes, sellRes] = await Promise.all([
+      fetch(`https://clob.polymarket.com/price?token_id=${tokenId}&side=buy`).then(r => r.json()).catch(() => null),
+      fetch(`https://clob.polymarket.com/price?token_id=${tokenId}&side=sell`).then(r => r.json()).catch(() => null),
+    ]);
+    const bestAsk = buyRes?.price ? parseFloat(buyRes.price) : null;   // price to buy = best ask
+    const bestBid = sellRes?.price ? parseFloat(sellRes.price) : null; // price to sell = best bid
+    return { bestAsk, bestBid };
+  } catch (e) {
+    return { bestAsk: null, bestBid: null };
+  }
+}
+
 async function saveWhaleTrades(trades) {
   if (!trades || !trades.length) return;
   // Only save 15m trades
   const filtered = trades.filter(t => t.slug && t.slug.includes('-15m-'));
   if (!filtered.length) return;
 
+  // Use actual block timestamp instead of Date.now() (when we received the log)
+  const blockNums = [...new Set(filtered.map(t => t.blockNumber).filter(Boolean))];
+  const blockTs = {};
+  for (const bn of blockNums) {
+    const ts = await fetchBlockTimestamp(bn);
+    if (ts) blockTs[bn] = ts;
+  }
+  for (const t of filtered) {
+    if (t.blockNumber && blockTs[t.blockNumber]) t.ts = blockTs[t.blockNumber];
+  }
+  // Sort by logIndex within same tx so fill order is preserved
+  filtered.sort((a, b) => {
+    if (a.txHash !== b.txHash) return 0;
+    return (parseInt(a.logIndex, 16) || 0) - (parseInt(b.logIndex, 16) || 0);
+  });
+
+  // Fetch true market (best ask/bid) — NOT liveState which can be last_trade (= whale's fill price)
+  // Whale uses limit orders a few cents below market; last_trade would show his price as "mkt"
+  let upAsk = null, upBid = null, downAsk = null, downBid = null;
+  const slug = liveState.eventSlug || activeEvent?.slug || '';
+  const matchesActive = slug && filtered.some(t => t.slug === slug);
+  if (matchesActive && liveState.tokenUp && liveState.tokenDown) {
+    const [up, down] = await Promise.all([
+      fetchClobBidAsk(liveState.tokenUp),
+      fetchClobBidAsk(liveState.tokenDown),
+    ]);
+    upAsk = up.bestAsk; upBid = up.bestBid;
+    downAsk = down.bestAsk; downBid = down.bestBid;
+  }
+  // Fallback to liveState if fetch failed or different event
+  if (upAsk == null) upAsk = liveState.upPrice;
+  if (downAsk == null) downAsk = liveState.downPrice;
+  if (upBid == null) upBid = liveState.upPrice;
+  if (downBid == null) downBid = liveState.downPrice;
+
+  const enriched = filtered.map(t => {
+    const isUp = /up/i.test(t.outcome);
+    // For BUY: market = best ask (what you'd pay). For SELL: market = best bid (what you'd get).
+    const mktUp = t.side === 'buy' ? upAsk : upBid;
+    const mktDown = t.side === 'buy' ? downAsk : downBid;
+    return {
+      ...t,
+      marketUp: mktUp,
+      marketDown: mktDown,
+      blockNumber: t.blockNumber,
+      logIndex: t.logIndex,
+    };
+  });
+
+  // For DB persist: best ask (typical whale buy-below-ask scenario)
+  const marketUp = upAsk ?? liveState.upPrice;
+  const marketDown = downAsk ?? liveState.downPrice;
   const obsRows = filtered.map(t => ({
     slug: t.slug, outcome: t.outcome, price: t.price,
     shares: t.side === 'sell' ? -t.shares : t.shares,
     usdc_size: t.side === 'sell' ? -t.usdcSize : t.usdcSize,
     tx_hash: t.txHash, trade_timestamp: t.ts,
+    market_up: marketUp != null ? marketUp : null,
+    market_down: marketDown != null ? marketDown : null,
   }));
   const { error: e1 } = await supabase.from('k9_observed_trades').insert(obsRows);
   if (e1) console.error('[whale-watcher] insert error:', e1.message);
 
-  broadcast({ type: 'whale_trades', trades: filtered });
+  broadcast({ type: 'whale_trades', trades: enriched });
   console.log(`[whale-watcher] ${filtered.map(t => `${t.side.toUpperCase()} ${t.outcome} ${t.slug} @${t.price} $${t.usdcSize.toFixed(2)}`).join(' | ')}`);
 }
 
@@ -4777,15 +6129,30 @@ async function whaleHttpPoll() {
   }
 }
 
-// Whale trades API — fetch from Supabase
+// Whale trades API — fetch from Supabase (persisted trades, source of truth for holdings)
 app.get('/api/whale-trades', async (req, res) => {
   const { slug } = req.query;
   try {
-    let q = supabase.from('k9_observed_trades').select('*').like('slug', '%-15m-%').order('id', { ascending: false }).limit(200);
+    const limit = Math.min(parseInt(req.query.limit || '1000', 10) || 1000, 5000);
+    let q = supabase.from('k9_observed_trades').select('*').like('slug', '%-15m-%').order('id', { ascending: false }).limit(limit);
     if (slug) q = q.eq('slug', slug);
     const { data, error } = await q;
     if (error) return res.status(500).json({ error: error.message });
-    res.json({ trades: data || [] });
+    // Normalize for frontend: ts, side, outcome, shares, usdc, marketUp, marketDown
+    const trades = (data || []).map(t => {
+      const shares = parseFloat(t.shares) || 0;
+      const side = shares >= 0 ? 'buy' : 'sell';
+      return {
+        ...t,
+        ts: (t.trade_timestamp || 0) * 1000,
+        side,
+        shares: Math.abs(shares),
+        usdc: Math.abs(parseFloat(t.usdc_size) || 0),
+        marketUp: t.market_up != null ? parseFloat(t.market_up) : undefined,
+        marketDown: t.market_down != null ? parseFloat(t.market_down) : undefined,
+      };
+    });
+    res.json({ trades });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -4794,7 +6161,7 @@ app.get('/api/whale-trades', async (req, res) => {
 // List all slugs the whale has traded on (for browsing history)
 app.get('/api/whale-slugs', async (req, res) => {
   try {
-    const limit = Math.min(parseInt(req.query.limit || '10000', 10) || 10000, 50000);
+    const limit = Math.min(parseInt(req.query.limit || '50000', 10) || 50000, 100000);
     const { data, error } = await supabase.from('k9_observed_trades')
       .select('slug, trade_timestamp')
       .like('slug', '%-15m-%')
@@ -4816,18 +6183,34 @@ app.get('/api/whale-slugs', async (req, res) => {
   }
 });
 
-// Whale holdings for current 15m event (net shares from trades)
+// Whale holdings for 15m events — derived from stored trades (k9_observed_trades)
 app.get('/api/whale-holdings', async (req, res) => {
   try {
-    // Find the current/latest 15m slug
     const nowSecs = Math.floor(Date.now() / 1000);
     const currentSlot = Math.floor(nowSecs / 900) * 900;
     const slug = req.query.slug || `btc-updown-15m-${currentSlot}`;
+    const all = req.query.all === '1' || req.query.all === 'true';
 
-    const { data, error } = await supabase.from('k9_observed_trades')
-      .select('outcome, shares')
-      .eq('slug', slug);
+    let query = supabase.from('k9_observed_trades').select('slug, outcome, shares').like('slug', '%-15m-%');
+    if (!all) query = query.eq('slug', slug);
+    const { data, error } = await query;
     if (error) return res.status(500).json({ error: error.message });
+
+    if (all) {
+      // Aggregate across all slugs
+      const bySlug = {};
+      for (const t of (data || [])) {
+        const s = t.slug || '';
+        if (!bySlug[s]) bySlug[s] = { up: 0, down: 0 };
+        const shares = parseFloat(t.shares) || 0;
+        if (/up/i.test(t.outcome)) bySlug[s].up += shares;
+        else bySlug[s].down += shares;
+      }
+      const slugs = Object.entries(bySlug).map(([s, h]) => ({ slug: s, up: Math.round(h.up * 100) / 100, down: Math.round(h.down * 100) / 100 }));
+      let totalUp = 0, totalDown = 0;
+      for (const h of slugs) { totalUp += h.up; totalDown += h.down; }
+      return res.json({ all: true, slugs, totalUp: Math.round(totalUp * 100) / 100, totalDown: Math.round(totalDown * 100) / 100 });
+    }
 
     let upShares = 0, downShares = 0;
     for (const t of (data || [])) {
@@ -4838,6 +6221,50 @@ app.get('/api/whale-holdings', async (req, res) => {
     res.json({ slug, up: Math.round(upShares * 100) / 100, down: Math.round(downShares * 100) / 100 });
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+// Whale total positions from Polymarket (source of truth — actual on-chain holdings)
+app.get('/api/whale-positions', async (req, res) => {
+  try {
+    const eventSlug = req.query.event || req.query.slug;
+    const r = await fetch(`https://data-api.polymarket.com/positions?user=${WHALE_WALLET}&limit=200`);
+    if (!r.ok) return res.json({ positions: [], totalUp: 0, totalDown: 0, totalValue: 0, error: `Polymarket ${r.status}` });
+    const data = await r.json();
+    const positions = Array.isArray(data) ? data : (data.positions || []);
+    const filtered = eventSlug
+      ? positions.filter(p => (p.eventSlug || p.slug || '').toLowerCase() === eventSlug.toLowerCase())
+      : positions;
+
+    let totalUp = 0, totalDown = 0, totalValue = 0;
+    const bySlug = {};
+    for (const p of filtered) {
+      const slug = p.eventSlug || p.slug;
+      const outcome = (p.outcome || '').toLowerCase();
+      const size = parseFloat(p.size || 0);
+      const value = parseFloat(p.currentValue || 0) || (parseFloat(p.curPrice || 0) * size);
+      if (!bySlug[slug]) bySlug[slug] = { up: 0, down: 0, value: 0 };
+      const isUp = outcome === 'yes' || outcome === 'up';
+      const isDown = outcome === 'no' || outcome === 'down';
+      if (isUp) {
+        totalUp += size;
+        bySlug[slug].up += size;
+      } else if (isDown) {
+        totalDown += size;
+        bySlug[slug].down += size;
+      }
+      totalValue += value;
+      bySlug[slug].value += value;
+    }
+    res.json({
+      positions: filtered,
+      totalUp: Math.round(totalUp * 100) / 100,
+      totalDown: Math.round(totalDown * 100) / 100,
+      totalValue: Math.round(totalValue * 100) / 100,
+      bySlug: Object.entries(bySlug).map(([s, v]) => ({ slug: s, ...v })),
+    });
+  } catch (e) {
+    res.json({ positions: [], totalUp: 0, totalDown: 0, totalValue: 0, error: e.message });
   }
 });
 
@@ -4941,9 +6368,8 @@ server.listen(PORT, async () => {
   // Monitor k9 trades vs Polymarket every 60s
   setTimeout(k9TradeMonitor, 20000);
   setInterval(k9TradeMonitor, 60000);
-  // Whale watcher (0x8dxd)
-  await seedWhaleSeenTx();
-  connectWhaleWatcher();
-  setTimeout(whaleHttpPoll, 7000);
-  setInterval(whaleHttpPoll, 15000);
+  // Whale watcher DISABLED to save resources
+
+  // Auto-flow: check every 3s for smooth price trends
+  setInterval(checkFlowTrigger, 3000);
 });
