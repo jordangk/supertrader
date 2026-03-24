@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import {
   ComposedChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
-  ResponsiveContainer, ReferenceLine, Area, Brush,
+  ResponsiveContainer, ReferenceLine, ReferenceDot, Area, Brush,
 } from 'recharts';
 
 const API_BASE = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
@@ -17,12 +17,14 @@ export default function WhaleHistory({ whaleTrades = [] }) {
   const [trades, setTrades] = useState([]);
   const [priceHistory, setPriceHistory] = useState([]);
   const [loading, setLoading] = useState(false);
-  const [chartWindowS, setChartWindowS] = useState(900); // zoom in seconds (default 15m = full event)
-  const [brushRange, setBrushRange] = useState(null); // { startIndex, endIndex } for custom zoom
+  const [chartWindowS, setChartWindowS] = useState(900);
+  const [brushRange, setBrushRange] = useState(null);
+  const [whaleHoldings, setWhaleHoldings] = useState(null);
+  const [whalePositions, setWhalePositions] = useState(null);
 
   // Fetch all slugs — auto-select latest (request more for longer history)
   useEffect(() => {
-    fetch(`${API_BASE}/api/whale-slugs?limit=20000`).then(r => r.json()).then(d => {
+    fetch(`${API_BASE}/api/whale-slugs?limit=50000`).then(r => r.json()).then(d => {
       const s = d.slugs || [];
       setSlugs(s);
       if (!selectedSlug && s.length > 0) setSelectedSlug(s[0].slug);
@@ -30,7 +32,7 @@ export default function WhaleHistory({ whaleTrades = [] }) {
   }, []);
   useEffect(() => {
     if (whaleTrades.length > 0) {
-      fetch(`${API_BASE}/api/whale-slugs?limit=20000`).then(r => r.json()).then(d => {
+      fetch(`${API_BASE}/api/whale-slugs?limit=50000`).then(r => r.json()).then(d => {
         const s = d.slugs || [];
         setSlugs(s);
         if (s.length > 0 && !s.some(x => x.slug === selectedSlug)) setSelectedSlug(s[0].slug);
@@ -40,10 +42,10 @@ export default function WhaleHistory({ whaleTrades = [] }) {
 
   // Fetch trades + price history for selected slug
   useEffect(() => {
-    if (!selectedSlug) { setTrades([]); setPriceHistory([]); return; }
+    if (!selectedSlug) { setTrades([]); setPriceHistory([]); setWhaleHoldings(null); setWhalePositions(null); return; }
     setLoading(true);
     Promise.all([
-      fetch(`${API_BASE}/api/whale-trades?slug=${encodeURIComponent(selectedSlug)}`).then(r => r.json()),
+      fetch(`${API_BASE}/api/whale-trades?slug=${encodeURIComponent(selectedSlug)}&limit=1000`).then(r => r.json()),
       fetch(`${API_BASE}/api/price-history?slug=${encodeURIComponent(selectedSlug)}&limit=1000`).then(r => r.json()),
     ]).then(([td, ph]) => {
       setTrades(td.trades || []);
@@ -55,6 +57,22 @@ export default function WhaleHistory({ whaleTrades = [] }) {
       })));
       setLoading(false);
     }).catch(() => { setTrades([]); setPriceHistory([]); setLoading(false); });
+  }, [selectedSlug]);
+
+  useEffect(() => {
+    if (!selectedSlug) return;
+    const is15m = selectedSlug.includes('-15m-');
+    if (is15m) {
+      fetch(`${API_BASE}/api/whale-holdings?slug=${encodeURIComponent(selectedSlug)}`)
+        .then(r => r.json())
+        .then(d => { setWhaleHoldings(d); setWhalePositions(null); })
+        .catch(() => { setWhaleHoldings(null); });
+    } else {
+      fetch(`${API_BASE}/api/whale-positions?event=${encodeURIComponent(selectedSlug)}`)
+        .then(r => r.json())
+        .then(d => { setWhalePositions(d); setWhaleHoldings(null); })
+        .catch(() => setWhalePositions(null));
+    }
   }, [selectedSlug]);
 
   // Build chart data from price history
@@ -139,23 +157,34 @@ export default function WhaleHistory({ whaleTrades = [] }) {
     return { totalBuyUsdc, totalSellUsdc, totalBuyShares, totalSellShares, upBuys, downBuys, upSells, downSells };
   }, [trades]);
 
-  // 5s trade buckets for the log
-  const buckets = useMemo(() => {
+  // Flat list: every transaction, no nesting
+  const flatTrades = useMemo(() => {
     if (!trades.length) return [];
-    const grouped = {};
-    for (const t of trades) {
+    return trades.map(t => {
       const ts = t.trade_timestamp || Math.floor(Date.parse(t.created_at || 0) / 1000);
-      const bucket = Math.floor(ts / 5) * 5;
-      if (!grouped[bucket]) grouped[bucket] = { ts: bucket, buys: [], sells: [] };
       const shares = Math.abs(t.shares || 0);
       const usdc = Math.abs(t.usdc_size || 0);
       const price = shares > 0 ? usdc / shares : 0;
-      const entry = { outcome: t.outcome, shares, usdc, price };
-      if ((t.shares || 0) >= 0) grouped[bucket].buys.push(entry);
-      else grouped[bucket].sells.push(entry);
-    }
-    return Object.values(grouped).sort((a, b) => a.ts - b.ts);
+      const side = (t.shares || 0) >= 0 ? 'buy' : 'sell';
+      return { ts, outcome: t.outcome, shares, usdc, price, side };
+    }).sort((a, b) => a.ts - b.ts);
   }, [trades]);
+
+  // Chart dots: one per trade (no 5s bucket aggregation)
+  const whaleChartDots = useMemo(() => {
+    if (!chartData.length || !trades.length || !priceHistory.length) return [];
+    const base = priceHistory[0].t;
+    return trades.map(t => {
+      const ts = (t.trade_timestamp || 0) * 1000 || Date.parse(t.created_at || 0);
+      const elapsed = Math.round((ts - base) / 1000);
+      const shares = Math.abs(t.shares || 0);
+      const usdc = Math.abs(t.usdc_size || 0);
+      const price = shares > 0 ? (usdc / shares) * 100 : 0;
+      const isUp = /up/i.test(t.outcome);
+      const side = (t.shares || 0) >= 0 ? 'buy' : 'sell';
+      return { elapsed, price, side, isUp };
+    }).filter(d => d.price > 0 && d.price <= 100);
+  }, [chartData, trades, priceHistory]);
 
   const formatElapsed = (secs) => `${Math.floor(secs / 60)}:${String(Math.abs(secs % 60)).padStart(2, '0')}`;
 
@@ -206,14 +235,14 @@ export default function WhaleHistory({ whaleTrades = [] }) {
       </div>
 
       {/* Event browser — scrollable when many events */}
-      <div className="flex items-center gap-2 flex-wrap max-h-[200px] overflow-y-auto overflow-x-hidden">
+      <div className="flex items-center gap-2 flex-wrap max-h-[500px] overflow-y-auto overflow-x-hidden">
         {slugs.length === 0 && <div className="text-sm text-gray-500 py-2">No whale events yet</div>}
-        {slugs.map(({ slug, ts }) => {
+        {slugs.map(({ slug, ts }, idx) => {
           const epoch = slug.match(/-(\d+)$/)?.[1];
           const isSelected = slug === selectedSlug;
           return (
             <button
-              key={slug}
+              key={`${slug}-${idx}`}
               onClick={() => setSelectedSlug(isSelected ? null : slug)}
               className={`px-3 py-2 rounded-lg border text-xs font-bold transition-all ${
                 isSelected
@@ -230,6 +259,22 @@ export default function WhaleHistory({ whaleTrades = [] }) {
       {/* Selected event detail */}
       {selectedSlug && !loading && (
         <div className="space-y-3">
+          {/* Whale holdings — 15m: DB/Alchemy, else: Polymarket */}
+          {whaleHoldings && selectedSlug?.includes('-15m-') && (
+            <div className="flex items-center gap-4 px-4 py-3 rounded-lg border border-cyan-800/50 bg-cyan-950/20 text-sm">
+              <span className="text-gray-500 font-bold">@0x8dxd (DB/Alchemy 15m)</span>
+              <span className="text-green-400 font-mono font-bold">{(whaleHoldings.up ?? 0).toFixed(1)} Up</span>
+              <span className="text-red-400 font-mono font-bold">{(whaleHoldings.down ?? 0).toFixed(1)} Down</span>
+            </div>
+          )}
+          {whalePositions && !whalePositions.error && !selectedSlug?.includes('-15m-') && (
+            <div className="flex items-center gap-4 px-4 py-3 rounded-lg border border-gray-800/50 bg-gray-900/60 text-sm">
+              <span className="text-gray-500 font-bold">@0x8dxd (Polymarket)</span>
+              <span className="text-green-400 font-mono font-bold">{(whalePositions.totalUp ?? 0).toFixed(1)} Up</span>
+              <span className="text-red-400 font-mono font-bold">{(whalePositions.totalDown ?? 0).toFixed(1)} Down</span>
+              <span className="text-yellow-400 font-mono font-bold">${(whalePositions.totalValue ?? 0).toFixed(2)} value</span>
+            </div>
+          )}
           {/* Summary cards */}
           {summary && (
             <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
@@ -289,27 +334,11 @@ export default function WhaleHistory({ whaleTrades = [] }) {
                   <Area yAxisId="btc" dataKey="btcDelta" stroke="#eab308" fill="#eab30822" strokeWidth={2} dot={false} connectNulls isAnimationActive={false} />
                   <Line yAxisId="poly" dataKey="upPrice" stroke="#4ade80" strokeWidth={2} dot={false} connectNulls isAnimationActive={false} />
                   <Line yAxisId="poly" dataKey="downPrice" stroke="#f87171" strokeWidth={2} dot={false} connectNulls isAnimationActive={false} />
-                  {/* Whale dots */}
-                  <Line yAxisId="poly" dataKey="whaleBuyUp" stroke="none" dot={({ cx, cy, payload }) => {
-                    if (!payload?.whaleDetails?.buyUp || !cx || !cy) return null;
-                    const r = Math.min(3 + payload.whaleDetails.buyUp.usdc / 5, 14);
-                    return <circle cx={cx} cy={cy} r={r} fill="#22c55e" fillOpacity={0.85} stroke="#fff" strokeWidth={1} />;
-                  }} connectNulls={false} isAnimationActive={false} />
-                  <Line yAxisId="poly" dataKey="whaleBuyDown" stroke="none" dot={({ cx, cy, payload }) => {
-                    if (!payload?.whaleDetails?.buyDown || !cx || !cy) return null;
-                    const r = Math.min(3 + payload.whaleDetails.buyDown.usdc / 5, 14);
-                    return <circle cx={cx} cy={cy} r={r} fill="#22c55e" fillOpacity={0.85} stroke="#fff" strokeWidth={1} />;
-                  }} connectNulls={false} isAnimationActive={false} />
-                  <Line yAxisId="poly" dataKey="whaleSellUp" stroke="none" dot={({ cx, cy, payload }) => {
-                    if (!payload?.whaleDetails?.sellUp || !cx || !cy) return null;
-                    const r = Math.min(3 + payload.whaleDetails.sellUp.usdc / 5, 14);
-                    return <circle cx={cx} cy={cy} r={r} fill="#ef4444" fillOpacity={0.85} stroke="#fff" strokeWidth={1} />;
-                  }} connectNulls={false} isAnimationActive={false} />
-                  <Line yAxisId="poly" dataKey="whaleSellDown" stroke="none" dot={({ cx, cy, payload }) => {
-                    if (!payload?.whaleDetails?.sellDown || !cx || !cy) return null;
-                    const r = Math.min(3 + payload.whaleDetails.sellDown.usdc / 5, 14);
-                    return <circle cx={cx} cy={cy} r={r} fill="#ef4444" fillOpacity={0.85} stroke="#fff" strokeWidth={1} />;
-                  }} connectNulls={false} isAnimationActive={false} />
+                  {/* Whale dots — every trade, no nesting */}
+                  {whaleChartDots.map((d, i) => (
+                    <ReferenceDot key={`whale-${i}`} yAxisId="poly" x={d.elapsed} y={d.price} r={4}
+                      fill={d.side === 'buy' ? '#22c55e' : '#ef4444'} fillOpacity={0.85} stroke="#fff" strokeWidth={1} />
+                  ))}
                   <Brush
                     dataKey="elapsed"
                     height={30}
@@ -336,31 +365,20 @@ export default function WhaleHistory({ whaleTrades = [] }) {
             </>
           )}
 
-          {/* Trade log */}
-          <div className="space-y-1 max-h-[400px] overflow-y-auto">
-            {buckets.map((b) => {
-              const time = new Date(b.ts * 1000);
-              const timeStr = time.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', second: '2-digit', hour12: true });
-              const allTrades = [...b.buys.map(t => ({ ...t, side: 'buy' })), ...b.sells.map(t => ({ ...t, side: 'sell' }))];
-              const totalUsdc = allTrades.reduce((s, t) => s + t.usdc, 0);
-              if (totalUsdc < 0.01) return null;
+          {/* Trade log — every transaction, no nesting */}
+          <div className="space-y-1 max-h-[600px] overflow-y-auto">
+            {flatTrades.filter(t => t.usdc >= 0.01).map((t, i) => {
+              const timeStr = new Date(t.ts * 1000).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', second: '2-digit', hour12: true });
+              const isUp = /up/i.test(t.outcome);
               return (
-                <div key={b.ts} className="flex items-start gap-3 px-3 py-2 rounded-lg bg-gray-900/60 border border-gray-800/50 text-xs">
-                  <span className="text-gray-500 font-mono w-24 shrink-0 pt-0.5">{timeStr}</span>
-                  <div className="flex-1 flex flex-wrap gap-x-3 gap-y-1">
-                    {allTrades.filter(t => t.usdc >= 0.01).map((t, j) => {
-                      const isUp = /up/i.test(t.outcome);
-                      return (
-                        <span key={j} className={t.side === 'buy' ? 'text-green-400' : 'text-red-400'}>
-                          {t.side === 'buy' ? 'BUY' : 'SELL'}{' '}
-                          <span className={isUp ? 'text-green-300' : 'text-red-300'}>{isUp ? 'Up' : 'Down'}</span>{' '}
-                          {t.shares.toFixed(1)}sh @ {(t.price * 100).toFixed(1)}¢{' '}
-                          <span className="text-gray-500">(${t.usdc.toFixed(2)})</span>
-                        </span>
-                      );
-                    })}
-                  </div>
-                  <span className="text-yellow-400 font-mono shrink-0">${totalUsdc.toFixed(2)}</span>
+                <div key={`${t.ts}-${i}`} className="flex items-center gap-3 px-3 py-1.5 rounded border border-gray-800/50 bg-gray-900/60 text-xs">
+                  <span className="text-gray-500 font-mono w-24 shrink-0">{timeStr}</span>
+                  <span className={t.side === 'buy' ? 'text-green-400 font-bold' : 'text-red-400 font-bold'}>
+                    {t.side === 'buy' ? 'BUY' : 'SELL'}
+                  </span>
+                  <span className={isUp ? 'text-green-300' : 'text-red-300'}>{t.shares.toFixed(1)} {isUp ? 'Up' : 'Down'}</span>
+                  <span className="text-gray-400">at {(t.price * 100).toFixed(1)}¢</span>
+                  <span className="text-yellow-400 font-mono font-bold">${t.usdc.toFixed(2)}</span>
                 </div>
               );
             })}

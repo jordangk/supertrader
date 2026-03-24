@@ -436,29 +436,28 @@ export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sE
       ema12: null, ema26: null, macdHist: null, macdLine: null, macdSignal: null, rsi: null, signal: null,
     }));
 
-    // EMA — use server-side fast tick EMA values, fall back to client computation with matching alphas
-    let e12 = null, e26 = null;
-    const a12 = 2 / (12 * 10 + 1), a26 = 2 / (26 * 10 + 1); // match server FAST_EMA alphas
-    for (const d of data) {
-      if (d.btcDelta == null) continue;
-      // Prefer server EMA (no cold-start lag)
-      if (d.sE12 != null && d.sE26 != null) {
-        e12 = d.sE12; e26 = d.sE26;
+    // BTC velocity: price change over 3-second rolling window (matches server trigger)
+    for (let i = 0; i < data.length; i++) {
+      if (data[i].btcVal == null) { data[i].velocity = null; continue; }
+      // Find point ~3 seconds ago
+      let j = i - 1;
+      while (j >= 0 && data[i].elapsed - data[j].elapsed < 3) j--;
+      if (j >= 0 && data[j].btcVal != null) {
+        data[i].velocity = Math.round((data[i].btcVal - data[j].btcVal) * 100) / 100;
       } else {
-        e12 = e12 == null ? d.btcDelta : d.btcDelta * a12 + e12 * (1 - a12);
-        e26 = e26 == null ? d.btcDelta : d.btcDelta * a26 + e26 * (1 - a26);
+        data[i].velocity = 0;
       }
-      d.ema12 = Math.round(e12 * 100) / 100;
-      d.ema26 = Math.round(e26 * 100) / 100;
     }
 
-    // MACD (12,26,9)
+    // MACD (12,26,9) + EMA12/EMA26 for chart
     let mf = null, msl = null, ms = null;
     const ma12 = 2 / 13, ma26 = 2 / 27, a9 = 2 / 10;
     for (const d of data) {
       if (d.btcVal == null) continue;
       mf = mf == null ? d.btcVal : d.btcVal * ma12 + mf * (1 - ma12);
       msl = msl == null ? d.btcVal : d.btcVal * ma26 + msl * (1 - ma26);
+      d.ema12 = openPrice ? Math.round((mf - openPrice) * 100) / 100 : null;
+      d.ema26 = openPrice ? Math.round((msl - openPrice) * 100) / 100 : null;
       const ml = mf - msl;
       ms = ms == null ? ml : ml * a9 + ms * (1 - a9);
       d.macdHist = Math.round((ml - ms) * 100) / 100;
@@ -708,12 +707,6 @@ export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sE
           ) : <span className="text-gray-600">—</span>}
         </div>
         <div>
-          <span className="text-xs text-gray-500 mr-1">RSI:</span>
-          <span className={`font-mono text-xs ${lastSignal?.rsi > 70 ? 'text-red-400' : lastSignal?.rsi < 30 ? 'text-green-400' : 'text-gray-300'}`}>
-            {lastSignal?.rsi != null ? lastSignal.rsi.toFixed(0) : '—'}
-          </span>
-        </div>
-        <div>
           <span className="text-xs text-gray-500 mr-1">MACD:</span>
           <span className={`font-mono text-xs ${lastSignal?.macdHist > 0 ? 'text-green-400' : lastSignal?.macdHist < 0 ? 'text-red-400' : 'text-gray-300'}`}>
             {lastSignal?.macdHist != null ? lastSignal.macdHist.toFixed(1) : '—'}
@@ -922,8 +915,8 @@ export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sE
               <Tooltip content={<CustomTooltip />} position={{ x: 70, y: 0 }} />
               <ReferenceLine yAxisId="btc" y={0} stroke="#555" strokeDasharray="3 3" />
               <Area yAxisId="btc" dataKey="btcDelta" stroke="#eab308" fill="#eab30822" strokeWidth={2} dot={false} connectNulls isAnimationActive={false} />
-              <Line yAxisId="btc" dataKey="ema12" stroke="#22d3ee" strokeWidth={1.5} dot={false} connectNulls isAnimationActive={false} strokeDasharray="4 2" />
-              <Line yAxisId="btc" dataKey="ema26" stroke="#a855f7" strokeWidth={1.5} dot={false} connectNulls isAnimationActive={false} strokeDasharray="6 3" />
+              <Line yAxisId="btc" dataKey="ema12" stroke="#06b6d4" strokeWidth={1.5} dot={false} connectNulls isAnimationActive={false} strokeDasharray="4 2" />
+              <Line yAxisId="btc" dataKey="ema26" stroke="#a855f7" strokeWidth={1.5} dot={false} connectNulls isAnimationActive={false} strokeDasharray="4 2" />
               <Line yAxisId="poly" dataKey="upPrice" stroke="#4ade80" strokeWidth={2} dot={false} connectNulls isAnimationActive={false} />
               <Line yAxisId="poly" dataKey="downPrice" stroke="#f87171" strokeWidth={2} dot={false} connectNulls isAnimationActive={false} />
               {entryMarkers.map((m, i) => (
@@ -946,10 +939,10 @@ export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sE
           </ResponsiveContainer>
           <div className="flex items-center justify-center gap-6 mt-2 text-xs flex-wrap">
             <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-yellow-500 inline-block"></span> BTC $</span>
-            <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-cyan-400 inline-block" style={{borderBottom:'1px dashed'}}></span> EMA12</span>
-            <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-purple-400 inline-block" style={{borderBottom:'1px dashed'}}></span> EMA26</span>
             <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-green-400 inline-block"></span> Up</span>
             <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-red-400 inline-block"></span> Down</span>
+            <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-cyan-400 inline-block" style={{borderTop:'1px dashed'}}></span> EMA12</span>
+            <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-purple-400 inline-block" style={{borderTop:'1px dashed'}}></span> EMA26</span>
             {myTradeMarkers.some(m => m.isUp && m.isBuy) && (
               <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-green-500 inline-block border border-white"></span> Up Buy</span>
             )}
@@ -964,44 +957,46 @@ export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sE
             )}
           </div>
           {/* MACD Histogram */}
-          <ResponsiveContainer width="100%" height={100}>
+          <ResponsiveContainer width="100%" height={80}>
             <ComposedChart data={chartData} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#222" />
               <XAxis dataKey="elapsed" tickFormatter={formatElapsed} stroke="#666" tick={{ fontSize: 9 }} interval="preserveStartEnd" />
-              <YAxis yAxisId="macd" orientation="left" width={50} stroke="#888" tick={{ fontSize: 9 }} tickFormatter={v => v.toFixed(0)} domain={['auto', 'auto']} />
-              <YAxis yAxisId="macdR" orientation="right" width={40} stroke="transparent" tick={false} />
-              <ReferenceLine yAxisId="macd" y={0} stroke="#555" />
-              <Bar yAxisId="macd" dataKey="macdHist" isAnimationActive={false}>
+              <YAxis yAxisId="mh" orientation="left" width={50} stroke="#888" tick={{ fontSize: 9 }} domain={['auto', 'auto']} />
+              <ReferenceLine yAxisId="mh" y={0} stroke="#555" />
+              <Bar yAxisId="mh" dataKey="macdHist" isAnimationActive={false}>
                 {chartData.map((d, i) => (
-                  <Cell key={i} fill={d.macdHist >= 0 ? '#22c55e' : '#ef4444'} fillOpacity={0.8} />
+                  <Cell key={i} fill={(d.macdHist ?? 0) >= 0 ? '#22c55e' : '#ef4444'} fillOpacity={0.7} />
                 ))}
               </Bar>
-              <Line yAxisId="macd" dataKey="macdLine" stroke="#22d3ee" strokeWidth={1} dot={false} connectNulls isAnimationActive={false} />
-              <Line yAxisId="macd" dataKey="macdSignal" stroke="#f97316" strokeWidth={1} dot={false} connectNulls isAnimationActive={false} strokeDasharray="4 2" />
+              <Line yAxisId="mh" dataKey="macdLine" stroke="#06b6d4" strokeWidth={1} dot={false} connectNulls isAnimationActive={false} />
+              <Line yAxisId="mh" dataKey="macdSignal" stroke="#f97316" strokeWidth={1} dot={false} connectNulls isAnimationActive={false} />
             </ComposedChart>
           </ResponsiveContainer>
           <div className="flex items-center justify-center gap-6 text-xs">
             <span className="flex items-center gap-1"><span className="w-3 h-2 bg-green-500 inline-block"></span>/<span className="w-3 h-2 bg-red-500 inline-block"></span> MACD Hist</span>
             <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-cyan-400 inline-block"></span> MACD</span>
-            <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-orange-500 inline-block" style={{borderBottom:'1px dashed'}}></span> Signal</span>
+            <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-orange-500 inline-block"></span> Signal</span>
           </div>
-          {/* RSI */}
-          <ResponsiveContainer width="100%" height={80}>
+          {/* BTC Velocity ($/3s) */}
+          <ResponsiveContainer width="100%" height={100}>
             <ComposedChart data={chartData} margin={{ top: 5, right: 10, left: 0, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#222" />
               <XAxis dataKey="elapsed" tickFormatter={formatElapsed} stroke="#666" tick={{ fontSize: 9 }} interval="preserveStartEnd" />
-              <YAxis yAxisId="rsi" orientation="left" width={50} stroke="#888" tick={{ fontSize: 9 }} domain={[0, 100]} ticks={[30, 50, 70]} />
-              <YAxis yAxisId="rsiR" orientation="right" width={40} stroke="transparent" tick={false} />
-              <ReferenceLine yAxisId="rsi" y={70} stroke="#ef4444" strokeDasharray="3 3" strokeOpacity={0.5} />
-              <ReferenceLine yAxisId="rsi" y={30} stroke="#22c55e" strokeDasharray="3 3" strokeOpacity={0.5} />
-              <ReferenceLine yAxisId="rsi" y={50} stroke="#555" strokeDasharray="2 4" />
-              <Area yAxisId="rsi" dataKey="rsi" stroke="#e879f9" fill="#e879f922" strokeWidth={1.5} dot={false} connectNulls isAnimationActive={false} />
+              <YAxis yAxisId="macd" orientation="left" width={50} stroke="#888" tick={{ fontSize: 9 }} tickFormatter={v => `$${v.toFixed(0)}`} domain={['auto', 'auto']} />
+              <YAxis yAxisId="macdR" orientation="right" width={40} stroke="transparent" tick={false} />
+              <ReferenceLine yAxisId="macd" y={0} stroke="#555" />
+              <ReferenceLine yAxisId="macd" y={20} stroke="#22c55e33" strokeDasharray="4 2" label={{ value: '+$20', position: 'right', fill: '#22c55e', fontSize: 9 }} />
+              <ReferenceLine yAxisId="macd" y={-20} stroke="#ef444433" strokeDasharray="4 2" label={{ value: '-$20', position: 'right', fill: '#ef4444', fontSize: 9 }} />
+              <Bar yAxisId="macd" dataKey="velocity" isAnimationActive={false}>
+                {chartData.map((d, i) => (
+                  <Cell key={i} fill={(d.velocity ?? 0) >= 0 ? '#22c55e' : '#ef4444'} fillOpacity={Math.abs(d.velocity ?? 0) >= 20 ? 1.0 : 0.4} />
+                ))}
+              </Bar>
             </ComposedChart>
           </ResponsiveContainer>
           <div className="flex items-center justify-center gap-6 text-xs">
-            <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-fuchsia-400 inline-block"></span> RSI(14)</span>
-            <span className="text-red-400/50">70 overbought</span>
-            <span className="text-green-400/50">30 oversold</span>
+            <span className="flex items-center gap-1"><span className="w-3 h-2 bg-green-500 inline-block"></span>/<span className="w-3 h-2 bg-red-500 inline-block"></span> BTC Velocity ($/3s)</span>
+            <span className="text-gray-500">trigger at ±$20</span>
           </div>
         </div>
       ) : (

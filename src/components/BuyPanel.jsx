@@ -1,6 +1,6 @@
 import React from 'react';
 
-export default function BuyPanel({ side, price, amounts, buying, onBuy, onRewardsBuy, onRewardsSell, onSuperRewards, onSuperSell, onSell, onSellAll, holdings, tokenId, expectedROI = 0, showROIHint = false }) {
+export default function BuyPanel({ side, price, amounts, buying, onBuy, onRewardsBuy, onRewardsSell, onSuperRewards, onSuperSell, onWhaleStyleBuy, onSell, onSellAll, holdings, tokenId, expectedROI = 0, showROIHint = false }) {
   const isUp = side === 'up';
   const raw = price != null ? price / (1 + expectedROI) : null;
   const threshold = raw != null ? Math.min(raw, 0.99) : null;
@@ -93,6 +93,31 @@ export default function BuyPanel({ side, price, amounts, buying, onBuy, onReward
             {buying === `super-sell-${side}` ? '...' : `Sell 50 (+1¢)`}
           </button>
         </div>
+        {onWhaleStyleBuy && (
+          <>
+            <div className="text-[10px] text-gray-500 mb-0.5">Whale-style (5sh behind bid, fill on dips)</div>
+            <div className="grid grid-cols-2 gap-1.5">
+            <button
+              disabled={buying?.startsWith('whale-style') || !price}
+              onClick={() => onWhaleStyleBuy(side, 2)}
+              className={`py-1.5 rounded-lg text-xs font-bold transition-all ${
+                buying === `whale-style-${side}-2` ? 'opacity-50 cursor-wait' : ''
+              } bg-cyan-800/50 hover:bg-cyan-700/50 border border-cyan-600/50 text-cyan-200 disabled:opacity-30`}
+            >
+              {buying === `whale-style-${side}-2` ? '...' : '5 @ bid-2¢'}
+            </button>
+            <button
+              disabled={buying?.startsWith('whale-style') || !price}
+              onClick={() => onWhaleStyleBuy(side, 3)}
+              className={`py-1.5 rounded-lg text-xs font-bold transition-all ${
+                buying === `whale-style-${side}-3` ? 'opacity-50 cursor-wait' : ''
+              } bg-cyan-800/50 hover:bg-cyan-700/50 border border-cyan-600/50 text-cyan-200 disabled:opacity-30`}
+            >
+            {buying === `whale-style-${side}-3` ? '...' : '5 @ bid-3¢'}
+            </button>
+            </div>
+          </>
+        )}
       </div>
 
       {/* Sell buttons */}

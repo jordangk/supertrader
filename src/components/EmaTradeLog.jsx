@@ -94,7 +94,7 @@ export default function EmaTradeLog() {
                     <td className="py-2 px-3"><span className="text-[10px] uppercase">{c.source || 'ema'}</span></td>
                     <td className="py-2 px-3 text-gray-400 truncate max-w-[120px]" title={c.eventSlug}>{c.eventSlug?.slice(-20) || c.polymarketEventId}</td>
                     <td className="py-2 px-3">
-                      <span className={c.entrySide === 'up' ? 'text-green-400' : 'text-red-400'}>{c.entrySide?.toUpperCase()}</span>
+                      <span className={c.entrySide === 'up' ? 'text-green-400' : c.entrySide === 'down' ? 'text-red-400' : 'text-gray-400'}>{c.entrySide?.toUpperCase()}</span>
                     </td>
                     <td className="py-2 px-3 text-right font-mono">{c.upPaidCents}¢</td>
                     <td className="py-2 px-3 text-right font-mono">{c.downPaidCents}¢</td>
@@ -115,11 +115,11 @@ export default function EmaTradeLog() {
                   {expanded[c.id || i] && (
                     <tr className="bg-gray-950/50 border-b border-gray-800/50">
                       <td colSpan={11} className="py-2 px-3 text-[11px] text-gray-500 space-y-1">
-                        <div>Entry: {c.entrySide?.toUpperCase()} @ {c.entryPriceCents}¢ → Hedge: {c.entrySide === 'up' ? 'DOWN' : 'UP'} @ {c.hedgePriceCents}¢</div>
+                        <div>Entry: {c.entrySide?.toUpperCase()} @ {c.entryPriceCents}¢ → Hedge: {c.entrySide === 'up' ? 'DOWN' : c.entrySide === 'down' ? 'UP' : '—'} @ {c.hedgePriceCents}¢</div>
                         <div>Gap: ${c.gap ?? '—'} | Peak: ${c.peakGap ?? '—'} | MACD Histogram: {c.histogram ?? '—'}</div>
                         <div>EMA 12: {c.e12 ?? '—'} | EMA 26: {c.e26 ?? '—'} | BTC: ${c.btcAtEntry ?? '—'} | {c.shares} shares</div>
                       </td>
-                  </tr>
+                    </tr>
                   )}
                 </React.Fragment>
               ))}

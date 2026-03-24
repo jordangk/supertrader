@@ -232,9 +232,9 @@ async function fireAutoLost() {
 let autoEma = {
   enabled: false,
   shares: 5,
-  gapOpenThreshold: 5,   // $5 fast EMA gap + MACD zero-cross to trigger
-  priceMin: 30,           // winning side 30-75¢ (tighter range)
-  priceMax: 75,
+  gapOpenThreshold: 5,   // EMA gap threshold (hybrid: velocity + gap)
+  priceMin: 30,           // winning side 30-55¢ (buy cheap only)
+  priceMax: 55,
   maxHedgeWaitMs: 30_000, // max 30s to wait for hedge signal
   cooldownMs: 0,          // no cooldown between cycles
   busy: false,
@@ -279,6 +279,7 @@ function saveEmaState() {
       autoEmaLog: autoEma.log,
       lastEntrySide: autoEma.lastEntrySide,
       btcStart: liveState.btcStart,
+      btcTicks: _btcTicks.slice(-100), // save recent BTC ticks for velocity on restart
       savedAt: Date.now(),
     };
     fs.writeFileSync(EMA_STATE_FILE, JSON.stringify(state));
@@ -288,11 +289,18 @@ function restoreEmaState() {
   try {
     if (!fs.existsSync(EMA_STATE_FILE)) return;
     const state = JSON.parse(fs.readFileSync(EMA_STATE_FILE, 'utf8'));
-    // Only restore if saved recently (< 5 min) and same btcStart
-    if (Date.now() - state.savedAt > 300_000) { console.log('[EMA] Saved state too old, skipping restore'); return; }
+    // Only restore if saved recently (< 30 min)
+    if (Date.now() - state.savedAt > 1_800_000) { console.log('[EMA] Saved state too old (>30m), skipping restore'); return; }
     if (state.serverEma) {
       Object.assign(serverEma, state.serverEma);
       console.log(`[EMA] Restored — e12=$${serverEma.e12?.toFixed(1)} e26=$${serverEma.e26?.toFixed(1)} gap=$${serverEma.gap.toFixed(1)}`);
+    }
+    if (state.btcTicks && Array.isArray(state.btcTicks)) {
+      // Restore BTC ticks that are still within the velocity window
+      const now = Date.now();
+      const valid = state.btcTicks.filter(t => now - t.t < BTC_VELOCITY_WINDOW_MS);
+      _btcTicks.push(...valid);
+      console.log(`[EMA] Restored ${valid.length} BTC ticks for velocity`);
     }
     if (state.autoEmaLog) autoEma.log = state.autoEmaLog;
     if (state.lastEntrySide) autoEma.lastEntrySide = state.lastEntrySide;
@@ -434,46 +442,67 @@ function _autoEmaAbort(reason) {
   autoEma.peakProfit = 0;
 }
 
-// Step 1: Enter when fast MACD crosses zero AND fast EMA gap ≥ threshold
+// BTC velocity tracker — rolling 3-second window
+const _btcTicks = []; // { t: timestamp, price: number }
+const BTC_VELOCITY_WINDOW_MS = 3000;  // 3-second window
+const BTC_VELOCITY_THRESHOLD = 5;      // $5 move in 3s to trigger
+
+// Step 1: Enter on raw BTC velocity (no EMA lag)
 let _lastEmaDebug = 0;
 function checkEmaTrigger() {
   if (!autoEma.enabled || autoEma.busy) return;
   if (!activeEvent || !clobClient) return;
   if (isNoTradeZone()) return;
-  if (Date.now() - autoEma.lastTriggerTime < 4_000) return; // 4s cooldown between attempts
+  if (Date.now() - autoEma.lastTriggerTime < 4_000) return; // 4s cooldown
 
-  // Use fast tick-by-tick EMA
+  const now = Date.now();
+  const btcNow = liveState.binanceBtc;
+  if (!btcNow) return;
+
+  // Add tick and prune old ones
+  _btcTicks.push({ t: now, price: btcNow });
+  while (_btcTicks.length > 0 && now - _btcTicks[0].t > BTC_VELOCITY_WINDOW_MS) _btcTicks.shift();
+  if (_btcTicks.length < 2) return;
+
+  // Calculate velocity: price change over the window
+  const oldest = _btcTicks[0];
+  const velocity = btcNow - oldest.price; // positive = BTC going up
+  const absVelocity = Math.abs(velocity);
+
+  // Also compute fast EMA gap for display/logging
   const fGap = (serverEma.fE12 ?? 0) - (serverEma.fE26 ?? 0);
-  const absGap = Math.abs(fGap);
   const fHist = serverEma.fHistogram ?? 0;
-  const histAgreesWithGap = (fGap > 0 && fHist > 0) || (fGap < 0 && fHist < 0);
-  const winSide = fGap > 0 ? 'up' : 'down';
+
+  const winSide = velocity > 0 ? 'up' : 'down';
   const winPrice = winSide === 'up' ? liveState.upPrice : liveState.downPrice;
   const winCents = (winPrice ?? 0) * 100;
 
   // Debug log every 10s
-  if (Date.now() - _lastEmaDebug > 10_000) {
-    _lastEmaDebug = Date.now();
-    console.log(`[AUTO-EMA-DBG] gap=$${fGap.toFixed(1)} (need≥${autoEma.gapOpenThreshold}) hist=${fHist.toFixed(2)} agrees=${histAgreesWithGap} win=${winCents.toFixed(0)}¢ (${autoEma.priceMin}-${autoEma.priceMax})`);
+  if (now - _lastEmaDebug > 10_000) {
+    _lastEmaDebug = now;
+    console.log(`[AUTO-EMA-DBG] vel=$${velocity.toFixed(1)}/${(BTC_VELOCITY_WINDOW_MS/1000)}s (need≥$${BTC_VELOCITY_THRESHOLD}) gap=$${fGap.toFixed(1)} (need≥$${autoEma.gapOpenThreshold}) hist=${fHist.toFixed(2)} win=${winCents.toFixed(0)}¢ (${autoEma.priceMin}-${autoEma.priceMax})`);
   }
 
-  if (absGap < autoEma.gapOpenThreshold) return;
+  // Hybrid trigger: velocity ≥$15/3s AND EMA gap ≥$8 (both must be true)
+  if (absVelocity < BTC_VELOCITY_THRESHOLD) return;
+  const absFGap = Math.abs(fGap);
+  if (absFGap < autoEma.gapOpenThreshold) return;
+  // Velocity and gap must agree on direction
+  if ((velocity > 0 && fGap < 0) || (velocity < 0 && fGap > 0)) return;
 
-  // MACD histogram must agree with gap direction (same sign)
-  if (!histAgreesWithGap) return;
-
+  // Price must be in range (buy cheap, not expensive)
   if (winPrice == null) return;
   if (winCents < autoEma.priceMin || winCents > autoEma.priceMax) return;
 
-  console.log(`[AUTO-EMA] Trigger — ${winSide.toUpperCase()}, fGap=$${fGap.toFixed(1)}, fHist=${fHist.toFixed(2)}, winning=${winCents.toFixed(0)}¢`);
+  console.log(`[AUTO-EMA] Trigger — ${winSide.toUpperCase()}, velocity=$${velocity.toFixed(1)}/${(BTC_VELOCITY_WINDOW_MS/1000)}s, winning=${winCents.toFixed(0)}¢, gap=$${fGap.toFixed(1)}`);
   autoEma.busy = true;
-  autoEma.lastTriggerTime = Date.now();
-  autoEma.log = [{ ts: Date.now(), side: winSide, triggerGap: fGap, fHist, entryPrice: null, entryFillTime: null, hedgePrice: null, hedgeReason: null, hedgeTime: null, peakGap: 0, tpPrice: null, profit: null, result: 'pending' }, ...autoEma.log].slice(0, 20);
-  broadcast({ type: 'auto_ema', status: 'triggered', side: winSide, gap: fGap });
+  autoEma.lastTriggerTime = now;
+  autoEma.log = [{ ts: now, side: winSide, triggerGap: fGap, fHist, velocity, entryPrice: null, entryFillTime: null, hedgePrice: null, hedgeReason: null, hedgeTime: null, peakGap: 0, tpPrice: null, profit: null, result: 'pending' }, ...autoEma.log].slice(0, 20);
+  broadcast({ type: 'auto_ema', status: 'triggered', side: winSide, gap: fGap, velocity });
   fireAutoEmaEntry(winSide);
 }
 
-// Step 1 execution: buy the winning side at market - 2¢
+// Step 1 execution: buy 5 shares at ask price
 async function fireAutoEmaEntry(side) {
   if (!clobClient || !activeEvent) { _autoEmaAbort('no_client'); return; }
   if (isNoTradeZone()) { _autoEmaAbort('no_trade_zone'); return; }
@@ -484,16 +513,16 @@ async function fireAutoEmaEntry(side) {
   const tickSize = activeEvent.tickSize || '0.01';
   const tick = parseFloat(tickSize);
   const negRisk = activeEvent.negRisk || false;
-  const sizeShares = 5; // always 5 shares
+  const sizeShares = 5;
 
   try {
     const mkt = await fetchClobBidAsk(tokenId);
     const marketPrice = mkt.bestAsk ?? (side === 'up' ? liveState.upPrice : liveState.downPrice);
     if (!marketPrice || marketPrice <= 0) { _autoEmaAbort('no_market_price'); return; }
 
-    const buyPrice = Math.max(0.01, Math.min(Math.round((marketPrice + 0.01) / tick) * tick, 0.99));
+    const buyPrice = Math.max(0.01, Math.min(Math.round(marketPrice / tick) * tick, 0.99));
 
-    console.log(`[AUTO-EMA] Entry: BUY ${side.toUpperCase()} ${sizeShares}sh @ ${(buyPrice*100).toFixed(0)}¢ (ask ${(marketPrice*100).toFixed(0)}¢, +1¢)`);
+    console.log(`[AUTO-EMA] Entry: BUY ${side.toUpperCase()} ${sizeShares}sh @ ${(buyPrice*100).toFixed(0)}¢ (ask ${(marketPrice*100).toFixed(0)}¢)`);
     const signedOrder = await clobClient.createOrder({ tokenID: tokenId, price: buyPrice, size: sizeShares, side: 'BUY' }, { tickSize, negRisk });
     const result = await clobClient.postOrder(signedOrder, 'GTC');
     const ok = result?.success || result?.status === 'matched' || result?.status === 'live';
@@ -509,9 +538,6 @@ async function fireAutoEmaEntry(side) {
 
     // Capture opposite side price NOW to lock in stop loss level
     const oppAskNow = side === 'up' ? liveState.downPrice : liveState.upPrice;
-    // Stop loss: opposite price where hedge = -5¢ loss
-    // totalCost = buyPrice + hedgePrice, profit = 100¢ - totalCost
-    // -5¢ means totalCost = 105¢, so stopLossOppPrice = (105 - buyPrice*100) / 100
     const stopLossOppPrice = (100 + 5 - Math.round(buyPrice * 100)) / 100;
 
     autoEma.phase = 'entered';
@@ -519,6 +545,8 @@ async function fireAutoEmaEntry(side) {
     autoEma.lastEntrySide = side;
     autoEma.entryOrderId = orderId;
     autoEma.entryPrice = buyPrice;
+    autoEma.totalShares = sizeShares;
+    autoEma.hedgedShares = 0;
     autoEma.entryTime = Date.now();
     autoEma.entryFillTime = Date.now();
     autoEma.oppPriceAtEntry = oppAskNow;
@@ -546,92 +574,99 @@ async function fireAutoEmaEntry(side) {
       autoEma.log[0].entryFillTime = Date.now();
       autoEma.log[0].result = 'entered';
     }
-    console.log(`[AUTO-EMA] ENTERED @ ${(buyPrice*100).toFixed(0)}¢ — trailing stop: -3¢ initial, ratchets at +5¢`);
+    console.log(`[AUTO-EMA] ENTERED @ ${(buyPrice*100).toFixed(0)}¢ — 50% hedge at profit, 50% ride to resolution, stop -5¢ all`);
   } catch (e) {
     console.error('[AUTO-EMA] Entry error:', e?.message ?? e);
     _autoEmaAbort();
   }
 }
 
-// Trailing stop: initial -3¢, ratchets up once profit reaches +5¢
-// Exit conditions:
-// 1. Stop loss: opposite ask ≥ locked stopLossOppPrice (= -5¢ real loss)
-// 2. Trailing profit stop: once peak profit ≥ 5¢, floor = peakProfit - 3¢, ratchets up 1:1
-// 3. MACD cross: only if profitable (≥ 0¢)
+// Scaled exit: hedge in 3 tranches at +1¢, +3¢, and EMA wave end (MACD cross)
+// Stop loss -5¢ hedges ALL remaining at any time
+// Tranches: 2sh @ +1¢, 2sh @ +3¢, 1sh @ MACD cross
 function checkEmaHedge() {
-  if (!autoEma.enabled || !autoEma.busy || autoEma.phase !== 'entered') return;
+  if (!autoEma.enabled || !autoEma.busy) return;
+  if (autoEma.phase !== 'entered') return;
   if (!activeEvent || !clobClient) return;
 
   const absGap = Math.abs(serverEma.gap);
   autoEma.peakGap = Math.max(autoEma.peakGap, absGap);
 
-  // Real P&L if we hedge right now: 100¢ - (entryPrice + oppAsk+1¢)
   const oppPrice = autoEma.entrySide === 'up' ? liveState.downPrice : liveState.upPrice;
   if (oppPrice == null || autoEma.entryPrice == null) return;
-  const hedgeCost = oppPrice + 0.01;
-  const totalCostCents = Math.round((autoEma.entryPrice + hedgeCost) * 100);
+  const totalCostCents = Math.round((autoEma.entryPrice + oppPrice) * 100);
   const profitCents = 100 - totalCostCents;
 
   autoEma.peakProfit = Math.max(autoEma.peakProfit, profitCents);
 
-  // 1. Stop loss: locked at entry time — opposite ask ≥ threshold
+  const hedgedSoFar = autoEma.hedgedShares || 0;
+  const totalShares = autoEma.totalShares || 5;
+  const remainingShares = totalShares - hedgedSoFar;
+  if (remainingShares <= 0) { _autoEmaAbort(); return; }
+
+  // 0. STOP LOSS -5¢: hedge ALL remaining shares immediately
   if (autoEma.stopLossOppPrice && oppPrice >= autoEma.stopLossOppPrice) {
     const reason = `stop_loss(${profitCents}¢, opp=${(oppPrice*100).toFixed(0)}¢≥${(autoEma.stopLossOppPrice*100).toFixed(0)}¢)`;
-    console.log(`[AUTO-EMA] STOP LOSS — ${autoEma.entrySide.toUpperCase()} opp=${(oppPrice*100).toFixed(0)}¢ ≥ stop=${(autoEma.stopLossOppPrice*100).toFixed(0)}¢ (entry ${(autoEma.entryPrice*100).toFixed(0)}¢, hedgeP&L=${profitCents}¢)`);
-    if (autoEma.log.length > 0) {
-      autoEma.log[0].hedgeReason = reason;
-      autoEma.log[0].hedgeTime = Date.now();
-      autoEma.log[0].peakGap = autoEma.peakGap;
-      autoEma.log[0].peakProfit = autoEma.peakProfit;
-    }
+    console.log(`[AUTO-EMA] STOP LOSS ALL ${remainingShares}sh — profit=${profitCents}¢`);
+    _logHedge(reason);
     autoEma.phase = 'hedging';
-    broadcast({ type: 'auto_ema', status: 'stop_loss', side: autoEma.entrySide, profitCents });
-    fireAutoEmaExit(reason);
+    fireAutoEmaExit(reason, remainingShares, true);
     return;
   }
 
-  // 2. Trailing profit stop: once we hit +5¢, lock in floor at peak - 3¢, ratchet 1:1
-  //    e.g. peak=5→floor=2, peak=6→floor=3, peak=10→floor=7
-  if (autoEma.peakProfit >= 5) {
-    const profitFloor = autoEma.peakProfit - 3;
-    if (profitCents <= profitFloor) {
-      const reason = `trailing_stop(+${profitCents}¢, peak=+${autoEma.peakProfit}¢, floor=+${profitFloor}¢)`;
-      console.log(`[AUTO-EMA] TRAILING STOP — ${autoEma.entrySide.toUpperCase()} profit=${profitCents}¢ ≤ floor=${profitFloor}¢ (peak=${autoEma.peakProfit}¢)`);
-      if (autoEma.log.length > 0) {
-        autoEma.log[0].hedgeReason = reason;
-        autoEma.log[0].hedgeTime = Date.now();
-        autoEma.log[0].peakGap = autoEma.peakGap;
-        autoEma.log[0].peakProfit = autoEma.peakProfit;
-      }
-      autoEma.phase = 'hedging';
-      broadcast({ type: 'auto_ema', status: 'trailing_stop', side: autoEma.entrySide, profitCents, peakProfit: autoEma.peakProfit });
-      fireAutoEmaExit(reason);
-      return;
+  // Scaled hedge tranches: [profitThreshold, shares]
+  // Tranche 1: +1¢ → hedge 2sh, Tranche 2: +3¢ → hedge 2sh, Tranche 3: MACD cross → hedge 1sh
+  const hedgeTranches = [
+    { at: 1, shares: 2 },   // hedge 2sh when profit hits +1¢
+    { at: 3, shares: 2 },   // hedge 2sh when profit hits +3¢
+  ];
+
+  // 1. Check profit-based tranches
+  let sharesForThisTranche = 0;
+  let trancheLabel = '';
+  for (const tr of hedgeTranches) {
+    const cumShares = tr.at === 1 ? 2 : 4; // cumulative: 2 after +1¢, 4 after +3¢
+    if (hedgedSoFar < cumShares && profitCents >= tr.at) {
+      sharesForThisTranche = Math.min(tr.shares, cumShares - hedgedSoFar);
+      trancheLabel = `+${tr.at}¢`;
+      break; // do one tranche at a time
     }
   }
 
-  // 3. MACD cross exit: only if profitable (hedge would be ≥ break-even)
-  const hist = serverEma.histogram ?? 0;
-  const prevHist = serverEma.prevHistogram ?? 0;
-  const macdCrossedAgainst = (autoEma.entrySide === 'up' && prevHist >= 0 && hist < 0) ||
-                              (autoEma.entrySide === 'down' && prevHist <= 0 && hist > 0);
-  if (macdCrossedAgainst && profitCents >= 0) {
-    console.log(`[AUTO-EMA] MACD CROSS EXIT — ${autoEma.entrySide.toUpperCase()} hedgeP&L=+${profitCents}¢ hist=${hist.toFixed(2)}`);
-    if (autoEma.log.length > 0) {
-      autoEma.log[0].hedgeReason = `macd_cross(+${profitCents}¢)`;
-      autoEma.log[0].hedgeTime = Date.now();
-      autoEma.log[0].peakGap = autoEma.peakGap;
-      autoEma.log[0].peakProfit = autoEma.peakProfit;
-    }
+  if (sharesForThisTranche > 0) {
+    const reason = `scaled_hedge(${trancheLabel}, ${profitCents}¢, ${sharesForThisTranche}sh)`;
+    console.log(`[AUTO-EMA] SCALED HEDGE ${sharesForThisTranche}sh @ ${trancheLabel} — profit=${profitCents}¢, hedged=${hedgedSoFar}→${hedgedSoFar + sharesForThisTranche}/${totalShares}`);
+    _logHedge(reason);
+    autoEma.phase = 'hedging'; // temporarily while placing order
+    fireAutoEmaExit(reason, sharesForThisTranche, false);
+    return;
+  }
+
+  // 2. EMA gap hits $10: hedge remaining shares (ride the wave to $10)
+  const fGap = (serverEma.fE12 ?? 0) - (serverEma.fE26 ?? 0);
+  const absFGap = Math.abs(fGap);
+  if (hedgedSoFar >= 4 && absFGap >= 10) {
+    const reason = `ema_gap_10(${profitCents}¢, gap=$${absFGap.toFixed(1)}, ${remainingShares}sh)`;
+    console.log(`[AUTO-EMA] EMA GAP $10 — hedge last ${remainingShares}sh, profit=${profitCents}¢, gap=$${absFGap.toFixed(1)}`);
+    _logHedge(reason);
     autoEma.phase = 'hedging';
-    broadcast({ type: 'auto_ema', status: 'macd_cross', side: autoEma.entrySide, profitCents });
-    fireAutoEmaExit(`macd_cross(+${profitCents}¢)`);
+    fireAutoEmaExit(reason, remainingShares, true);
     return;
   }
 }
 
-// Exit: sell entry-side shares at market-1¢ (no more opposite-side hedge)
-async function fireAutoEmaExit(reason) {
+function _logHedge(reason) {
+  if (autoEma.log.length > 0) {
+    autoEma.log[0].hedgeReason = reason;
+    autoEma.log[0].hedgeTime = Date.now();
+    autoEma.log[0].peakGap = autoEma.peakGap;
+    autoEma.log[0].peakProfit = autoEma.peakProfit;
+  }
+}
+
+// Exit: hedge by buying opposite side. Supports partial (50%) and full (stop loss) exits.
+// isFinal=true: close entire position. isFinal=false: hedge partial, keep riding rest.
+async function fireAutoEmaExit(reason, sharesToHedge, isFinal) {
   if (!clobClient || !activeEvent) { _autoEmaAbort(); return; }
 
   const oppSide = autoEma.entrySide === 'up' ? 'down' : 'up';
@@ -641,21 +676,23 @@ async function fireAutoEmaExit(reason) {
   const tickSize = activeEvent.tickSize || '0.01';
   const tick = parseFloat(tickSize);
   const negRisk = activeEvent.negRisk || false;
-  const sizeShares = 5;
 
   try {
-    // Hedge: buy opposite side at ask+1¢ for quick fill
+    // Hedge: buy opposite side at ask for quick fill
     const mkt = await fetchClobBidAsk(tokenId);
     const marketPrice = mkt.bestAsk ?? (oppSide === 'up' ? liveState.upPrice : liveState.downPrice);
     if (!marketPrice || marketPrice <= 0) { _autoEmaAbort(); return; }
 
-    const buyPrice = Math.max(0.01, Math.min(Math.round((marketPrice + 0.01) / tick) * tick, 0.99));
+    const buyPrice = Math.max(0.01, Math.min(Math.round(marketPrice / tick) * tick, 0.99));
     const totalCost = Math.round((autoEma.entryPrice + buyPrice) * 100);
     const profitCents = 100 - totalCost;
 
-    console.log(`[AUTO-EMA] HEDGE: BUY ${oppSide.toUpperCase()} ${sizeShares}sh @ ${(buyPrice*100).toFixed(0)}¢ (entry ${(autoEma.entryPrice*100).toFixed(0)}¢ + ${(buyPrice*100).toFixed(0)}¢ = ${totalCost}¢, ${profitCents >= 0 ? '+' : ''}${profitCents}¢, reason=${reason})`);
+    const totalShares = autoEma.totalShares || 5;
+    const rideShares = isFinal ? 0 : totalShares - sharesToHedge - (autoEma.hedgedShares || 0);
 
-    const signedOrder = await clobClient.createOrder({ tokenID: tokenId, price: buyPrice, size: sizeShares, side: 'BUY' }, { tickSize, negRisk });
+    console.log(`[AUTO-EMA] HEDGE: BUY ${oppSide.toUpperCase()} ${sharesToHedge}sh @ ${(buyPrice*100).toFixed(0)}¢ (entry avg ${(autoEma.entryPrice*100).toFixed(1)}¢ + ${(buyPrice*100).toFixed(0)}¢ = ${totalCost}¢, ${profitCents >= 0 ? '+' : ''}${profitCents}¢/sh, ${isFinal ? 'FINAL' : `ride ${rideShares}sh to resolution`}, reason=${reason})`);
+
+    const signedOrder = await clobClient.createOrder({ tokenID: tokenId, price: buyPrice, size: sharesToHedge, side: 'BUY' }, { tickSize, negRisk });
     const result = await clobClient.postOrder(signedOrder, 'GTC');
     const ok = result?.success || result?.status === 'matched' || result?.status === 'live';
     const orderId = result?.orderID ?? result?.order_id;
@@ -663,25 +700,40 @@ async function fireAutoEmaExit(reason) {
     console.log(`[AUTO-EMA] Hedge result: status=${result?.status}, orderId=${orderId}`);
     if (!ok) { console.log('[AUTO-EMA] Hedge order failed:', JSON.stringify(result)); _autoEmaAbort(); return; }
 
+    autoEma.hedgedShares = (autoEma.hedgedShares || 0) + sharesToHedge;
+
     if (autoEma.log.length > 0) {
       autoEma.log[0].hedgePrice = buyPrice;
       autoEma.log[0].profit = profitCents;
-      autoEma.log[0].result = `hedge ${profitCents >= 0 ? '+' : ''}${profitCents}¢`;
+      autoEma.log[0].hedgedShares = autoEma.hedgedShares;
+      autoEma.log[0].rideShares = isFinal ? 0 : rideShares;
+      autoEma.log[0].result = isFinal
+        ? `hedge ALL ${profitCents >= 0 ? '+' : ''}${profitCents}¢`
+        : `hedge ${sharesToHedge}sh ${profitCents >= 0 ? '+' : ''}${profitCents}¢, ride ${rideShares}sh`;
     }
 
     // DB insert
     supabase.from('polymarket_trades').insert({
       polymarket_event_id: eventDbId(), direction: oppSide,
-      purchase_price: buyPrice, purchase_amount: Math.round(sizeShares * buyPrice * 100) / 100,
+      purchase_price: buyPrice, purchase_amount: Math.round(sharesToHedge * buyPrice * 100) / 100,
       purchase_time: new Date().toISOString(), minute: Math.floor(Date.now() / 60000),
       btc_price_at_purchase: liveState.btcCurrent, order_type: 'live',
-      order_status: 'open', polymarket_order_id: orderId, shares: sizeShares,
-      notes: JSON.stringify({ type: 'auto-ema-hedge', side: oppSide, buyPrice, entryPrice: autoEma.entryPrice, entrySide: autoEma.entrySide, profitCents, peakProfit: autoEma.peakProfit, reason, eventSlug: liveState.eventSlug, gap: serverEma.gap, peakGap: autoEma.peakGap, histogram: serverEma.histogram }),
+      order_status: 'open', polymarket_order_id: orderId, shares: sharesToHedge,
+      notes: JSON.stringify({ type: isFinal ? 'auto-ema-hedge-all' : 'auto-ema-hedge-half', side: oppSide, buyPrice, sharesToHedge, rideShares, entryPrice: autoEma.entryPrice, entrySide: autoEma.entrySide, profitCents, peakProfit: autoEma.peakProfit, reason, eventSlug: liveState.eventSlug, gap: serverEma.gap, peakGap: autoEma.peakGap, histogram: serverEma.histogram }),
     }).then(({ error: dbErr }) => { if (dbErr) console.error('[AUTO-EMA] DB error:', dbErr); });
 
-    broadcast({ type: 'auto_ema', status: 'hedged', side: oppSide, buyPrice, profitCents });
+    broadcast({ type: 'auto_ema', status: isFinal ? 'hedged_all' : 'hedged_half', side: oppSide, buyPrice, profitCents, sharesToHedge, rideShares });
     autoEma.lastHedgeTime = Date.now();
-    _autoEmaAbort();
+
+    if (isFinal) {
+      // Position fully closed
+      _autoEmaAbort();
+    } else {
+      // Partial hedge done — go back to 'entered' so next tranche can fire
+      autoEma.phase = 'entered';
+      autoEma.busy = true;
+      console.log(`[AUTO-EMA] Partial hedge done — ${autoEma.hedgedShares}/${autoEma.totalShares}sh hedged, ${remainingShares - sharesToHedge}sh remaining (stop loss still active)`);
+    }
 
   } catch (e) {
     console.error('[AUTO-EMA] Hedge error:', e?.message ?? e);
@@ -1595,7 +1647,10 @@ function connectBinanceStream() {
           updateServerEma(newPrice);
         }
         const fGap = (serverEma.fE12 ?? 0) - (serverEma.fE26 ?? 0);
-        broadcast({ type: 'binance_btc', price: newPrice, ema: { e12: serverEma.fE12, e26: serverEma.fE26, gap: fGap, histogram: serverEma.fHistogram } });
+        // Compute current velocity for UI
+        const velOldest = _btcTicks.length > 0 ? _btcTicks[0] : null;
+        const velocity = velOldest ? newPrice - velOldest.price : 0;
+        broadcast({ type: 'binance_btc', price: newPrice, velocity, ema: { e12: serverEma.fE12, e26: serverEma.fE26, gap: fGap, histogram: serverEma.fHistogram } });
         if (changed) {
           checkEmaTrigger();
           checkEmaHedge();

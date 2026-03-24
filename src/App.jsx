@@ -721,21 +721,20 @@ export default function App() {
                   {autoEma.enabled ? 'ON' : 'OFF'}
                 </button>
               </div>
-              {/* Live EMA state — from WebSocket (tick-by-tick) */}
+              {/* Live velocity + EMA — from WebSocket (tick-by-tick) */}
               <div className="flex gap-3 text-[10px] font-mono flex-wrap">
-                <span className="text-cyan-400">EMA12: {serverEma?.e12 != null ? `$${serverEma.e12.toFixed(1)}` : '—'}</span>
-                <span className="text-purple-400">EMA26: {serverEma?.e26 != null ? `$${serverEma.e26.toFixed(1)}` : '—'}</span>
                 <span className={`font-bold ${
-                  Math.abs(serverEma?.gap || 0) >= (autoEma.gapOpenThreshold || 5)
-                    ? (serverEma?.gap || 0) > 0 ? 'text-green-400' : 'text-red-400'
+                  Math.abs(serverEma?.velocity || 0) >= 20
+                    ? (serverEma?.velocity || 0) > 0 ? 'text-green-400' : 'text-red-400'
                     : 'text-gray-500'
                 }`}>
-                  Gap: ${Math.abs(serverEma?.gap || 0).toFixed(1)} {(serverEma?.gap || 0) > 0 ? 'UP' : (serverEma?.gap || 0) < 0 ? 'DN' : ''}
-                  {Math.abs(serverEma?.gap || 0) >= (autoEma.gapOpenThreshold || 5) && ' OPEN'}
+                  Vel: ${(serverEma?.velocity || 0).toFixed(1)}/3s
+                  {Math.abs(serverEma?.velocity || 0) >= 20 && ' TRIGGER'}
                 </span>
-                <span className={`${(serverEma?.histogram || 0) > 0 ? 'text-green-400' : (serverEma?.histogram || 0) < 0 ? 'text-red-400' : 'text-gray-500'}`}>
-                  Hist: {(serverEma?.histogram || 0).toFixed(2)}
-                </span>
+                <span className="text-cyan-400">E12: ${(serverEma?.e12 || 0).toFixed(1)}</span>
+                <span className="text-purple-400">E26: ${(serverEma?.e26 || 0).toFixed(1)}</span>
+                <span className="text-gray-500">Gap: ${Math.abs(serverEma?.gap || 0).toFixed(1)}</span>
+                <span className="text-gray-500">Hist: {(serverEma?.histogram || 0).toFixed(2)}</span>
               </div>
               {autoEma.phase && (
                 <div className={`text-[10px] font-mono font-bold ${autoEma.phase === 'entered' ? 'text-yellow-400' : 'text-green-400'}`}>

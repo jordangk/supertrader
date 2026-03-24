@@ -48,7 +48,7 @@ export function useWebSocket() {
             setEvent(msg.event);
           } else if (msg.type === 'binance_btc') {
             setBinanceBtc(msg.price != null ? parseFloat(msg.price) : null);
-            if (msg.ema) setServerEma(msg.ema);
+            if (msg.ema) setServerEma(prev => ({ ...prev, ...msg.ema, velocity: msg.velocity ?? prev.velocity }));
           } else if (msg.type === 'auto-sell') {
             setAutoSell(msg);
           } else if (msg.type === 'refresh') {
