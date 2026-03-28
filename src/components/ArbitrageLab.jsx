@@ -62,8 +62,19 @@ export default function ArbitrageLab() {
   const [loadingDefaults, setLoadingDefaults] = useState(true);
   const [meta, setMeta] = useState({ kalshi: null, poly: null });
   const [campaignsList, setCampaignsList] = useState([]);
+  const [pnlData, setPnlData] = useState(null);
 
-  // Load campaigns on mount and every 5s
+  // Load P&L
+  useEffect(() => {
+    function loadPnl() {
+      fetch(`${API_BASE}/api/arb/pnl`).then(r => r.json()).then(d => setPnlData(d)).catch(() => {});
+    }
+    loadPnl();
+    const iv = setInterval(loadPnl, 15000);
+    return () => clearInterval(iv);
+  }, []);
+
+  // Load campaigns on mount and every 2s
   useEffect(() => {
     function loadCampaigns() {
       fetch(`${API_BASE}/api/arb/campaigns`)
@@ -614,11 +625,17 @@ export default function ArbitrageLab() {
       {/* Active campaigns */}
       {campaignsList.filter(c => c.status === 'running').length > 0 && (
         <div className="border border-gray-800 rounded-lg overflow-hidden">
-          <div className="bg-gray-900 px-2 py-1.5 text-[10px] text-gray-500 font-semibold flex justify-between">
-            <span>Active Campaigns</span>
-            <span>{campaignsList.filter(c => c.status === 'running').length} running</span>
+          <div className="bg-gray-900 px-2 py-1.5 text-[10px] font-semibold flex justify-between items-center">
+            <span className="text-gray-500">Active Campaigns</span>
+            {pnlData?.current && (
+              <span className={`text-xs font-bold ${Number(pnlData.current.profit) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                P&L: {Number(pnlData.current.profit) >= 0 ? '+' : ''}${Number(pnlData.current.profit).toFixed(2)}
+                <span className="text-gray-600 font-normal ml-1">(${Number(pnlData.current.total).toFixed(0)} total)</span>
+              </span>
+            )}
+            <span className="text-gray-500">{campaignsList.filter(c => c.status === 'running').length} running</span>
           </div>
-          <div className="divide-y divide-gray-800">
+          <div className="divide-y divide-gray-800 overflow-x-auto">
             {campaignsList.filter(c => c.status === 'running').map(c => (
               <div key={c.id} className="flex items-center gap-2 px-2 py-1.5 text-[10px] font-mono">
                 <button
@@ -681,6 +698,23 @@ export default function ArbitrageLab() {
                 >
                   stop
                 </button>
+                <span className="border-l border-gray-700 pl-1 flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => fetch(`${API_BASE}/api/arb/campaigns/${c.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ earlyExit: !c.early_exit }) })}
+                    className={`text-[9px] px-1 py-0.5 rounded ${c.early_exit ? 'bg-orange-700 text-white' : 'text-gray-600 hover:text-gray-400'}`}
+                  >
+                    exit
+                  </button>
+                  {c.early_exit && (
+                    <input
+                      type="number"
+                      defaultValue={c.exit_threshold_cents || 4}
+                      onBlur={(e) => fetch(`${API_BASE}/api/arb/campaigns/${c.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ exitThreshold: parseInt(e.target.value) || 4 }) })}
+                      className="w-7 bg-transparent border-b border-gray-700 text-center text-[9px] text-orange-400 focus:border-orange-500 outline-none"
+                    />
+                  )}
+                </span>
               </div>
             ))}
           </div>
