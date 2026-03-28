@@ -1,4 +1,13 @@
 import 'dotenv/config';
+
+// Prevent unhandled WS/stream errors from crashing the process
+process.on('uncaughtException', (err) => {
+  console.error('[UNCAUGHT]', err.message);
+});
+process.on('unhandledRejection', (err) => {
+  console.error('[UNHANDLED]', err?.message || err);
+});
+
 import express from 'express';
 import cors from 'cors';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -12,10 +21,20 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { execFile } from 'child_process';
+import { registerArbitrageRoutes } from './lib/arbitrageRoutes.mjs';
+import { startAutoRedeem } from './scripts/auto-redeem-poly.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const K9_COPY_STATE_FILE = path.join(__dirname, '.k9-copy-state.json');
+
+// ── Trade file logger ────────────────────────────────────────────────────
+const TRADE_LOG_FILE = path.join(__dirname, 'trade-log.jsonl');
+function logTrade(strategy, action, data) {
+  const entry = { ts: new Date().toISOString(), strategy, action, ...data };
+  fs.appendFileSync(TRADE_LOG_FILE, JSON.stringify(entry) + '\n');
+  console.log(`[TRADE-LOG] ${strategy} ${action}:`, JSON.stringify(data));
+}
 
 const app = express();
 const server = createServer(app);
@@ -23,6 +42,7 @@ const wss = new WebSocketServer({ server });
 
 app.use(cors());
 app.use(express.json());
+registerArbitrageRoutes(app, { getClobClient: () => clobClient });
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
@@ -71,13 +91,15 @@ async function initClobClient() {
       FUNDER_ADDRESS || undefined,
     );
     console.log('[CLOB] Client ready');
+    // Start auto-redeem for resolved Polymarket positions (every 60s)
+    startAutoRedeem(60000);
   } catch (e) {
     console.error('[CLOB] Failed to init client:', e.message);
   }
 }
 
 // ── USDC Allowance Check (funder = Safe that holds USDC) ──────────────────
-const POLYGON_RPC = 'https://polygon-mainnet.g.alchemy.com/v2/8kruQGYamUT6J4Ib0aMfw';
+const POLYGON_RPC = `https://polygon-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_KEY || '8kruQGYamUT6J4Ib0aMfw'}`;
 const USDC_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
 const CTF_EXCHANGE = '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E';
 const MAX_UINT256 = '0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff';
@@ -130,6 +152,514 @@ let liveState = {
   tokenDown: null,
   binanceBtc: null,
 };
+
+// ── ETH parallel event tracking (uses BTC price for EMA, ETH event for prices) ──
+let ethEvent = null;
+let ethClobWs = null;
+let liveStateEth = {
+  upPrice: null, downPrice: null,
+  upStartPrice: null, downStartPrice: null,
+  eventSlug: null, eventTitle: null,
+  tokenUp: null, tokenDown: null,
+};
+
+// ── ETH velocity strategy: BTC $10 in <1s → buy ETH, hedge 3s later ──
+const ETH_VEL_THRESHOLD = 10;      // $10 single-tick move
+let _ethPrevBtcPrice = null;        // previous Binance BTC tick price
+let autoEth = {
+  enabled: false,
+  busy: false,
+  priceMin: 30,
+  priceMax: 90,
+  shares: 5,
+  cooldownMs: 4000,
+  lastTriggerTime: 0,
+  phase: null,       // null | 'entered' | 'hedging'
+  entrySide: null,
+  entryPrice: null,
+  entryTime: null,
+  hedgeTimer: null,
+  log: [],
+};
+
+function checkEthVelocityTrigger() {
+  if (!autoEth.enabled) return;
+
+  // Phase: watching — after entry, check each BTC tick for reversal
+  if (autoEth.phase === 'watching') {
+    const btcNow = liveState.binanceBtc;
+    if (btcNow != null && autoEth.watchPrevPrice != null) {
+      const tickDir = btcNow - autoEth.watchPrevPrice;
+      autoEth.watchPrevPrice = btcNow;
+      // Same direction = hold, opposite or flat = hedge
+      const sameDir = (autoEth.entryDirection > 0 && tickDir > 0) || (autoEth.entryDirection < 0 && tickDir < 0);
+      if (!sameDir) {
+        console.log(`[ETH-VEL] BTC tick reversed (${tickDir >= 0 ? '+' : ''}${tickDir.toFixed(2)}) — hedging at 99¢`);
+        autoEth.phase = 'hedging';
+        fireEthHedge();
+      }
+    }
+    return;
+  }
+
+  if (autoEth.busy) return;
+  if (!ethEvent || !clobClient) return;
+  const now = Date.now();
+  if (now - autoEth.lastTriggerTime < autoEth.cooldownMs) return;
+
+  const btcNow = liveState.binanceBtc;
+  if (!btcNow) return;
+
+  // Single-tick trigger: compare to previous Binance tick
+  const prevPrice = _ethPrevBtcPrice;
+  _ethPrevBtcPrice = btcNow;
+  if (prevPrice == null) return;
+
+  const velocity = btcNow - prevPrice;
+  const absVelocity = Math.abs(velocity);
+
+  if (absVelocity < ETH_VEL_THRESHOLD) return;
+
+  // BTC up → ETH up, BTC down → ETH down
+  const winSide = velocity > 0 ? 'up' : 'down';
+  const winPrice = winSide === 'up' ? liveStateEth.upPrice : liveStateEth.downPrice;
+  const winCents = (winPrice ?? 0) * 100;
+
+  if (winPrice == null || winCents < autoEth.priceMin || winCents > autoEth.priceMax) return;
+
+  console.log(`[ETH-VEL] Trigger — BTC single tick $${velocity.toFixed(1)} → ETH ${winSide.toUpperCase()} @ ${winCents.toFixed(0)}¢`);
+  autoEth.busy = true;
+  autoEth.lastTriggerTime = now;
+  autoEth.log = [{ ts: now, side: winSide, velocity, entryPrice: null, hedgePrice: null, profit: null, result: 'pending' }, ...autoEth.log].slice(0, 20);
+  broadcast({ type: 'eth_auto', status: 'triggered', side: winSide, velocity });
+  fireEthEntry(winSide);
+}
+
+// Post entry at market (ask). If not filled in 10s, cancel and repost at ask+20¢ to force.
+async function fireEthEntry(side) {
+  if (!clobClient || !ethEvent) { _ethAbort('no_client'); return; }
+
+  const tokenId = side === 'up' ? liveStateEth.tokenUp : liveStateEth.tokenDown;
+  if (!tokenId) { _ethAbort('no_token'); return; }
+
+  const tickSize = ethEvent.tickSize || '0.01';
+  const tick = typeof tickSize === 'string' ? parseFloat(tickSize) : tickSize;
+  const negRisk = ethEvent.negRisk || false;
+
+  try {
+    const mkt = await fetchClobBidAsk(tokenId);
+    const askPrice = mkt.bestAsk ?? (side === 'up' ? liveStateEth.upPrice : liveStateEth.downPrice);
+    if (!askPrice || askPrice <= 0) { _ethAbort('no_price'); return; }
+
+    // Entry at market (ask price)
+    const buyPrice = Math.max(0.01, Math.min(Math.round(askPrice / tick) * tick, 0.99));
+
+    console.log(`[ETH-VEL] Entry: BUY ${side.toUpperCase()} ${autoEth.shares}sh @ ${(buyPrice*100).toFixed(0)}¢ (ask)`);
+    logTrade('eth-vel', 'entry', { side, buyPrice, shares: autoEth.shares, eventSlug: liveStateEth.eventSlug });
+    const signed = await clobClient.createOrder({ tokenID: tokenId, price: buyPrice, size: autoEth.shares, side: 'BUY' }, { tickSize: String(tick), negRisk });
+    const result = await clobClient.postOrder(signed, 'GTC');
+    const ok = result?.success || result?.status === 'matched' || result?.status === 'live';
+    const orderId = result?.orderID ?? result?.order_id;
+
+    if (!ok) { console.log('[ETH-VEL] Entry failed:', JSON.stringify(result)); _ethAbort('order_failed'); return; }
+
+    autoEth.entrySide = side;
+    autoEth.entryPrice = buyPrice;
+    autoEth.entryOrderId = orderId;
+
+    autoEth.phase = 'watching';  // wait for next BTC tick to decide hedge
+    autoEth.entryTime = Date.now();
+    autoEth.entryDirection = side === 'up' ? 1 : -1; // +1 = BTC was going up, -1 = down
+    autoEth.watchPrevPrice = liveState.binanceBtc;    // snapshot current BTC price
+    if (autoEth.log.length > 0) { autoEth.log[0].entryPrice = buyPrice; autoEth.log[0].result = 'entered'; }
+    console.log(`[ETH-VEL] Entry posted @ ${(buyPrice*100).toFixed(0)}¢ — watching BTC ticks, hedge on reversal`);
+    broadcast({ type: 'eth_auto', status: 'entered', side, buyPrice });
+
+  } catch (e) {
+    console.error('[ETH-VEL] Entry error:', e?.message);
+    _ethAbort();
+  }
+}
+
+// Hedge: always buy opposite at 99¢ to force immediate fill
+async function fireEthHedge() {
+  if (!clobClient || !ethEvent) { _ethAbort(); return; }
+
+  const oppSide = autoEth.entrySide === 'up' ? 'down' : 'up';
+  const tokenId = oppSide === 'up' ? liveStateEth.tokenUp : liveStateEth.tokenDown;
+  if (!tokenId) { _ethAbort(); return; }
+
+  const tickSize = ethEvent.tickSize || '0.01';
+  const tick = typeof tickSize === 'string' ? parseFloat(tickSize) : tickSize;
+  const negRisk = ethEvent.negRisk || false;
+
+  try {
+    const hedgePrice = 0.99; // force fill
+    const totalCost = Math.round((autoEth.entryPrice + hedgePrice) * 100);
+    const profitCents = 100 - totalCost;
+
+    console.log(`[ETH-VEL] Hedge: BUY ${oppSide.toUpperCase()} ${autoEth.shares}sh @ 99¢ (force, entry ${(autoEth.entryPrice*100).toFixed(0)}¢, ${profitCents >= 0 ? '+' : ''}${profitCents}¢)`);
+    logTrade('eth-vel', 'hedge', { side: oppSide, buyPrice: hedgePrice, shares: autoEth.shares, entryPrice: autoEth.entryPrice, profitCents, eventSlug: liveStateEth.eventSlug });
+    const signed = await clobClient.createOrder({ tokenID: tokenId, price: hedgePrice, size: autoEth.shares, side: 'BUY' }, { tickSize: String(tick), negRisk });
+    const result = await clobClient.postOrder(signed, 'GTC');
+    const ok = result?.success || result?.status === 'matched' || result?.status === 'live';
+
+    if (!ok) { console.log('[ETH-VEL] Hedge failed:', JSON.stringify(result)); _ethAbort(); return; }
+
+    console.log(`[ETH-VEL] Hedged @ 99¢ — ${profitCents >= 0 ? '+' : ''}${profitCents}¢`);
+    if (autoEth.log.length > 0) {
+      autoEth.log[0].hedgePrice = hedgePrice;
+      autoEth.log[0].profit = profitCents;
+      autoEth.log[0].result = `hedge ${profitCents >= 0 ? '+' : ''}${profitCents}¢`;
+    }
+    broadcast({ type: 'eth_auto', status: 'hedged', side: oppSide, hedgePrice, profitCents });
+    _ethAbort();
+
+  } catch (e) {
+    console.error('[ETH-VEL] Hedge error:', e?.message);
+    _ethAbort();
+  }
+}
+
+function _ethAbort(reason) {
+  if (reason) console.log(`[ETH-VEL] Abort: ${reason}`);
+  autoEth.busy = false;
+  autoEth.phase = null;
+  autoEth.entrySide = null;
+  autoEth.entryPrice = null;
+  if (autoEth.hedgeTimer) { clearTimeout(autoEth.hedgeTimer); autoEth.hedgeTimer = null; }
+}
+
+// ── Auto-ETH-EMA: same BTC EMA trigger, but trades ETH Polymarket tokens ──
+let autoEthEma = {
+  enabled: false,
+  shares: 5,
+  gapOpenThreshold: 5,
+  priceMin: 30,
+  priceMax: 55,
+  maxHedgeWaitMs: 30_000,
+  cooldownMs: 0,
+  busy: false,
+  phase: null,
+  entrySide: null,
+  entryOrderId: null,
+  hedgeOrderId: null,
+  takeProfitOrderId: null,
+  entryPrice: null,
+  entryTime: null,
+  oppPriceAtEntry: null,
+  stopLossOppPrice: null,
+  peakGap: 0,
+  peakProfit: 0,
+  btcAtEntry: null,
+  btcPeak: null,
+  lastTriggerTime: 0,
+  lastHedgeTime: 0,
+  lastEntrySide: null,
+  log: [],
+};
+
+function _autoEthEmaAbort(reason) {
+  if (clobClient) {
+    if (autoEthEma.takeProfitOrderId) clobClient.cancelOrder({ orderID: autoEthEma.takeProfitOrderId }).catch(() => {});
+    if (autoEthEma.entryOrderId) clobClient.cancelOrder({ orderID: autoEthEma.entryOrderId }).catch(() => {});
+  }
+  if (reason && autoEthEma.log.length > 0 && autoEthEma.log[0].result === 'pending') {
+    autoEthEma.log[0].result = reason;
+  }
+  autoEthEma.takeProfitPrice = null;
+  autoEthEma.lastTriggerTime = Date.now();
+  autoEthEma.busy = false;
+  autoEthEma.phase = null;
+  autoEthEma.entrySide = null;
+  autoEthEma.entryOrderId = null;
+  autoEthEma.hedgeOrderId = null;
+  autoEthEma.takeProfitOrderId = null;
+  autoEthEma.entryPrice = null;
+  autoEthEma.entryTime = null;
+  autoEthEma.oppPriceAtEntry = null;
+  autoEthEma.stopLossOppPrice = null;
+  autoEthEma.peakGap = 0;
+  autoEthEma.btcAtEntry = null;
+  autoEthEma.btcPeak = null;
+  autoEthEma.entryFillTime = null;
+  autoEthEma.peakProfit = 0;
+}
+
+let _lastEthEmaDebug = 0;
+function checkEthEmaTrigger(btcEmaCrossed, fGap) {
+  if (!autoEthEma.enabled || autoEthEma.busy) return;
+  if (!ethEvent || !clobClient) return;
+  if (Date.now() - autoEthEma.lastTriggerTime < 4_000) return; // 4s cooldown
+
+  const now = Date.now();
+  const fHist = serverEma.fHistogram ?? 0;
+
+  const winSide = fGap > 0 ? 'up' : 'down';
+  const winPrice = winSide === 'up' ? liveStateEth.upPrice : liveStateEth.downPrice;
+  const winCents = (winPrice ?? 0) * 100;
+
+  // Debug log every 10s
+  if (now - _lastEthEmaDebug > 10_000) {
+    _lastEthEmaDebug = now;
+    console.log(`[ETH-EMA-DBG] btcGap=$${fGap.toFixed(1)} hist=${fHist.toFixed(2)} ethWin=${winCents.toFixed(0)}¢ (${autoEthEma.priceMin}-${autoEthEma.priceMax})`);
+  }
+
+  // Same convergence trigger as BTC: gap near zero + closing fast
+  const absGap = Math.abs(fGap);
+  if (absGap > EMA_GAP_NEAR_THRESHOLD) return; // not close enough
+  const gapFrom3sAgo = _emaGapHistory.length > 0 ? _emaGapHistory[0].gap : fGap;
+  const gapNarrow = Math.abs(gapFrom3sAgo) - absGap;
+  if (gapNarrow < EMA_GAP_FROM_THRESHOLD) return; // hasn't narrowed fast enough
+
+  // Side: approaching cross = about to flip
+  const winSideAdj = fGap > 0 ? 'down' : 'up';
+  const winPriceAdj = winSideAdj === 'up' ? liveStateEth.upPrice : liveStateEth.downPrice;
+  const winCentsAdj = (winPriceAdj ?? 0) * 100;
+
+  // Price must be in range
+  if (winPriceAdj == null) return;
+  if (winCentsAdj < autoEthEma.priceMin || winCentsAdj > autoEthEma.priceMax) return;
+
+  console.log(`[ETH-EMA] Trigger — ${winSideAdj.toUpperCase()}, gap=$${fGap.toFixed(1)} (was $${gapFrom3sAgo.toFixed(1)} 3s ago, narrowed $${gapNarrow.toFixed(1)}), winning=${winCentsAdj.toFixed(0)}¢`);
+  logTrade('eth-ema', 'trigger', { side: winSideAdj, winCents: winCentsAdj, gap: fGap, gapNarrow, ethUp: liveStateEth.upPrice, ethDown: liveStateEth.downPrice });
+  autoEthEma.busy = true;
+  autoEthEma.lastTriggerTime = now;
+  autoEthEma.log = [{ ts: now, side: winSideAdj, triggerGap: fGap, gapNarrow, fHist, entryPrice: null, entryFillTime: null, hedgePrice: null, hedgeReason: null, hedgeTime: null, peakGap: 0, tpPrice: null, profit: null, result: 'pending' }, ...autoEthEma.log].slice(0, 20);
+  broadcast({ type: 'auto_eth_ema', status: 'triggered', side: winSideAdj, gap: fGap, gapNarrow });
+  fireEthEmaEntry(winSideAdj);
+}
+
+async function fireEthEmaEntry(side) {
+  if (!clobClient || !ethEvent) { _autoEthEmaAbort('no_client'); return; }
+
+  const tokenId = side === 'up' ? liveStateEth.tokenUp : liveStateEth.tokenDown;
+  if (!tokenId) { _autoEthEmaAbort('no_token'); return; }
+
+  const tickSize = ethEvent.tickSize || '0.01';
+  const tick = typeof tickSize === 'string' ? parseFloat(tickSize) : tickSize;
+  const negRisk = ethEvent.negRisk || false;
+  const sizeShares = 5;
+
+  try {
+    const mkt = await fetchClobBidAsk(tokenId);
+    const marketPrice = mkt.bestAsk ?? (side === 'up' ? liveStateEth.upPrice : liveStateEth.downPrice);
+    if (!marketPrice || marketPrice <= 0) { _autoEthEmaAbort('no_market_price'); return; }
+
+    const buyPrice = Math.max(0.01, Math.min(Math.round((marketPrice + 0.03) / tick) * tick, 0.99));
+
+    console.log(`[ETH-EMA] Entry: FAK BUY ${side.toUpperCase()} ${sizeShares}sh @ ${(buyPrice*100).toFixed(0)}¢ (ask ${(marketPrice*100).toFixed(0)}¢ +3¢)`);
+    const signedOrder = await clobClient.createOrder({ tokenID: tokenId, price: buyPrice, size: sizeShares, side: 'BUY' }, { tickSize: String(tick), negRisk });
+    const result = await clobClient.postOrder(signedOrder, 'FAK');
+    const ok = result?.success || result?.status === 'matched';
+    const orderId = result?.orderID ?? result?.order_id;
+
+    if (!ok) {
+      console.log('[ETH-EMA] Entry FAK didn\'t fill:', JSON.stringify(result));
+      _autoEthEmaAbort('fak_no_fill');
+      return;
+    }
+
+    console.log(`[ETH-EMA] Entry result: status=${result?.status}, orderId=${orderId}`);
+
+    const oppAskNow = side === 'up' ? liveStateEth.downPrice : liveStateEth.upPrice;
+    const stopLossOppPrice = (100 + 5 - Math.round(buyPrice * 100)) / 100;
+
+    autoEthEma.phase = 'entered';
+    autoEthEma.entrySide = side;
+    autoEthEma.lastEntrySide = side;
+    autoEthEma.entryOrderId = orderId;
+    autoEthEma.entryPrice = buyPrice;
+    autoEthEma.totalShares = sizeShares;
+    autoEthEma.hedgedShares = 0;
+    autoEthEma.entryTime = Date.now();
+    autoEthEma.entryFillTime = Date.now();
+    autoEthEma.oppPriceAtEntry = oppAskNow;
+    autoEthEma.stopLossOppPrice = stopLossOppPrice;
+    autoEthEma.peakGap = Math.abs((serverEma.fE12 ?? 0) - (serverEma.fE26 ?? 0));
+    autoEthEma.btcAtEntry = liveState.binanceBtc;
+    autoEthEma.btcPeak = liveState.binanceBtc;
+    autoEthEma.peakProfit = 0;
+
+    console.log(`[ETH-EMA] Stop loss locked: opp now=${(oppAskNow*100).toFixed(0)}¢, stop if opp ≥ ${(stopLossOppPrice*100).toFixed(0)}¢ (= -5¢ loss)`);
+
+    // DB insert
+    supabase.from('polymarket_trades').insert({
+      polymarket_event_id: null, direction: side,
+      purchase_price: buyPrice, purchase_amount: Math.round(sizeShares * buyPrice * 100) / 100,
+      purchase_time: new Date().toISOString(), minute: Math.floor(Date.now() / 60000),
+      btc_price_at_purchase: liveState.binanceBtc, order_type: 'live',
+      order_status: 'open', polymarket_order_id: orderId, shares: sizeShares,
+      notes: JSON.stringify({ type: 'auto-eth-ema-entry', side, buyPrice, gap: (serverEma.fE12 ?? 0) - (serverEma.fE26 ?? 0), eventSlug: liveStateEth.eventSlug, histogram: serverEma.fHistogram, e12: serverEma.fE12, e26: serverEma.fE26 }),
+    }).then(({ error: dbErr }) => { if (dbErr) console.error('[ETH-EMA] DB error:', dbErr); });
+
+    broadcast({ type: 'auto_eth_ema', status: 'entered', side, buyPrice, gap: (serverEma.fE12 ?? 0) - (serverEma.fE26 ?? 0) });
+    if (autoEthEma.log.length > 0) {
+      autoEthEma.log[0].entryPrice = buyPrice;
+      autoEthEma.log[0].entryFillTime = Date.now();
+      autoEthEma.log[0].result = 'entered';
+    }
+    console.log(`[ETH-EMA] ENTERED @ ${(buyPrice*100).toFixed(0)}¢ — hedge all on EMA cross back or gap $6`);
+    logTrade('eth-ema', 'entry', { side, buyPrice, shares: sizeShares, gap: (serverEma.fE12??0)-(serverEma.fE26??0), orderId, eventSlug: liveStateEth.eventSlug });
+  } catch (e) {
+    console.error('[ETH-EMA] Entry error:', e?.message ?? e);
+    _autoEthEmaAbort();
+  }
+}
+
+function checkEthEmaHedge() {
+  if (!autoEthEma.enabled || !autoEthEma.busy || autoEthEma.phase !== 'entered') return;
+  if (!ethEvent || !clobClient) return;
+
+  // Use BTC EMA (serverEma)
+  const fGap = (serverEma.fE12 ?? 0) - (serverEma.fE26 ?? 0);
+  const absFGap = Math.abs(fGap);
+  autoEthEma.peakGap = Math.max(autoEthEma.peakGap, absFGap);
+
+  const oppPrice = autoEthEma.entrySide === 'up' ? liveStateEth.downPrice : liveStateEth.upPrice;
+  if (oppPrice == null || autoEthEma.entryPrice == null) return;
+  const totalCostCents = Math.round((autoEthEma.entryPrice + oppPrice) * 100);
+  const profitCents = 100 - totalCostCents;
+  autoEthEma.peakProfit = Math.max(autoEthEma.peakProfit, profitCents);
+
+  const totalShares = autoEthEma.totalShares || 5;
+
+  // 1. EMA gap reaches $6: take profit
+  if (absFGap >= 6) {
+    const reason = `ema_gap_6(${profitCents}¢, gap=$${fGap.toFixed(1)})`;
+    console.log(`[ETH-EMA] EMA GAP $6 — hedge all ${totalShares}sh, profit=${profitCents}¢, gap=$${fGap.toFixed(1)}`);
+    _logEthEmaHedge(reason);
+    autoEthEma.phase = 'hedging';
+    fireEthEmaExit(reason, totalShares, true);
+    return;
+  }
+
+  // 2. EMA crosses back
+  const crossedBack = (autoEthEma.entrySide === 'up' && fGap < 0) ||
+                      (autoEthEma.entrySide === 'down' && fGap > 0);
+  if (crossedBack) {
+    const reason = `ema_cross_back(${profitCents}¢, gap=$${fGap.toFixed(1)})`;
+    console.log(`[ETH-EMA] EMA CROSS BACK — hedge all ${totalShares}sh, profit=${profitCents}¢, gap=$${fGap.toFixed(1)}`);
+    _logEthEmaHedge(reason);
+    autoEthEma.phase = 'hedging';
+    fireEthEmaExit(reason, totalShares, true);
+    return;
+  }
+}
+
+function _logEthEmaHedge(reason) {
+  if (autoEthEma.log.length > 0) {
+    autoEthEma.log[0].hedgeReason = reason;
+    autoEthEma.log[0].hedgeTime = Date.now();
+    autoEthEma.log[0].peakGap = autoEthEma.peakGap;
+    autoEthEma.log[0].peakProfit = autoEthEma.peakProfit;
+  }
+}
+
+async function fireEthEmaExit(reason, sharesToHedge, isFinal) {
+  if (!clobClient || !ethEvent) { _autoEthEmaAbort(); return; }
+
+  const oppSide = autoEthEma.entrySide === 'up' ? 'down' : 'up';
+  const tokenId = oppSide === 'up' ? liveStateEth.tokenUp : liveStateEth.tokenDown;
+  if (!tokenId) { _autoEthEmaAbort(); return; }
+
+  const tickSize = ethEvent.tickSize || '0.01';
+  const tick = typeof tickSize === 'string' ? parseFloat(tickSize) : tickSize;
+  const negRisk = ethEvent.negRisk || false;
+
+  try {
+    const mkt = await fetchClobBidAsk(tokenId);
+    const marketPrice = mkt.bestAsk ?? (oppSide === 'up' ? liveStateEth.upPrice : liveStateEth.downPrice);
+    if (!marketPrice || marketPrice <= 0) { _autoEthEmaAbort(); return; }
+
+    const buyPrice = Math.max(0.01, Math.min(Math.round((marketPrice - 0.01) / tick) * tick, 0.99));
+    const totalCost = Math.round((autoEthEma.entryPrice + buyPrice) * 100);
+    const profitCents = 100 - totalCost;
+
+    const totalShares = autoEthEma.totalShares || 5;
+    const rideShares = isFinal ? 0 : totalShares - sharesToHedge - (autoEthEma.hedgedShares || 0);
+
+    console.log(`[ETH-EMA] HEDGE: GTC BUY ${oppSide.toUpperCase()} ${sharesToHedge}sh @ ${(buyPrice*100).toFixed(0)}¢ (ask ${(marketPrice*100).toFixed(0)}¢ -1¢, entry ${(autoEthEma.entryPrice*100).toFixed(0)}¢, ${profitCents >= 0 ? '+' : ''}${profitCents}¢, reason=${reason})`);
+    logTrade('eth-ema', 'hedge', { side: oppSide, buyPrice, shares: sharesToHedge, entryPrice: autoEthEma.entryPrice, totalCost, profitCents, reason, eventSlug: liveStateEth.eventSlug });
+
+    const signedOrder = await clobClient.createOrder({ tokenID: tokenId, price: buyPrice, size: sharesToHedge, side: 'BUY' }, { tickSize: String(tick), negRisk });
+    const result = await clobClient.postOrder(signedOrder, 'GTC');
+    const ok = result?.success || result?.status === 'matched' || result?.status === 'live';
+    const orderId = result?.orderID ?? result?.order_id;
+
+    console.log(`[ETH-EMA] Hedge result: status=${result?.status}, orderId=${orderId}`);
+    if (!ok) {
+      console.log('[ETH-EMA] Hedge order failed, retrying in 2s:', JSON.stringify(result));
+      await new Promise(r => setTimeout(r, 2000));
+      return fireEthEmaExit(reason, sharesToHedge, isFinal);
+    }
+
+    // If resting (not filled immediately), wait 10s then cancel and FAK at current ask+3¢
+    if (result?.status === 'live' && orderId) {
+      console.log(`[ETH-EMA] Hedge resting — will force FAK +3¢ in 10s`);
+      await new Promise(resolve => setTimeout(resolve, 10_000));
+      try {
+        await clobClient.cancelOrder({ orderID: orderId });
+      } catch (e) { console.log(`[ETH-EMA] Cancel error (continuing): ${e?.message}`); }
+      // Retry FAK until filled
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        try {
+          const freshMkt = await fetchClobBidAsk(tokenId);
+          const freshAsk = freshMkt.bestAsk ?? (oppSide === 'up' ? liveStateEth.upPrice : liveStateEth.downPrice);
+          const fakPrice = Math.max(0.01, Math.min(Math.round((freshAsk + 0.03) / tick) * tick, 0.99));
+          console.log(`[ETH-EMA] Hedge force #${attempt}: FAK BUY ${oppSide.toUpperCase()} ${sharesToHedge}sh @ ${(fakPrice*100).toFixed(0)}¢ (ask ${(freshAsk*100).toFixed(0)}¢ +3¢)`);
+          const fakSigned = await clobClient.createOrder({ tokenID: tokenId, price: fakPrice, size: sharesToHedge, side: 'BUY' }, { tickSize: String(tick), negRisk });
+          const fakResult = await clobClient.postOrder(fakSigned, 'FAK');
+          const fakOk = fakResult?.success || fakResult?.status === 'matched';
+          logTrade('eth-ema', 'hedge-fak', { side: oppSide, price: fakPrice, shares: sharesToHedge, reason: `10s_force_#${attempt}` });
+          if (fakOk) break;
+          console.log(`[ETH-EMA] Force FAK #${attempt} didn't fill, retrying in 3s...`);
+          if (attempt < 5) await new Promise(r => setTimeout(r, 3000));
+        } catch (e) {
+          console.log(`[ETH-EMA] Force hedge #${attempt} error: ${e?.message}`);
+          if (attempt < 5) await new Promise(r => setTimeout(r, 3000));
+        }
+      }
+    }
+
+    autoEthEma.hedgedShares = (autoEthEma.hedgedShares || 0) + sharesToHedge;
+
+    if (autoEthEma.log.length > 0) {
+      autoEthEma.log[0].hedgePrice = buyPrice;
+      autoEthEma.log[0].profit = profitCents;
+      autoEthEma.log[0].hedgedShares = autoEthEma.hedgedShares;
+      autoEthEma.log[0].rideShares = isFinal ? 0 : rideShares;
+      autoEthEma.log[0].result = isFinal
+        ? `hedge ALL ${profitCents >= 0 ? '+' : ''}${profitCents}¢`
+        : `hedge ${sharesToHedge}sh ${profitCents >= 0 ? '+' : ''}${profitCents}¢, ride ${rideShares}sh`;
+    }
+
+    // DB insert
+    supabase.from('polymarket_trades').insert({
+      polymarket_event_id: null, direction: oppSide,
+      purchase_price: buyPrice, purchase_amount: Math.round(sharesToHedge * buyPrice * 100) / 100,
+      purchase_time: new Date().toISOString(), minute: Math.floor(Date.now() / 60000),
+      btc_price_at_purchase: liveState.binanceBtc, order_type: 'live',
+      order_status: 'open', polymarket_order_id: orderId, shares: sharesToHedge,
+      notes: JSON.stringify({ type: isFinal ? 'auto-eth-ema-hedge' : 'auto-eth-ema-hedge-partial', side: oppSide, buyPrice, sharesToHedge, rideShares, entryPrice: autoEthEma.entryPrice, entrySide: autoEthEma.entrySide, profitCents, peakProfit: autoEthEma.peakProfit, reason, eventSlug: liveStateEth.eventSlug, gap: (serverEma.fE12 ?? 0) - (serverEma.fE26 ?? 0), peakGap: autoEthEma.peakGap, histogram: serverEma.fHistogram }),
+    }).then(({ error: dbErr }) => { if (dbErr) console.error('[ETH-EMA] DB error:', dbErr); });
+
+    broadcast({ type: 'auto_eth_ema', status: isFinal ? 'hedged_all' : 'hedged_half', side: oppSide, buyPrice, profitCents, sharesToHedge, rideShares });
+    autoEthEma.lastHedgeTime = Date.now();
+
+    if (isFinal) {
+      _autoEthEmaAbort();
+    } else {
+      autoEthEma.phase = 'entered';
+      autoEthEma.busy = true;
+    }
+
+  } catch (e) {
+    console.error('[ETH-EMA] Hedge error, retrying in 3s:', e?.message ?? e);
+    await new Promise(r => setTimeout(r, 3000));
+    return fireEthEmaExit(reason, sharesToHedge, isFinal);
+  }
+}
 
 // ── Auto-scalp on BTC $5 move (Binance stream) ─────────────────────────────
 let autoScalp = {
@@ -312,10 +842,10 @@ const EMA12_ALPHA = 2 / 13;  // MACD fast (candle-based)
 const EMA26_ALPHA = 2 / 27;  // MACD slow (candle-based)
 const EMA9_ALPHA = 2 / 10;   // MACD signal line (candle-based)
 const MACD_CANDLE_MS = 2000;  // 2-second candles for entry
-// Fast tick-level alphas: ~10 ticks/sec, so multiply periods by 10
-const FAST_EMA12_ALPHA = 2 / (12 * 10 + 1);  // ~120 ticks ≈ 12s
-const FAST_EMA26_ALPHA = 2 / (26 * 10 + 1);  // ~260 ticks ≈ 26s
-const FAST_EMA9_ALPHA = 2 / (9 * 10 + 1);    // ~90 ticks ≈ 9s
+// Standard MACD alphas applied to tick data (same as chart)
+const FAST_EMA12_ALPHA = 2 / 13;   // standard EMA12
+const FAST_EMA26_ALPHA = 2 / 27;   // standard EMA26
+const FAST_EMA9_ALPHA = 2 / 10;    // standard signal line
 
 // EMA log buffer — flush to Supabase every 5s
 const _emaLogBuffer = [];
@@ -447,9 +977,15 @@ const _btcTicks = []; // { t: timestamp, price: number }
 const BTC_VELOCITY_WINDOW_MS = 3000;  // 3-second window
 const BTC_VELOCITY_THRESHOLD = 5;      // $5 move in 3s to trigger
 
-// Step 1: Enter on raw BTC velocity (no EMA lag)
+// EMA gap history — track gap over time to detect fast convergence
+const _emaGapHistory = []; // { t: timestamp, gap: number }
+const EMA_GAP_WINDOW_MS = 5000;   // look back 5 seconds
+const EMA_GAP_NEAR_THRESHOLD = 2; // gap must be within $2 of crossing
+const EMA_GAP_FROM_THRESHOLD = 2; // gap must have narrowed by at least $2 in 5s
+
+// Step 1: Enter when EMA gap is about to cross (near $0 + closing fast)
 let _lastEmaDebug = 0;
-function checkEmaTrigger() {
+function checkEmaTrigger(btcEmaCrossed, fGap) {
   if (!autoEma.enabled || autoEma.busy) return;
   if (!activeEvent || !clobClient) return;
   if (isNoTradeZone()) return;
@@ -469,36 +1005,43 @@ function checkEmaTrigger() {
   const velocity = btcNow - oldest.price; // positive = BTC going up
   const absVelocity = Math.abs(velocity);
 
-  // Also compute fast EMA gap for display/logging
-  const fGap = (serverEma.fE12 ?? 0) - (serverEma.fE26 ?? 0);
+  // Track EMA gap history for convergence detection
+  _emaGapHistory.push({ t: now, gap: fGap });
+  while (_emaGapHistory.length > 0 && now - _emaGapHistory[0].t > EMA_GAP_WINDOW_MS) _emaGapHistory.shift();
+
+  // fGap passed as parameter from shared BTC EMA cross detection
   const fHist = serverEma.fHistogram ?? 0;
 
-  const winSide = velocity > 0 ? 'up' : 'down';
+  // Determine side based on which direction the gap is converging toward
+  // If gap is positive and shrinking → EMA12 dropping toward EMA26 → bearish → buy Down
+  // If gap is negative and shrinking → EMA12 rising toward EMA26 → bullish → buy Up
+  // But we want to buy the side that will win AFTER the cross completes
+  const winSide = fGap > 0 ? 'down' : 'up'; // approaching cross = about to flip
   const winPrice = winSide === 'up' ? liveState.upPrice : liveState.downPrice;
   const winCents = (winPrice ?? 0) * 100;
 
   // Debug log every 10s
+  const gapFrom3sAgo = _emaGapHistory.length > 0 ? _emaGapHistory[0].gap : fGap;
+  const gapNarrow = Math.abs(gapFrom3sAgo) - Math.abs(fGap);
   if (now - _lastEmaDebug > 10_000) {
     _lastEmaDebug = now;
-    console.log(`[AUTO-EMA-DBG] vel=$${velocity.toFixed(1)}/${(BTC_VELOCITY_WINDOW_MS/1000)}s (need≥$${BTC_VELOCITY_THRESHOLD}) gap=$${fGap.toFixed(1)} (need≥$${autoEma.gapOpenThreshold}) hist=${fHist.toFixed(2)} win=${winCents.toFixed(0)}¢ (${autoEma.priceMin}-${autoEma.priceMax})`);
+    console.log(`[AUTO-EMA-DBG] gap=$${fGap.toFixed(1)} (near≤$${EMA_GAP_NEAR_THRESHOLD}) gapNarrow=$${gapNarrow.toFixed(1)}/3s (need≥$${EMA_GAP_FROM_THRESHOLD}) hist=${fHist.toFixed(2)} win=${winSide}@${winCents.toFixed(0)}¢ (${autoEma.priceMin}-${autoEma.priceMax})`);
   }
 
-  // Hybrid trigger: velocity ≥$15/3s AND EMA gap ≥$8 (both must be true)
-  if (absVelocity < BTC_VELOCITY_THRESHOLD) return;
-  const absFGap = Math.abs(fGap);
-  if (absFGap < autoEma.gapOpenThreshold) return;
-  // Velocity and gap must agree on direction
-  if ((velocity > 0 && fGap < 0) || (velocity < 0 && fGap > 0)) return;
+  // Trigger: gap is near zero AND it narrowed fast in the last 3 seconds
+  const absGap = Math.abs(fGap);
+  if (absGap > EMA_GAP_NEAR_THRESHOLD) return;  // not close enough to crossing
+  if (gapNarrow < EMA_GAP_FROM_THRESHOLD) return; // hasn't narrowed fast enough
 
   // Price must be in range (buy cheap, not expensive)
   if (winPrice == null) return;
   if (winCents < autoEma.priceMin || winCents > autoEma.priceMax) return;
 
-  console.log(`[AUTO-EMA] Trigger — ${winSide.toUpperCase()}, velocity=$${velocity.toFixed(1)}/${(BTC_VELOCITY_WINDOW_MS/1000)}s, winning=${winCents.toFixed(0)}¢, gap=$${fGap.toFixed(1)}`);
+  console.log(`[AUTO-EMA] Trigger — ${winSide.toUpperCase()}, gap=$${fGap.toFixed(1)} (was $${gapFrom3sAgo.toFixed(1)} 3s ago, narrowed $${gapNarrow.toFixed(1)}), winning=${winCents.toFixed(0)}¢`);
   autoEma.busy = true;
   autoEma.lastTriggerTime = now;
-  autoEma.log = [{ ts: now, side: winSide, triggerGap: fGap, fHist, velocity, entryPrice: null, entryFillTime: null, hedgePrice: null, hedgeReason: null, hedgeTime: null, peakGap: 0, tpPrice: null, profit: null, result: 'pending' }, ...autoEma.log].slice(0, 20);
-  broadcast({ type: 'auto_ema', status: 'triggered', side: winSide, gap: fGap, velocity });
+  autoEma.log = [{ ts: now, side: winSide, triggerGap: fGap, gapNarrow, fHist, velocity, entryPrice: null, entryFillTime: null, hedgePrice: null, hedgeReason: null, hedgeTime: null, peakGap: 0, tpPrice: null, profit: null, result: 'pending' }, ...autoEma.log].slice(0, 20);
+  broadcast({ type: 'auto_ema', status: 'triggered', side: winSide, gap: fGap, gapNarrow });
   fireAutoEmaEntry(winSide);
 }
 
@@ -520,17 +1063,17 @@ async function fireAutoEmaEntry(side) {
     const marketPrice = mkt.bestAsk ?? (side === 'up' ? liveState.upPrice : liveState.downPrice);
     if (!marketPrice || marketPrice <= 0) { _autoEmaAbort('no_market_price'); return; }
 
-    const buyPrice = Math.max(0.01, Math.min(Math.round(marketPrice / tick) * tick, 0.99));
+    const buyPrice = Math.max(0.01, Math.min(Math.round((marketPrice + 0.03) / tick) * tick, 0.99));
 
-    console.log(`[AUTO-EMA] Entry: BUY ${side.toUpperCase()} ${sizeShares}sh @ ${(buyPrice*100).toFixed(0)}¢ (ask ${(marketPrice*100).toFixed(0)}¢)`);
+    console.log(`[AUTO-EMA] Entry: FAK BUY ${side.toUpperCase()} ${sizeShares}sh @ ${(buyPrice*100).toFixed(0)}¢ (ask ${(marketPrice*100).toFixed(0)}¢ +3¢)`);
     const signedOrder = await clobClient.createOrder({ tokenID: tokenId, price: buyPrice, size: sizeShares, side: 'BUY' }, { tickSize, negRisk });
-    const result = await clobClient.postOrder(signedOrder, 'GTC');
-    const ok = result?.success || result?.status === 'matched' || result?.status === 'live';
+    const result = await clobClient.postOrder(signedOrder, 'FAK');
+    const ok = result?.success || result?.status === 'matched';
     const orderId = result?.orderID ?? result?.order_id;
 
     if (!ok) {
-      console.log('[AUTO-EMA] Entry order failed:', JSON.stringify(result));
-      _autoEmaAbort('order_failed');
+      console.log('[AUTO-EMA] Entry FAK didn\'t fill:', JSON.stringify(result));
+      _autoEmaAbort('fak_no_fill');
       return;
     }
 
@@ -574,83 +1117,50 @@ async function fireAutoEmaEntry(side) {
       autoEma.log[0].entryFillTime = Date.now();
       autoEma.log[0].result = 'entered';
     }
-    console.log(`[AUTO-EMA] ENTERED @ ${(buyPrice*100).toFixed(0)}¢ — 50% hedge at profit, 50% ride to resolution, stop -5¢ all`);
+    console.log(`[AUTO-EMA] ENTERED @ ${(buyPrice*100).toFixed(0)}¢ — hedge on EMA cross back or gap $6`);
+    logTrade('btc-ema', 'entry', { side, buyPrice, shares: sizeShares, gap: serverEma.gap, fGap: (serverEma.fE12??0)-(serverEma.fE26??0), orderId, eventSlug: liveState.eventSlug });
   } catch (e) {
     console.error('[AUTO-EMA] Entry error:', e?.message ?? e);
     _autoEmaAbort();
   }
 }
 
-// Scaled exit: hedge in 3 tranches at +1¢, +3¢, and EMA wave end (MACD cross)
-// Stop loss -5¢ hedges ALL remaining at any time
-// Tranches: 2sh @ +1¢, 2sh @ +3¢, 1sh @ MACD cross
+// Exit: hedge ALL 5sh when EMA crosses back OR gap reaches $6. Stop loss -5¢.
 function checkEmaHedge() {
-  if (!autoEma.enabled || !autoEma.busy) return;
-  if (autoEma.phase !== 'entered') return;
+  if (!autoEma.enabled || !autoEma.busy || autoEma.phase !== 'entered') return;
   if (!activeEvent || !clobClient) return;
 
-  const absGap = Math.abs(serverEma.gap);
-  autoEma.peakGap = Math.max(autoEma.peakGap, absGap);
+  const fGap = (serverEma.fE12 ?? 0) - (serverEma.fE26 ?? 0);
+  const absFGap = Math.abs(fGap);
+  autoEma.peakGap = Math.max(autoEma.peakGap, absFGap);
 
   const oppPrice = autoEma.entrySide === 'up' ? liveState.downPrice : liveState.upPrice;
   if (oppPrice == null || autoEma.entryPrice == null) return;
   const totalCostCents = Math.round((autoEma.entryPrice + oppPrice) * 100);
   const profitCents = 100 - totalCostCents;
-
   autoEma.peakProfit = Math.max(autoEma.peakProfit, profitCents);
 
-  const hedgedSoFar = autoEma.hedgedShares || 0;
   const totalShares = autoEma.totalShares || 5;
-  const remainingShares = totalShares - hedgedSoFar;
-  if (remainingShares <= 0) { _autoEmaAbort(); return; }
 
-  // 0. STOP LOSS -5¢: hedge ALL remaining shares immediately
-  if (autoEma.stopLossOppPrice && oppPrice >= autoEma.stopLossOppPrice) {
-    const reason = `stop_loss(${profitCents}¢, opp=${(oppPrice*100).toFixed(0)}¢≥${(autoEma.stopLossOppPrice*100).toFixed(0)}¢)`;
-    console.log(`[AUTO-EMA] STOP LOSS ALL ${remainingShares}sh — profit=${profitCents}¢`);
+  // 1. EMA gap reaches $6: take profit, ride is done
+  if (absFGap >= 6) {
+    const reason = `ema_gap_6(${profitCents}¢, gap=$${fGap.toFixed(1)})`;
+    console.log(`[AUTO-EMA] EMA GAP $6 — hedge all ${totalShares}sh, profit=${profitCents}¢, gap=$${fGap.toFixed(1)}`);
     _logHedge(reason);
     autoEma.phase = 'hedging';
-    fireAutoEmaExit(reason, remainingShares, true);
+    fireAutoEmaExit(reason, totalShares, true);
     return;
   }
 
-  // Scaled hedge tranches: [profitThreshold, shares]
-  // Tranche 1: +1¢ → hedge 2sh, Tranche 2: +3¢ → hedge 2sh, Tranche 3: MACD cross → hedge 1sh
-  const hedgeTranches = [
-    { at: 1, shares: 2 },   // hedge 2sh when profit hits +1¢
-    { at: 3, shares: 2 },   // hedge 2sh when profit hits +3¢
-  ];
-
-  // 1. Check profit-based tranches
-  let sharesForThisTranche = 0;
-  let trancheLabel = '';
-  for (const tr of hedgeTranches) {
-    const cumShares = tr.at === 1 ? 2 : 4; // cumulative: 2 after +1¢, 4 after +3¢
-    if (hedgedSoFar < cumShares && profitCents >= tr.at) {
-      sharesForThisTranche = Math.min(tr.shares, cumShares - hedgedSoFar);
-      trancheLabel = `+${tr.at}¢`;
-      break; // do one tranche at a time
-    }
-  }
-
-  if (sharesForThisTranche > 0) {
-    const reason = `scaled_hedge(${trancheLabel}, ${profitCents}¢, ${sharesForThisTranche}sh)`;
-    console.log(`[AUTO-EMA] SCALED HEDGE ${sharesForThisTranche}sh @ ${trancheLabel} — profit=${profitCents}¢, hedged=${hedgedSoFar}→${hedgedSoFar + sharesForThisTranche}/${totalShares}`);
-    _logHedge(reason);
-    autoEma.phase = 'hedging'; // temporarily while placing order
-    fireAutoEmaExit(reason, sharesForThisTranche, false);
-    return;
-  }
-
-  // 2. EMA gap hits $10: hedge remaining shares (ride the wave to $10)
-  const fGap = (serverEma.fE12 ?? 0) - (serverEma.fE26 ?? 0);
-  const absFGap = Math.abs(fGap);
-  if (hedgedSoFar >= 4 && absFGap >= 10) {
-    const reason = `ema_gap_10(${profitCents}¢, gap=$${absFGap.toFixed(1)}, ${remainingShares}sh)`;
-    console.log(`[AUTO-EMA] EMA GAP $10 — hedge last ${remainingShares}sh, profit=${profitCents}¢, gap=$${absFGap.toFixed(1)}`);
+  // 2. EMA crosses back (gap flips sign against entry direction)
+  const crossedBack = (autoEma.entrySide === 'up' && fGap < 0) ||
+                      (autoEma.entrySide === 'down' && fGap > 0);
+  if (crossedBack) {
+    const reason = `ema_cross_back(${profitCents}¢, gap=$${fGap.toFixed(1)})`;
+    console.log(`[AUTO-EMA] EMA CROSS BACK — hedge all ${totalShares}sh, profit=${profitCents}¢, gap=$${fGap.toFixed(1)}`);
     _logHedge(reason);
     autoEma.phase = 'hedging';
-    fireAutoEmaExit(reason, remainingShares, true);
+    fireAutoEmaExit(reason, totalShares, true);
     return;
   }
 }
@@ -683,14 +1193,15 @@ async function fireAutoEmaExit(reason, sharesToHedge, isFinal) {
     const marketPrice = mkt.bestAsk ?? (oppSide === 'up' ? liveState.upPrice : liveState.downPrice);
     if (!marketPrice || marketPrice <= 0) { _autoEmaAbort(); return; }
 
-    const buyPrice = Math.max(0.01, Math.min(Math.round(marketPrice / tick) * tick, 0.99));
+    const buyPrice = Math.max(0.01, Math.min(Math.round((marketPrice - 0.01) / tick) * tick, 0.99));
     const totalCost = Math.round((autoEma.entryPrice + buyPrice) * 100);
     const profitCents = 100 - totalCost;
 
     const totalShares = autoEma.totalShares || 5;
     const rideShares = isFinal ? 0 : totalShares - sharesToHedge - (autoEma.hedgedShares || 0);
 
-    console.log(`[AUTO-EMA] HEDGE: BUY ${oppSide.toUpperCase()} ${sharesToHedge}sh @ ${(buyPrice*100).toFixed(0)}¢ (entry avg ${(autoEma.entryPrice*100).toFixed(1)}¢ + ${(buyPrice*100).toFixed(0)}¢ = ${totalCost}¢, ${profitCents >= 0 ? '+' : ''}${profitCents}¢/sh, ${isFinal ? 'FINAL' : `ride ${rideShares}sh to resolution`}, reason=${reason})`);
+    console.log(`[AUTO-EMA] HEDGE: GTC BUY ${oppSide.toUpperCase()} ${sharesToHedge}sh @ ${(buyPrice*100).toFixed(0)}¢ (ask ${(marketPrice*100).toFixed(0)}¢ -1¢, entry ${(autoEma.entryPrice*100).toFixed(0)}¢, ${profitCents >= 0 ? '+' : ''}${profitCents}¢, reason=${reason})`);
+    logTrade('btc-ema', 'hedge', { side: oppSide, buyPrice, shares: sharesToHedge, entryPrice: autoEma.entryPrice, totalCost, profitCents, reason, eventSlug: liveState.eventSlug });
 
     const signedOrder = await clobClient.createOrder({ tokenID: tokenId, price: buyPrice, size: sharesToHedge, side: 'BUY' }, { tickSize, negRisk });
     const result = await clobClient.postOrder(signedOrder, 'GTC');
@@ -698,7 +1209,39 @@ async function fireAutoEmaExit(reason, sharesToHedge, isFinal) {
     const orderId = result?.orderID ?? result?.order_id;
 
     console.log(`[AUTO-EMA] Hedge result: status=${result?.status}, orderId=${orderId}`);
-    if (!ok) { console.log('[AUTO-EMA] Hedge order failed:', JSON.stringify(result)); _autoEmaAbort(); return; }
+    if (!ok) {
+      console.log('[AUTO-EMA] Hedge order failed, retrying in 2s:', JSON.stringify(result));
+      await new Promise(r => setTimeout(r, 2000));
+      return fireAutoEmaExit(reason, sharesToHedge, isFinal);
+    }
+
+    // If resting (not filled immediately), wait 10s then cancel and FAK at current ask+3¢
+    if (result?.status === 'live' && orderId) {
+      console.log(`[AUTO-EMA] Hedge resting — will force FAK +3¢ in 10s`);
+      await new Promise(resolve => setTimeout(resolve, 10_000));
+      try {
+        await clobClient.cancelOrder({ orderID: orderId });
+      } catch (e) { console.log(`[AUTO-EMA] Cancel error (continuing): ${e?.message}`); }
+      // Retry FAK until filled
+      for (let attempt = 1; attempt <= 5; attempt++) {
+        try {
+          const freshMkt = await fetchClobBidAsk(tokenId);
+          const freshAsk = freshMkt.bestAsk ?? (oppSide === 'up' ? liveState.upPrice : liveState.downPrice);
+          const fakPrice = Math.max(0.01, Math.min(Math.round((freshAsk + 0.03) / tick) * tick, 0.99));
+          console.log(`[AUTO-EMA] Hedge force #${attempt}: FAK BUY ${oppSide.toUpperCase()} ${sharesToHedge}sh @ ${(fakPrice*100).toFixed(0)}¢ (ask ${(freshAsk*100).toFixed(0)}¢ +3¢)`);
+          const fakSigned = await clobClient.createOrder({ tokenID: tokenId, price: fakPrice, size: sharesToHedge, side: 'BUY' }, { tickSize, negRisk });
+          const fakResult = await clobClient.postOrder(fakSigned, 'FAK');
+          const fakOk = fakResult?.success || fakResult?.status === 'matched';
+          logTrade('btc-ema', 'hedge-fak', { side: oppSide, price: fakPrice, shares: sharesToHedge, reason: `10s_force_#${attempt}` });
+          if (fakOk) break;
+          console.log(`[AUTO-EMA] Force FAK #${attempt} didn't fill, retrying in 3s...`);
+          if (attempt < 5) await new Promise(r => setTimeout(r, 3000));
+        } catch (e) {
+          console.log(`[AUTO-EMA] Force hedge #${attempt} error: ${e?.message}`);
+          if (attempt < 5) await new Promise(r => setTimeout(r, 3000));
+        }
+      }
+    }
 
     autoEma.hedgedShares = (autoEma.hedgedShares || 0) + sharesToHedge;
 
@@ -736,8 +1279,9 @@ async function fireAutoEmaExit(reason, sharesToHedge, isFinal) {
     }
 
   } catch (e) {
-    console.error('[AUTO-EMA] Hedge error:', e?.message ?? e);
-    _autoEmaAbort();
+    console.error('[AUTO-EMA] Hedge error, retrying in 3s:', e?.message ?? e);
+    await new Promise(r => setTimeout(r, 3000));
+    return fireAutoEmaExit(reason, sharesToHedge, isFinal);
   }
 }
 
@@ -1624,6 +2168,110 @@ function connectClobStream(tokenIds) {
   clobWs.on('error', (e) => console.error('[CLOB WS] error:', e.message));
 }
 
+// ── ETH event: auto-detect + CLOB WS ──────────────────────────────────────
+async function fetchActiveEthEvent() {
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const slot = Math.floor(now / 900) * 900;
+    const slug = `eth-updown-15m-${slot}`;
+    const res = await fetch(`https://gamma-api.polymarket.com/events?slug=${slug}`);
+    const data = await res.json();
+    const event = Array.isArray(data) ? data[0] : data;
+    if (!event) return null;
+    const market = event.markets?.[0];
+    if (!market) return null;
+    const tokenIds = typeof market.clobTokenIds === 'string' ? JSON.parse(market.clobTokenIds) : market.clobTokenIds;
+    console.log(`[ETH EVENT] Found: ${event.slug} — ${event.title}`);
+    return {
+      slug: event.slug, title: event.title,
+      tokenUp: tokenIds[0], tokenDown: tokenIds[1],
+      tickSize: market.orderPriceMinTickSize || '0.01',
+      negRisk: !!market.negRisk,
+    };
+  } catch (e) {
+    console.error('[ETH EVENT] fetch error:', e.message);
+    return null;
+  }
+}
+
+function connectEthClobStream(tokenIds) {
+  if (ethClobWs) ethClobWs.close();
+  ethClobWs = new WebSocket('wss://ws-subscriptions-clob.polymarket.com/ws/market');
+
+  ethClobWs.on('open', () => {
+    console.log('[ETH CLOB WS] connected');
+    ethClobWs.send(JSON.stringify({ assets_ids: tokenIds, type: 'market' }));
+  });
+
+  ethClobWs.on('message', (raw) => {
+    try {
+      const msgs = JSON.parse(raw);
+      const arr = Array.isArray(msgs) ? msgs : [msgs];
+      let changed = false;
+      for (const msg of arr) {
+        let price = null;
+        const assetId = msg.asset_id || msg.market;
+        if (msg.event_type === 'price_change' || msg.type === 'price_change') price = parseFloat(msg.price);
+        else if (msg.event_type === 'last_trade_price' || msg.type === 'last_trade_price') price = parseFloat(msg.price);
+        if (price != null && !isNaN(price) && price > 0 && price < 1) {
+          if (assetId === liveStateEth.tokenUp) {
+            liveStateEth.upPrice = price;
+            if (liveStateEth.upStartPrice == null) liveStateEth.upStartPrice = price;
+            changed = true;
+          } else if (assetId === liveStateEth.tokenDown) {
+            liveStateEth.downPrice = price;
+            if (liveStateEth.downStartPrice == null) liveStateEth.downStartPrice = price;
+            changed = true;
+          }
+        }
+      }
+      if (changed) {
+        broadcast({ type: 'eth_prices', ...liveStateEth });
+      }
+    } catch {}
+  });
+
+  ethClobWs.on('close', () => {
+    console.log('[ETH CLOB WS] disconnected, reconnecting in 3s...');
+    setTimeout(() => { if (liveStateEth.tokenUp) connectEthClobStream([liveStateEth.tokenUp, liveStateEth.tokenDown]); }, 3000);
+  });
+  ethClobWs.on('error', (e) => console.error('[ETH CLOB WS] error:', e.message));
+}
+
+async function refreshEthEvent() {
+  const event = await fetchActiveEthEvent();
+  if (!event) { console.log('[ETH EVENT] No active ETH event found'); return; }
+  ethEvent = event;
+  liveStateEth.eventSlug = event.slug;
+  liveStateEth.eventTitle = event.title;
+  liveStateEth.tokenUp = event.tokenUp;
+  liveStateEth.tokenDown = event.tokenDown;
+  liveStateEth.upPrice = null;
+  liveStateEth.downPrice = null;
+  liveStateEth.upStartPrice = null;
+  liveStateEth.downStartPrice = null;
+  broadcast({ type: 'eth_event', event });
+  connectEthClobStream([event.tokenUp, event.tokenDown]);
+  // Fetch initial prices
+  try {
+    const [upP, downP] = await Promise.all([fetchClobPrice(event.tokenUp), fetchClobPrice(event.tokenDown)]);
+    if (upP != null) liveStateEth.upPrice = upP;
+    if (downP != null) liveStateEth.downPrice = downP;
+    broadcast({ type: 'eth_prices', ...liveStateEth });
+  } catch {}
+}
+
+// Schedule ETH event refresh alongside BTC
+let ethEventTimer = null;
+function scheduleEthEvent() {
+  if (ethEventTimer) clearTimeout(ethEventTimer);
+  const now = Date.now();
+  const nowSecs = Math.floor(now / 1000);
+  const nextSlot = (Math.floor(nowSecs / 900) + 1) * 900;
+  const delay = (nextSlot * 1000) - now + 3000; // 3s after slot boundary
+  ethEventTimer = setTimeout(() => { refreshEthEvent(); scheduleEthEvent(); }, delay);
+}
+
 // ── Binance BTC/USDT real-time price ─────────────────────────────────────
 let binanceWs = null;
 let binanceRetryDelay = 3000;
@@ -1652,8 +2300,16 @@ function connectBinanceStream() {
         const velocity = velOldest ? newPrice - velOldest.price : 0;
         broadcast({ type: 'binance_btc', price: newPrice, velocity, ema: { e12: serverEma.fE12, e26: serverEma.fE26, gap: fGap, histogram: serverEma.fHistogram } });
         if (changed) {
-          checkEmaTrigger();
+          // Compute BTC EMA cross ONCE — shared by both BTC and ETH strategies
+          const prevFGap = serverEma._prevFGap ?? 0;
+          const btcEmaCrossed = (prevFGap <= 0 && fGap > 0) || (prevFGap >= 0 && fGap < 0);
+          serverEma._prevFGap = fGap;
+
+          checkEmaTrigger(btcEmaCrossed, fGap);
           checkEmaHedge();
+          checkEthVelocityTrigger();
+          checkEthEmaTrigger(btcEmaCrossed, fGap);
+          checkEthEmaHedge();
         }
         // if (changed) pushSnapshot(); // paused
         // Auto-scalp: $threshold BTC move arms, then wait 500ms of stability to fire
@@ -3933,6 +4589,17 @@ app.post('/api/auto-flow', (req, res) => {
 });
 
 // ── Auto-EMA endpoints ───────────────────────────────────────────────────────
+app.get('/api/eth-state', (req, res) => {
+  res.json({ event: ethEvent, prices: liveStateEth, autoEth });
+});
+
+app.post('/api/eth-auto', (req, res) => {
+  const { enabled } = req.body;
+  if (enabled != null) autoEth.enabled = !!enabled;
+  console.log(`[ETH-VEL] ${autoEth.enabled ? 'ON' : 'OFF'} — BTC single tick $${ETH_VEL_THRESHOLD} → ETH, hedge immediately at 99¢, price ${autoEth.priceMin}-${autoEth.priceMax}¢`);
+  res.json(autoEth);
+});
+
 app.get('/api/auto-ema', (req, res) => {
   res.json({
     ...autoEma,
@@ -3956,6 +4623,44 @@ app.post('/api/auto-ema', (req, res) => {
   }
   console.log(`[AUTO-EMA] ${autoEma.enabled ? 'ON' : 'OFF'} — gap≥$${autoEma.gapOpenThreshold} (open & close) price=${autoEma.priceMin}-${autoEma.priceMax}¢ hedgeWait=${autoEma.maxHedgeWaitMs/1000}s`);
   res.json({ success: true, ...autoEma });
+});
+
+// ── ETH EMA endpoints ───────────────────────────────────────────────────────
+app.get('/api/eth-ema-state', (req, res) => {
+  const fGap = (serverEma.fE12 ?? 0) - (serverEma.fE26 ?? 0);
+  res.json({
+    ...autoEthEma,
+    ema: { e12: serverEma.fE12, e26: serverEma.fE26, gap: fGap, histogram: serverEma.fHistogram },
+  });
+});
+
+app.post('/api/eth-ema', (req, res) => {
+  const { enabled, gapOpenThreshold, priceMin, priceMax, maxHedgeWaitMs, cooldownMs } = req.body;
+  if (typeof enabled === 'boolean') autoEthEma.enabled = enabled;
+  if (gapOpenThreshold != null) autoEthEma.gapOpenThreshold = Math.max(1, Math.min(50, parseFloat(gapOpenThreshold) || 5));
+  if (priceMin != null) autoEthEma.priceMin = Math.max(1, Math.min(99, parseInt(priceMin) || 25));
+  if (priceMax != null) autoEthEma.priceMax = Math.max(1, Math.min(99, parseInt(priceMax) || 85));
+  if (maxHedgeWaitMs != null) autoEthEma.maxHedgeWaitMs = Math.max(5000, Math.min(120000, parseInt(maxHedgeWaitMs) || 30000));
+  if (cooldownMs != null) autoEthEma.cooldownMs = Math.max(0, Math.min(300000, parseInt(cooldownMs) ?? 0));
+  if (enabled) {
+    _autoEthEmaAbort();
+    autoEthEma.enabled = true;
+  } else if (enabled === false) {
+    _autoEthEmaAbort();
+  }
+  console.log(`[ETH-EMA] ${autoEthEma.enabled ? 'ON' : 'OFF'} — gap≥$${autoEthEma.gapOpenThreshold} price=${autoEthEma.priceMin}-${autoEthEma.priceMax}¢ hedgeWait=${autoEthEma.maxHedgeWaitMs/1000}s`);
+  res.json({ success: true, ...autoEthEma });
+});
+
+app.get('/api/trade-log', (req, res) => {
+  try {
+    if (!fs.existsSync(TRADE_LOG_FILE)) return res.json([]);
+    const lines = fs.readFileSync(TRADE_LOG_FILE, 'utf-8').trim().split('\n').filter(Boolean);
+    const entries = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    res.json(entries.slice(-200).reverse());
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ── Hedged trade log (Auto-EMA, Auto-Scalp, Auto-Flow — all profitable cycle records) ─
@@ -4599,8 +5304,58 @@ async function pushSnapshot() {
   });
 }
 
+const ethSnapshotBuffer = [];
+
+async function pushEthSnapshot() {
+  if (!liveStateEth.eventSlug) return;
+  // Do not require liveState.binanceBtc — otherwise no rows are written until BTC WS connects,
+  // and Polymarket up/down never persist to eth_15m_snapshots for the chart.
+  const endDate = ethEvent?.endDate ? new Date(ethEvent.endDate) : null;
+  const secsLeft = endDate ? Math.max(0, Math.floor((endDate - Date.now()) / 1000)) : 0;
+
+  // Fetch ETH Binance price
+  let ethPrice = null;
+  try {
+    const res = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT').then(r => r.json()).catch(() => null);
+    ethPrice = res?.price ? parseFloat(res.price) : null;
+  } catch {}
+
+  let upBid = null, upAsk = null, downBid = null, downAsk = null;
+  try {
+    const upToken = liveStateEth.tokenUp;
+    const downToken = liveStateEth.tokenDown;
+    if (upToken && downToken) {
+      const [ubr, uar, dbr, dar] = await Promise.all([
+        fetch(`https://clob.polymarket.com/price?token_id=${upToken}&side=buy`).then(r => r.json()).catch(() => null),
+        fetch(`https://clob.polymarket.com/price?token_id=${upToken}&side=sell`).then(r => r.json()).catch(() => null),
+        fetch(`https://clob.polymarket.com/price?token_id=${downToken}&side=buy`).then(r => r.json()).catch(() => null),
+        fetch(`https://clob.polymarket.com/price?token_id=${downToken}&side=sell`).then(r => r.json()).catch(() => null),
+      ]);
+      upBid = ubr?.price ? parseFloat(ubr.price) : null;
+      upAsk = uar?.price ? parseFloat(uar.price) : null;
+      downBid = dbr?.price ? parseFloat(dbr.price) : null;
+      downAsk = dar?.price ? parseFloat(dar.price) : null;
+    }
+  } catch (e) { /* ignore */ }
+
+  ethSnapshotBuffer.push({
+    event_slug: liveStateEth.eventSlug,
+    eth_price: ethPrice,
+    up_cost: liveStateEth.upPrice,
+    down_cost: liveStateEth.downPrice,
+    up_best_bid: upBid,
+    up_best_ask: upAsk,
+    down_best_bid: downBid,
+    down_best_ask: downAsk,
+    up_spread: upBid != null && upAsk != null ? Number((upAsk - upBid).toFixed(4)) : null,
+    down_spread: downBid != null && downAsk != null ? Number((downAsk - downBid).toFixed(4)) : null,
+    observed_at: new Date().toISOString(),
+    seconds_left: secsLeft,
+  });
+}
+
 // Capture a snapshot every 5s (was 1s — reduced to lower Supabase + Polymarket API load)
-setInterval(() => { pushSnapshot(); }, 5000);
+setInterval(() => { pushSnapshot(); pushEthSnapshot(); }, 5000);
 
 // Flush buffer to Supabase every 5s
 setInterval(async () => {
@@ -4611,6 +5366,18 @@ setInterval(async () => {
     if (error) console.error('[SNAPSHOT] batch error:', error.message);
   } catch (e) {
     console.error('[SNAPSHOT] flush error:', e.message);
+  }
+}, 5000);
+
+// Flush ETH snapshot buffer to Supabase every 5s
+setInterval(async () => {
+  if (!ethSnapshotBuffer.length) return;
+  const batch = ethSnapshotBuffer.splice(0, ethSnapshotBuffer.length);
+  try {
+    const { error } = await supabase.from('eth_15m_snapshots').insert(batch);
+    if (error) console.error('[ETH-SNAPSHOT] batch error:', error.message);
+  } catch (e) {
+    console.error('[ETH-SNAPSHOT] flush error:', e.message);
   }
 }, 5000);
 
@@ -4733,6 +5500,48 @@ app.get('/api/price-history', async (req, res) => {
     res.json({ snapshots: (data || []).reverse(), slug });
   } catch (e) {
     res.json({ snapshots: [], error: e.message });
+  }
+});
+
+app.get('/api/eth-price-history', async (req, res) => {
+  const slug = req.query.slug || liveStateEth.eventSlug;
+  const limit = parseInt(req.query.limit || '1000');
+  if (!slug) return res.json({ snapshots: [] });
+  try {
+    const { data, error } = await supabase
+      .from('eth_15m_snapshots')
+      .select('observed_at, eth_price, up_cost, down_cost, seconds_left')
+      .eq('event_slug', slug)
+      .order('observed_at', { ascending: false })
+      .limit(limit);
+    if (error) return res.json({ snapshots: [], error: error.message });
+    res.json({ snapshots: (data || []).reverse(), slug });
+  } catch (e) {
+    res.json({ snapshots: [], error: e.message });
+  }
+});
+
+/** Latest stored Polymarket up/down for an ETH event (hydrate UI after refresh). */
+app.get('/api/eth-latest-snapshot', async (req, res) => {
+  const slug = req.query.slug || liveStateEth.eventSlug;
+  if (!slug) return res.json({ up: null, down: null, slug: null });
+  try {
+    const { data, error } = await supabase
+      .from('eth_15m_snapshots')
+      .select('up_cost, down_cost, observed_at')
+      .eq('event_slug', slug)
+      .order('observed_at', { ascending: false })
+      .limit(1);
+    if (error) return res.json({ up: null, down: null, error: error.message, slug });
+    const row = data?.[0];
+    res.json({
+      slug,
+      observed_at: row?.observed_at ?? null,
+      up: row?.up_cost != null ? parseFloat(row.up_cost) : null,
+      down: row?.down_cost != null ? parseFloat(row.down_cost) : null,
+    });
+  } catch (e) {
+    res.json({ up: null, down: null, error: e.message, slug });
   }
 });
 
@@ -5485,6 +6294,11 @@ wss.on('connection', (ws) => {
   ws.send(JSON.stringify({ type: 'event', event: activeEvent }));
   ws.send(JSON.stringify({ type: 'prices', ...liveState }));
   ws.send(JSON.stringify({ type: 'btc', current: liveState.btcCurrent, start: liveState.btcStart }));
+  // Send ETH event + prices so ETH chart works on page load
+  if (ethEvent) ws.send(JSON.stringify({ type: 'eth_event', event: ethEvent }));
+  if (liveStateEth.upPrice != null || liveStateEth.downPrice != null) {
+    ws.send(JSON.stringify({ type: 'eth_prices', upPrice: liveStateEth.upPrice, downPrice: liveStateEth.downPrice, upStartPrice: liveStateEth.upStartPrice, downStartPrice: liveStateEth.downStartPrice }));
+  }
 });
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -6436,10 +7250,12 @@ server.listen(PORT, async () => {
   await initClobClient();
   await ensureAllowance();
   await refreshEvent();
+  await refreshEthEvent();
   connectBtcStream();
   connectBinanceStream();
   startPricePoll();
   scheduleNextEvent();
+  scheduleEthEvent();
   const splitReady = !!FUNDER_ADDRESS && !!process.env.PRIVATE_KEY;
   const scriptExists = fs.existsSync(SPLIT_SCRIPT);
   console.log(`[SPLIT] autoSplit=${autoSplit.enabled ? 'ON' : 'OFF'}, amount=$${autoSplit.amount}, ready=${splitReady}, script=${scriptExists}`);

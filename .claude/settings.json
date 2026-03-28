@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s http://localhost:3001/api/sim-dashboard?limit=10)",
+      "Bash(git checkout origin/main -- server.js)",
+      "Bash(git checkout origin/main -- src/App.jsx)",
+      "Bash(curl -s \"http://localhost:3001/api/k9-trades?limit=3\")",
+      "Bash(source /Users/jordangk/Desktop/supert/supertrader/.env)",
+      "Bash(node -e \":*)",
+      "Bash(ls /Users/jordangk/Desktop/supert/supertrader/.env*)",
+      "Bash(pm2 logs supertrader --lines 15 --nostream)",
+      "Bash(pm2 startup)",
+      "Bash(npm install recharts)",
+      "Bash(curl -s http://localhost:3001/api/event)"
+    ]
+  }
+}
