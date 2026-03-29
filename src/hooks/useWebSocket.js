@@ -11,6 +11,9 @@ export function useWebSocket() {
   const [refreshTrigger, setRefreshTrigger] = useState(0);
   const [copyFeed, setCopyFeed] = useState([]); // combined k9 + our copy orders
   const [whaleTrades, setWhaleTrades] = useState([]);
+  const [ethPrices, setEthPrices] = useState({ upPrice: null, downPrice: null, upStartPrice: null, downStartPrice: null });
+  const [ethEvent, setEthEvent] = useState(null);
+  const [ethAutoLog, setEthAutoLog] = useState([]);
   const ws = useRef(null);
 
   useEffect(() => {
@@ -71,6 +74,18 @@ export function useWebSocket() {
               }));
               return [...entries, ...prev].slice(0, 200);
             });
+          } else if (msg.type === 'eth_prices') {
+            setEthPrices(prev => {
+              const up = msg.upPrice != null ? parseFloat(msg.upPrice) : null;
+              const down = msg.downPrice != null ? parseFloat(msg.downPrice) : null;
+              if (prev.upPrice === up && prev.downPrice === down) return prev;
+              return { upPrice: up, downPrice: down, upStartPrice: msg.upStartPrice ?? prev.upStartPrice, downStartPrice: msg.downStartPrice ?? prev.downStartPrice };
+            });
+          } else if (msg.type === 'eth_event') {
+            setEthEvent(msg.event);
+          } else if (msg.type === 'eth_auto') {
+            // Real-time ETH trade updates (refresh full state from API)
+            setEthAutoLog(prev => [msg, ...prev].slice(0, 20));
           } else if (msg.type === 'k9_copy') {
             setCopyFeed(prev => {
               const entry = {
@@ -91,5 +106,5 @@ export function useWebSocket() {
     return () => ws.current?.close();
   }, []);
 
-  return { prices, btc, binanceBtc, serverEma, priceEma, event, autoSell, refreshTrigger, copyFeed, whaleTrades };
+  return { prices, btc, binanceBtc, serverEma, priceEma, event, autoSell, refreshTrigger, copyFeed, whaleTrades, ethPrices, ethEvent, ethAutoLog };
 }

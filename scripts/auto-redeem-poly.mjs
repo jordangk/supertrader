@@ -143,22 +143,8 @@ async function checkAndRedeem() {
       }
     }
 
-    // Also cancel stale open orders
-    try {
-      const { ClobClient } = await import('@polymarket/clob-client');
-      const tempWallet = new Wallet(process.env.PRIVATE_KEY);
-      const tempClient = new ClobClient('https://clob.polymarket.com', 137, tempWallet);
-      let creds;
-      try { creds = await tempClient.deriveApiKey(); } catch { creds = await tempClient.createOrDeriveApiKey(); }
-      const client = new ClobClient('https://clob.polymarket.com', 137, tempWallet, creds, 2, FUNDER);
-      const openOrders = await client.getOpenOrders();
-      if (openOrders?.length) {
-        console.log(`[auto-redeem] Cancelling ${openOrders.length} stale open orders`);
-        for (const o of openOrders) {
-          try { await client.cancelOrder(o.id); } catch {}
-        }
-      }
-    } catch {}
+    // DISABLED — was killing snipe limit orders on Poly
+    // Stale order cleanup moved to snipe manager instead
   } catch (e) {
     console.error('[auto-redeem] Error:', e.message?.slice(0, 100));
   }

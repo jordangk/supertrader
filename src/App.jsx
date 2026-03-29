@@ -16,21 +16,22 @@ import PriceTracker from './components/PriceTracker.jsx';
 import EventSearch from './components/EventSearch.jsx';
 import PriceDivergence from './components/PriceDivergence.jsx';
 import EmaTradeLog from './components/EmaTradeLog.jsx';
+import { getApiBase } from './apiBase.js';
 
 const AMOUNTS = [50, 25, 10, 5];
 const FEE_PCT = 0.02; // 2% Polymarket fee
 
-const API_BASE = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
+const API_BASE = getApiBase();
 
 export default function App() {
-  const { prices, btc, binanceBtc, serverEma, priceEma, event, refreshTrigger, copyFeed, whaleTrades } = useWebSocket();
+  const { prices, btc, binanceBtc, serverEma, priceEma, event, refreshTrigger, copyFeed, whaleTrades, ethPrices, ethEvent } = useWebSocket();
   const [wallet, setWallet] = useState(null);
   const [orders, setOrders] = useState([]);
   const [positions, setPositions] = useState([]);
   const [openOrders, setOpenOrders] = useState([]);
   const [buying, setBuying] = useState(null);
   const [toast, setToast] = useState(null);
-  const [tab, setTab] = useState('divergence');
+  const [tab, setTab] = useState('btc');
   const [showEventSearch, setShowEventSearch] = useState(false);
   const [liquidityRewards, setLiquidityRewards] = useState({ total: 0, byDate: [] });
   const [autoScalp, setAutoScalp] = useState({ enabled: false, threshold: 5, profitCents: 2, shares: 50, log: [] });
@@ -38,6 +39,8 @@ export default function App() {
   const [autoFlow, setAutoFlow] = useState({ enabled: false, log: [], upFlow: null, downFlow: null });
   const [autoEma, setAutoEma] = useState({ enabled: false, phase: null, log: [], ema: {} });
   const [autoLost, setAutoLost] = useState({ enabled: false, side: 'down', shares: 10, buyPrice: 0.02, sellPrice: 0.07, log: [] });
+  const [autoEthState, setAutoEthState] = useState({ enabled: false, log: [] });
+  const [autoEthEma, setAutoEthEma] = useState({ enabled: false, phase: null, log: [], ema: {} });
 
   function fetchOpenOrders() {
     fetch(`${API_BASE}/api/open-orders`)
@@ -82,6 +85,8 @@ export default function App() {
 
   function fetchAutoEma() {
     fetch(`${API_BASE}/api/auto-ema`).then(r => { if (r.ok) return r.json(); throw new Error(); }).then(setAutoEma).catch(() => {});
+    fetch(`${API_BASE}/api/eth-state`).then(r => { if (r.ok) return r.json(); throw new Error(); }).then(d => { if (d.autoEth) setAutoEthState(d.autoEth); }).catch(() => {});
+    fetch(`${API_BASE}/api/eth-ema-state`).then(r => { if (r.ok) return r.json(); throw new Error(); }).then(setAutoEthEma).catch(() => {});
   }
   async function toggleAutoEma() {
     try {
@@ -582,6 +587,14 @@ export default function App() {
             }`}>
             {showEventSearch ? 'Hide Search' : 'Find Event'}
           </button>
+          <a
+            href="/arb"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="px-3 py-1 text-xs rounded-lg border border-gray-700 bg-gray-800 text-amber-400 hover:bg-gray-700 hover:text-amber-300 transition-colors"
+          >
+            Arb Lab ↗
+          </a>
         </div>
         <WalletBar wallet={wallet} liquidityRewards={liquidityRewards} />
       </div>
@@ -774,7 +787,95 @@ export default function App() {
                 <p>Gap ≥${autoEma.gapOpenThreshold || 5} & widening → buy winning side at mkt-3¢. Gap &lt;${autoEma.gapOpenThreshold || 5} → hedge opposite at mkt-3¢. Always 5sh. {autoEma.priceMin || 25}–{autoEma.priceMax || 85}¢. Timeout: {(autoEma.maxHedgeWaitMs || 30000) / 1000}s.</p>
               </div>
             </div>
-            <PriceDivergence key={event?.slug} prices={prices} btc={btc} binanceBtc={binanceBtc} serverEma={serverEma} priceEma={priceEma} event={event} autoEmaLog={autoEma.log || []} />
+            {/* BTC / ETH tab switcher */}
+            <div className="flex gap-2 mb-2">
+              {['btc', 'eth'].map(t => (
+                <button key={t} onClick={() => setTab(t)}
+                  className={`px-4 py-1 rounded text-sm font-bold transition-colors ${tab === t ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'}`}>
+                  {t.toUpperCase()}
+                </button>
+              ))}
+            </div>
+            {tab === 'btc' ? (
+              <PriceDivergence key={event?.slug} prices={prices} btc={btc} binanceBtc={binanceBtc} serverEma={serverEma} priceEma={priceEma} event={event} autoEmaLog={autoEma.log || []} />
+            ) : (
+              <>
+                {/* ETH Auto-Trade Toggle */}
+                <div className="rounded-xl border border-gray-800 bg-gray-900 p-3 mb-2">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <span className="text-sm font-bold text-purple-400">ETH Velocity</span>
+                      <span className="text-[10px] text-gray-500 ml-2">BTC $10/1s → buy ETH, hedge 3s later</span>
+                    </div>
+                    <button
+                      onClick={() => {
+                        const next = !autoEthState.enabled;
+                        fetch(`${API_BASE}/api/eth-auto`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: next }) })
+                          .then(r => r.json()).then(d => setAutoEthState(d)).catch(() => {});
+                      }}
+                      className={`px-3 py-1 rounded text-xs font-bold ${autoEthState.enabled ? 'bg-green-600 text-white' : 'bg-gray-700 text-gray-400'}`}>
+                      {autoEthState.enabled ? 'ON' : 'OFF'}
+                    </button>
+                  </div>
+                  {autoEthState.log?.length > 0 && (
+                    <div className="mt-2 space-y-1 max-h-40 overflow-y-auto">
+                      {autoEthState.log.map((t, i) => (
+                        <div key={i} className="flex gap-2 text-[10px] font-mono">
+                          <span className="text-gray-500">{new Date(t.ts).toLocaleTimeString()}</span>
+                          <span className={t.side === 'up' ? 'text-green-400' : 'text-red-400'}>{t.side?.toUpperCase()}</span>
+                          <span className="text-gray-400">vel=${t.velocity?.toFixed(0)}</span>
+                          <span className="text-gray-400">buy@{((t.entryPrice||0)*100).toFixed(0)}¢</span>
+                          <span className="text-gray-400">hedge@{((t.hedgePrice||0)*100).toFixed(0)}¢</span>
+                          <span className={`font-bold ${(t.profit||0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                            {t.profit != null ? `${t.profit >= 0 ? '+' : ''}${t.profit}¢` : '...'}
+                          </span>
+                          <span className="text-gray-600">{t.result}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                {/* ETH EMA Toggle */}
+                <div className="rounded-xl border border-gray-800 bg-gray-900 p-3 mb-2">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <span className="text-sm font-bold text-cyan-400">ETH Auto-EMA</span>
+                      <span className="text-[10px] text-gray-500 ml-2">BTC EMA cross → trade ETH, hedge on cross back or gap $6</span>
+                    </div>
+                    <button
+                      onClick={() => {
+                        const next = !autoEthEma.enabled;
+                        fetch(`${API_BASE}/api/eth-ema`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: next }) })
+                          .then(r => r.json()).then(d => setAutoEthEma(prev => ({ ...prev, ...d }))).catch(() => {});
+                      }}
+                      className={`px-3 py-1 rounded text-xs font-bold ${autoEthEma.enabled ? 'bg-green-600 text-white' : 'bg-gray-700 text-gray-400'}`}>
+                      {autoEthEma.enabled ? 'ON' : 'OFF'}
+                    </button>
+                  </div>
+                  {autoEthEma.phase && (
+                    <div className="text-[10px] text-yellow-400 mt-1">Phase: {autoEthEma.phase} | {autoEthEma.entrySide?.toUpperCase()} @ {((autoEthEma.entryPrice||0)*100).toFixed(0)}¢</div>
+                  )}
+                  {autoEthEma.log?.length > 0 && (
+                    <div className="mt-2 space-y-1 max-h-40 overflow-y-auto">
+                      {autoEthEma.log.map((t, i) => (
+                        <div key={i} className="flex gap-2 text-[10px] font-mono">
+                          <span className="text-gray-500">{new Date(t.ts).toLocaleTimeString()}</span>
+                          <span className={t.side === 'up' ? 'text-green-400' : 'text-red-400'}>{t.side?.toUpperCase()}</span>
+                          <span className="text-gray-400">gap=${t.triggerGap?.toFixed(1)}</span>
+                          <span className="text-gray-400">buy@{((t.entryPrice||0)*100).toFixed(0)}¢</span>
+                          <span className="text-gray-400">hedge@{((t.hedgePrice||0)*100).toFixed(0)}¢</span>
+                          <span className={`font-bold ${(t.profit||0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                            {t.profit != null ? `${t.profit >= 0 ? '+' : ''}${t.profit}¢` : '...'}
+                          </span>
+                          <span className="text-gray-600">{t.result}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <PriceDivergence key={ethEvent?.slug || 'eth'} prices={ethPrices} btc={btc} binanceBtc={binanceBtc} serverEma={serverEma} priceEma={priceEma} event={ethEvent} autoEmaLog={autoEthEma.log || []} mode="eth" />
+              </>
+            )}
           </div>
           <MyTrades />
         <OrderToast toast={toast} onDismiss={() => setToast(null)} />

@@ -64,6 +64,49 @@ export default function ArbitrageLab() {
   const [campaignsList, setCampaignsList] = useState([]);
   const [pnlData, setPnlData] = useState(null);
 
+  // Snipe state
+  const [snipes, setSnipes] = useState([]);
+  const [snipeForm, setSnipeForm] = useState({ asset: 'btc', side: 'up', limitPrice: '0.47', shares: '50', kalshiLimit: '0.51' });
+
+  // Load snipes
+  useEffect(() => {
+    function loadSnipes() {
+      fetch(`${API_BASE}/api/arb/snipes`).then(r => r.json()).then(d => { if (d.snipes) setSnipes(d.snipes); }).catch(() => {});
+    }
+    loadSnipes();
+    const iv = setInterval(loadSnipes, 5000);
+    return () => clearInterval(iv);
+  }, []);
+
+  async function addSnipe() {
+    const { asset, side, limitPrice, shares, kalshiLimit } = snipeForm;
+    if (!limitPrice || !shares) return;
+    const sides = side === 'both' ? ['up', 'down'] : [side];
+    try {
+      for (const s of sides) {
+        await fetch(`${API_BASE}/api/arb/snipes`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ asset, side: s, limitPrice: parseFloat(limitPrice), shares: parseInt(shares), kalshiLimit: parseFloat(kalshiLimit) }),
+        });
+      }
+    } catch {}
+  }
+
+  async function deleteSnipe(id) {
+    try { await fetch(`${API_BASE}/api/arb/snipes/${id}`, { method: 'DELETE' }); } catch {}
+  }
+
+  async function toggleSnipe(id, currentActive) {
+    try {
+      await fetch(`${API_BASE}/api/arb/snipes/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ active: !currentActive }),
+      });
+    } catch {}
+  }
+
   // Load P&L
   useEffect(() => {
     function loadPnl() {
@@ -676,8 +719,8 @@ export default function ArbitrageLab() {
                 </span>
                 {c.live?.best != null && (
                   <span className={`px-1 py-0.5 rounded text-[9px] font-bold ${c.live.best > 0 ? 'bg-green-900/50 text-green-400' : 'bg-red-900/30 text-red-400'}`}>
-                    A:{c.live.profitA != null ? `${c.live.profitA > 0 ? '+' : ''}$${(c.live.profitA * 5 / 100).toFixed(2)}` : '—'}
-                    {' '}B:{c.live.profitB != null ? `${c.live.profitB > 0 ? '+' : ''}$${(c.live.profitB * 5 / 100).toFixed(2)}` : '—'}
+                    A:{c.live.profitA != null ? `${c.live.profitA > 0 ? '+' : ''}${c.live.profitA.toFixed(1)}¢` : '—'}
+                    {' '}B:{c.live.profitB != null ? `${c.live.profitB > 0 ? '+' : ''}${c.live.profitB.toFixed(1)}¢` : '—'}
                   </span>
                 )}
                 <span className="text-gray-500">{c.total_trades || 0} trades</span>
@@ -1404,6 +1447,142 @@ export default function ArbitrageLab() {
           </div>
         </div>
       )}
+
+      {/* Pre-Market Snipes */}
+      <div className="border border-gray-800 rounded-lg overflow-hidden">
+        <div className="bg-gray-900 px-2 py-1.5 text-[10px] font-semibold flex justify-between items-center">
+          <span className="text-amber-400">Pre-Market Snipes</span>
+          <span className="text-gray-500">{snipes.filter(s => s.active).length} active</span>
+        </div>
+
+        {/* Add snipe form */}
+        <div className="flex items-center gap-1 px-2 py-1.5 border-b border-gray-800 text-[10px]">
+          <select
+            value={snipeForm.asset}
+            onChange={e => setSnipeForm(f => ({ ...f, asset: e.target.value }))}
+            className="bg-gray-800 text-gray-300 rounded px-1.5 py-1 border border-gray-700 text-[10px]"
+          >
+            {['btc', 'eth', 'sol', 'xrp', 'hype'].map(a => (
+              <option key={a} value={a}>{a.toUpperCase()}</option>
+            ))}
+          </select>
+          <select
+            value={snipeForm.side}
+            onChange={e => setSnipeForm(f => ({ ...f, side: e.target.value }))}
+            className="bg-gray-800 text-gray-300 rounded px-1.5 py-1 border border-gray-700 text-[10px]"
+          >
+            <option value="up">UP</option>
+            <option value="down">DOWN</option>
+            <option value="both">BOTH</option>
+          </select>
+          <input
+            type="number"
+            step="0.01"
+            min="0.01"
+            max="0.99"
+            placeholder="Price"
+            value={snipeForm.limitPrice}
+            onChange={e => setSnipeForm(f => ({ ...f, limitPrice: e.target.value }))}
+            className="w-14 bg-gray-800 text-gray-300 rounded px-1.5 py-1 border border-gray-700 text-[10px] text-center"
+          />
+          <span className="text-gray-500">@</span>
+          <input
+            type="number"
+            min="1"
+            placeholder="Shares"
+            value={snipeForm.shares}
+            onChange={e => setSnipeForm(f => ({ ...f, shares: e.target.value }))}
+            className="w-12 bg-gray-800 text-gray-300 rounded px-1.5 py-1 border border-gray-700 text-[10px] text-center"
+          />
+          <span className="text-gray-500">sh</span>
+          <span className="text-gray-500 text-[10px]">KS limit</span>
+          <input
+            type="number"
+            step="0.01"
+            min="0.01"
+            max="0.99"
+            placeholder="KS ¢"
+            value={snipeForm.kalshiLimit}
+            onChange={e => setSnipeForm(f => ({ ...f, kalshiLimit: e.target.value }))}
+            className="w-12 bg-gray-800 text-gray-300 rounded px-1.5 py-1 border border-gray-700 text-[10px] text-center"
+          />
+          <button
+            type="button"
+            onClick={addSnipe}
+            className="px-2 py-1 bg-amber-600 hover:bg-amber-500 text-white rounded text-[10px] font-bold"
+          >
+            Add
+          </button>
+        </div>
+
+        {/* Snipes table */}
+        {snipes.length > 0 && (
+          <div className="overflow-x-auto max-h-48 overflow-y-auto">
+            <table className="w-full text-[10px] font-mono">
+              <thead className="sticky top-0 bg-gray-900 text-gray-500">
+                <tr>
+                  <th className="text-left p-1.5">Asset</th>
+                  <th className="text-left p-1.5">Side</th>
+                  <th className="text-left p-1.5">Limit</th>
+                  <th className="text-left p-1.5">Shares</th>
+                  <th className="text-left p-1.5">Status</th>
+                  <th className="text-left p-1.5">Last Result</th>
+                  <th className="text-left p-1.5"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {snipes.map(s => (
+                  <tr key={s.id} className="border-t border-gray-800/80">
+                    <td className="p-1 text-amber-400 font-bold">{s.asset.toUpperCase()}</td>
+                    <td className={`p-1 font-bold ${s.side === 'up' ? 'text-green-400' : 'text-red-400'}`}>{s.side.toUpperCase()}</td>
+                    <td className="p-1 text-gray-300">{(Number(s.limit_price) * 100).toFixed(0)}¢ <span className="text-gray-500">→ KS {(Number(s.kalshi_limit || 0.51) * 100).toFixed(0)}¢</span></td>
+                    <td className="p-1 text-gray-300">{s.shares}</td>
+                    <td className="p-1">
+                      <span className={`px-1 py-0.5 rounded text-[9px] font-bold ${s.active ? 'bg-green-700 text-white' : 'bg-gray-700 text-gray-400'}`}>
+                        {s.active ? 'ACTIVE' : 'OFF'}
+                      </span>
+                      {s.poly_filled > 0 && (
+                        <span className="ml-1 text-green-400">P:{s.poly_filled}</span>
+                      )}
+                      {s.kalshi_filled > 0 && (
+                        <span className="ml-1 text-blue-400">K:{s.kalshi_filled}</span>
+                      )}
+                    </td>
+                    <td className={`p-1 ${
+                      s.last_result === 'hedged' ? 'text-green-400' :
+                      s.last_result === 'filled' ? 'text-yellow-400' :
+                      s.last_result === 'cancelled' ? 'text-gray-500' :
+                      s.last_result?.startsWith('hedge_') ? 'text-red-400' :
+                      'text-gray-500'
+                    }`}>
+                      {s.last_result || 'new'}
+                    </td>
+                    <td className="p-1 flex items-center gap-1">
+                      <button
+                        type="button"
+                        onClick={() => toggleSnipe(s.id, s.active)}
+                        className={`px-1.5 py-0.5 rounded text-[9px] font-bold ${s.active ? 'bg-gray-700 text-gray-400 hover:bg-gray-600' : 'bg-green-700 text-white hover:bg-green-600'}`}
+                      >
+                        {s.active ? 'Pause' : 'Start'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => deleteSnipe(s.id)}
+                        className="px-1.5 py-0.5 rounded text-[9px] font-bold bg-red-900/50 text-red-400 hover:bg-red-800/50"
+                      >
+                        X
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {snipes.length === 0 && (
+          <div className="px-2 py-3 text-[10px] text-gray-600 text-center">No snipes configured. Add one above.</div>
+        )}
+      </div>
     </div>
   );
 }

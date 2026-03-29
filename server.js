@@ -2971,13 +2971,8 @@ async function saveEventAnalysis(oldSlug) {
 async function refreshEvent(clientBtcOpen) {
   const event = await fetchActiveEvent();
   if (event && event.slug !== liveState.eventSlug) {
-    // Cancel all open GTC orders from the previous event before switching
-    if (clobClient && liveState.eventSlug) {
-      try {
-        await clobClient.cancelAll();
-        console.log('[EVENT] Cancelled all open orders from previous event');
-      } catch (e) { console.error('[EVENT] Failed to cancel orders:', e.message); }
-    }
+    // DISABLED — was killing snipe limit orders on Poly
+    // Event-level order cleanup is now handled by the snipe manager
     // Save analysis for the old event before switching
     if (liveState.eventSlug) saveEventAnalysis(liveState.eventSlug);
     // Reset in-memory shares for new event — but keep them if pre-split already ran for this slot

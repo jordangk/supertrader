@@ -6,7 +6,15 @@ import {
 
 const API_BASE = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
 
-export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sEma, priceEma, event, autoEmaLog = [] }) {
+/** Slugs like eth-updown-15m-1739123456 → market window start (ms). */
+function parseEventStartMsFromSlug(slug) {
+  if (!slug || typeof slug !== 'string') return null;
+  const m = slug.match(/-(\d{9,})$/);
+  if (!m) return null;
+  return parseInt(m[1], 10) * 1000;
+}
+
+export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sEma, priceEma, event, autoEmaLog = [], mode = 'btc' }) {
   const [history, setHistory] = useState([]);
   const [live, setLive] = useState({ btc: null, up: null, down: null, upStart: null, downStart: null, btcStart: null, slug: null, endDate: null, title: null });
   const [btcOpen, setBtcOpen] = useState(null); // captured at event start, client-side
@@ -25,6 +33,41 @@ export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sE
   const lastSlug = useRef(null);
   const openLockedForSlug = useRef(null); // once set, opens don't change until next slug
   const waitingForHistory = useRef(false); // block live capture until history fetch resolves
+  const pricesRef = useRef(prices); // keep latest ethPrices accessible inside poll closure
+  const ethLastPolyRef = useRef({ up: null, down: null }); // WS + DB + sessionStorage — survives refresh
+  const eventRef = useRef(event);
+  const sEmaRef = useRef(sEma);
+  pricesRef.current = prices;
+  eventRef.current = event;
+  sEmaRef.current = sEma;
+
+  // Hydrate last Polymarket up/down from session + latest DB row (so chart / header work before WS reconnects)
+  useEffect(() => {
+    if (mode !== 'eth') return;
+    const slug = event?.slug || live.slug;
+    if (!slug) return;
+    try {
+      const raw = sessionStorage.getItem(`ethPoly:${slug}`);
+      if (raw) {
+        const p = JSON.parse(raw);
+        ethLastPolyRef.current = { up: p.up ?? null, down: p.down ?? null };
+      }
+    } catch {}
+    fetch(`${API_BASE}/api/eth-latest-snapshot?slug=${encodeURIComponent(slug)}`)
+      .then(r => r.json())
+      .then(d => {
+        if (d.up != null || d.down != null) {
+          ethLastPolyRef.current = {
+            up: d.up != null ? d.up : ethLastPolyRef.current?.up,
+            down: d.down != null ? d.down : ethLastPolyRef.current?.down,
+          };
+          try {
+            sessionStorage.setItem(`ethPoly:${slug}`, JSON.stringify(ethLastPolyRef.current));
+          } catch {}
+        }
+      })
+      .catch(() => {});
+  }, [mode, event?.slug, live.slug]);
 
   // Load stop-loss config from server on mount (persisted across refresh)
   useEffect(() => {
@@ -66,27 +109,115 @@ export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sE
     return () => clearTimeout(timerRef.current);
   }, []);
 
-  // Seed BTC history from Binance klines on mount (15 min of 5s candles)
+  // Seed history on mount (re-run when ETH event slug appears from WS)
   useEffect(() => {
-    fetch('https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1s&limit=900')
-      .then(r => r.json())
-      .then(klines => {
-        if (!Array.isArray(klines)) return;
-        const seed = klines.map(k => ({ t: k[0], btc: parseFloat(k[4]), up: null, down: null }));
-        setHistory(prev => prev.length > 0 ? prev : seed);
-      })
-      .catch(() => {});
-  }, []);
+    if (mode === 'eth') {
+      const qs = event?.slug ? `slug=${encodeURIComponent(event.slug)}&` : '';
+      // ETH mode: fetch DB snapshots + both klines in parallel
+      Promise.all([
+        fetch(`${API_BASE}/api/eth-price-history?${qs}limit=1000`).then(r => r.json()).catch(() => ({ snapshots: [] })),
+        fetch('https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1s&limit=900').then(r => r.json()).catch(() => []),
+        fetch('https://api.binance.com/api/v3/klines?symbol=ETHUSDT&interval=1s&limit=900').then(r => r.json()).catch(() => []),
+      ]).then(([d, btcKlines, ethKlines]) => {
+        if (!Array.isArray(btcKlines)) return;
+        // Build kline seed with both BTC + ETH
+        const ethKlineMap = {};
+        if (Array.isArray(ethKlines)) {
+          for (const k of ethKlines) ethKlineMap[k[0]] = parseFloat(k[4]);
+        }
+        const klineSeed = btcKlines.map(k => ({
+          t: k[0], btc: parseFloat(k[4]), eth: ethKlineMap[k[0]] ?? null, up: null, down: null,
+        }));
+        // Build DB snapshots with BTC merged from klines
+        const btcArr = btcKlines.map(k => ({ t: k[0], btc: parseFloat(k[4]) }));
+        const dbSnaps = (d.snapshots || []).map(s => {
+          const t = new Date(s.observed_at.endsWith('Z') ? s.observed_at : s.observed_at + 'Z').getTime();
+          let bestBtc = null, bestDist = Infinity;
+          for (const k of btcArr) {
+            const dist = Math.abs(k.t - t);
+            if (dist < bestDist) { bestDist = dist; bestBtc = k.btc; }
+            if (k.t > t) break;
+          }
+          if (bestDist > 2000) bestBtc = null;
+          return {
+            t, eth: s.eth_price != null ? parseFloat(s.eth_price) : null,
+            up: s.up_cost != null ? parseFloat(s.up_cost) : null,
+            down: s.down_cost != null ? parseFloat(s.down_cost) : null,
+            secsLeft: s.seconds_left, btc: bestBtc,
+          };
+        });
+        // Forward-fill BTC in DB snaps
+        let lastBtc = null;
+        for (const s of dbSnaps) { if (s.btc != null) lastBtc = s.btc; else s.btc = lastBtc; }
+        // Merge: kline seed + DB snapshots (DB overwrites overlapping time range)
+        let merged;
+        if (dbSnaps.length > 0) {
+          const firstDbT = dbSnaps[0].t;
+          const lastDbT = dbSnaps[dbSnaps.length - 1].t;
+          const older = klineSeed.filter(k => k.t < firstDbT);
+          const newer = klineSeed.filter(k => k.t > lastDbT);
+          merged = [...older, ...dbSnaps, ...newer];
+        } else {
+          merged = klineSeed;
+        }
+        // Back-fill + forward-fill up/down/eth
+        let fUp = null, fDown = null, fEth = null;
+        for (const h of merged) {
+          if (fUp == null && h.up != null) fUp = h.up;
+          if (fDown == null && h.down != null) fDown = h.down;
+          if (fEth == null && h.eth != null) fEth = h.eth;
+          if (fUp != null && fDown != null && fEth != null) break;
+        }
+        for (const h of merged) { if (h.up == null) h.up = fUp; else break; }
+        for (const h of merged) { if (h.down == null) h.down = fDown; else break; }
+        for (const h of merged) { if (h.eth == null) h.eth = fEth; else break; }
+        let lUp = null, lDown = null, lEth = null;
+        for (const h of merged) {
+          if (h.up != null) lUp = h.up; else h.up = lUp;
+          if (h.down != null) lDown = h.down; else h.down = lDown;
+          if (h.eth != null) lEth = h.eth; else h.eth = lEth;
+        }
+        const t0ms = parseEventStartMsFromSlug(event?.slug);
+        if (t0ms != null) merged = merged.filter(h => h.t >= t0ms);
+        setHistory(merged.length > 1000 ? merged.slice(-1000) : merged);
+        const firstBtc = merged.find(h => h.btc != null);
+        if (firstBtc) setBtcOpen(firstBtc.btc);
+        const lastPoly = [...merged].reverse().find(h => h.up != null || h.down != null);
+        if (lastPoly && event?.slug) {
+          ethLastPolyRef.current = { up: lastPoly.up ?? null, down: lastPoly.down ?? null };
+          try {
+            sessionStorage.setItem(`ethPoly:${event.slug}`, JSON.stringify(ethLastPolyRef.current));
+          } catch {}
+        }
+      });
+    } else {
+      // BTC mode: just kline seed
+      fetch('https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1s&limit=900')
+        .then(r => r.json())
+        .then(klines => {
+          if (!Array.isArray(klines)) return;
+          const seed = klines.map(k => ({ t: k[0], btc: parseFloat(k[4]), up: null, down: null }));
+          setHistory(prev => prev.length > 0 ? prev : seed);
+        })
+        .catch(() => {});
+    }
+  }, [mode, event?.slug]);
 
   // Poll /api/event + Binance REST every 1s
   useEffect(() => {
     let active = true;
     const poll = async () => {
       try {
-        const [eventRes, binanceRes] = await Promise.all([
+        const fetches = [
           fetch(`${API_BASE}/api/event`).then(r => r.json()).catch(() => null),
           fetch('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT').then(r => r.json()).catch(() => null),
-        ]);
+        ];
+        if (mode === 'eth') {
+          fetches.push(fetch('https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT').then(r => r.json()).catch(() => null));
+          // Same liveStateEth as WS — REST fallback when eth_prices messages lag or miss
+          fetches.push(fetch(`${API_BASE}/api/eth-state`).then(r => r.json()).catch(() => null));
+        }
+        const [eventRes, binanceRes, ethBinanceRes, ethStateRes] = await Promise.all(fetches);
         if (!active) return;
         const ls = eventRes?.liveState || {};
         const ev = eventRes?.event || {};
@@ -95,22 +226,69 @@ export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sE
         const btcPrice = liveBinance || (ls.binanceBtc ? parseFloat(ls.binanceBtc) : null) || (ls.btcCurrent ? parseFloat(ls.btcCurrent) : null);
         const up = ls.upPrice != null ? parseFloat(ls.upPrice) : null;
         const down = ls.downPrice != null ? parseFloat(ls.downPrice) : null;
-        setLive({
-          btc: btcPrice,
-          up,
-          down,
-          upStart: ls.upStartPrice != null ? parseFloat(ls.upStartPrice) : null,
-          downStart: ls.downStartPrice != null ? parseFloat(ls.downStartPrice) : null,
-          btcStart: ls.btcStart != null ? parseFloat(ls.btcStart) : null,
-          dbOpenBtc: op.btc || null, // authoritative open from DB
-          dbOpenUp: op.up,
-          dbOpenDown: op.down,
-          slug: ls.eventSlug || ev.slug,
-          endDate: ev.endDate,
-          title: ev.title || ls.eventTitle,
-          tokenUp: ls.tokenUp || ev.tokenUp || null,
-          tokenDown: ls.tokenDown || ev.tokenDown || null,
-        });
+        let histUp;
+        let histDown;
+        if (mode === 'eth') {
+          // ETH: BTC from poll; Up/Down from WS → REST liveState → cached DB/session → last history point
+          const p = pricesRef.current;
+          const srv = ethStateRes?.prices;
+          const ev2 = eventRef.current;
+          const ethUp = (p?.upPrice != null ? parseFloat(p.upPrice) : null)
+            ?? (srv?.upPrice != null ? parseFloat(srv.upPrice) : null)
+            ?? (ethLastPolyRef.current?.up != null ? ethLastPolyRef.current.up : null);
+          const ethDown = (p?.downPrice != null ? parseFloat(p.downPrice) : null)
+            ?? (srv?.downPrice != null ? parseFloat(srv.downPrice) : null)
+            ?? (ethLastPolyRef.current?.down != null ? ethLastPolyRef.current.down : null);
+          if (ethUp != null || ethDown != null) {
+            ethLastPolyRef.current = {
+              up: ethUp ?? ethLastPolyRef.current?.up ?? null,
+              down: ethDown ?? ethLastPolyRef.current?.down ?? null,
+            };
+            const slug = ev2?.slug;
+            if (slug) {
+              try {
+                sessionStorage.setItem(`ethPoly:${slug}`, JSON.stringify(ethLastPolyRef.current));
+              } catch {}
+            }
+          }
+          histUp = ethUp;
+          histDown = ethDown;
+          setLive(prev => ({
+            ...prev,
+            btc: btcPrice,
+            up: ethUp ?? prev.up,
+            down: ethDown ?? prev.down,
+            upStart: (p?.upStartPrice != null ? parseFloat(p.upStartPrice) : null)
+              ?? (srv?.upStartPrice != null ? parseFloat(srv.upStartPrice) : prev.upStart),
+            downStart: (p?.downStartPrice != null ? parseFloat(p.downStartPrice) : null)
+              ?? (srv?.downStartPrice != null ? parseFloat(srv.downStartPrice) : prev.downStart),
+            btcStart: ls.btcStart != null ? parseFloat(ls.btcStart) : prev.btcStart,
+            slug: ev2?.slug || prev.slug,
+            endDate: ev2?.endDate || prev.endDate,
+            title: ev2?.title || prev.title,
+            tokenUp: ev2?.tokenUp || prev.tokenUp,
+            tokenDown: ev2?.tokenDown || prev.tokenDown,
+          }));
+        } else {
+          histUp = up;
+          histDown = down;
+          setLive({
+            btc: btcPrice,
+            up,
+            down,
+            upStart: ls.upStartPrice != null ? parseFloat(ls.upStartPrice) : null,
+            downStart: ls.downStartPrice != null ? parseFloat(ls.downStartPrice) : null,
+            btcStart: ls.btcStart != null ? parseFloat(ls.btcStart) : null,
+            dbOpenBtc: op.btc || null, // authoritative open from DB
+            dbOpenUp: op.up,
+            dbOpenDown: op.down,
+            slug: ls.eventSlug || ev.slug,
+            endDate: ev.endDate,
+            title: ev.title || ls.eventTitle,
+            tokenUp: ls.tokenUp || ev.tokenUp || null,
+            tokenDown: ls.tokenDown || ev.tokenDown || null,
+          });
+        }
         // Sync stop-loss state from server (monitored server-side, survives refresh)
         const slServer = eventRes?.stopLoss;
         if (slServer) {
@@ -123,10 +301,15 @@ export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sE
             stopLossRef.current = null;
           }
         }
-        // Accumulate history directly in poll — one point per poll, no dedup
-        if (btcPrice || up || down) {
+        // Accumulate history — histUp/histDown set above (ETH includes cached/DB snapshot)
+        const se = sEmaRef.current;
+        const ethPrice = ethBinanceRes?.price ? parseFloat(ethBinanceRes.price) : null;
+        if (btcPrice || histUp || histDown) {
           setHistory(prev => {
-            const next = [...prev, { t: Date.now(), btc: btcPrice, up, down, sE12: sEma?.e12 ?? null, sE26: sEma?.e26 ?? null }];
+            const last = prev[prev.length - 1];
+            const u = mode === 'eth' ? (histUp ?? last?.up ?? null) : histUp;
+            const d = mode === 'eth' ? (histDown ?? last?.down ?? null) : histDown;
+            const next = [...prev, { t: Date.now(), btc: btcPrice, eth: ethPrice, up: u, down: d, sE12: se?.e12 ?? null, sE26: se?.e26 ?? null }];
             return next.length > 1000 ? next.slice(-1000) : next;
           });
         }
@@ -138,57 +321,176 @@ export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sE
     return () => { active = false; clearInterval(iv); };
   }, []);
 
+  // ETH mode: also capture when ethPrices prop changes between polls
+  useEffect(() => {
+    if (mode !== 'eth') return;
+    const up = prices?.upPrice != null ? parseFloat(prices.upPrice) : null;
+    const down = prices?.downPrice != null ? parseFloat(prices.downPrice) : null;
+    if (up == null && down == null) return;
+    ethLastPolyRef.current = {
+      up: up ?? ethLastPolyRef.current?.up ?? null,
+      down: down ?? ethLastPolyRef.current?.down ?? null,
+    };
+    const slug = event?.slug || live.slug;
+    if (slug) {
+      try {
+        sessionStorage.setItem(`ethPoly:${slug}`, JSON.stringify(ethLastPolyRef.current));
+      } catch {}
+    }
+    setLive(prev => ({ ...prev, up: up ?? prev.up, down: down ?? prev.down }));
+  }, [mode, prices?.upPrice, prices?.downPrice, event?.slug, live.slug]);
+
   // When event slug changes: reset history, unlock opens for new capture
   useEffect(() => {
     if (live.slug && live.slug !== lastSlug.current) {
       lastSlug.current = live.slug;
       openLockedForSlug.current = null; // unlock so next tick captures opens
-      waitingForHistory.current = true; // block live capture until history fetch resolves
       setBtcOpen(null);
       setUpOpen(null);
       setDownOpen(null);
+      waitingForHistory.current = true;
       // Keep history across events so chart always has BTC data to show
-      // Fetch historical snapshots — open price comes from DB (first snapshot)
       const slug = live.slug;
-      fetch(`${API_BASE}/api/price-history?slug=${slug}&limit=1000`)
-        .then(r => r.json())
-        .then(d => {
-          const snaps = (d.snapshots || []).map(s => ({
-            t: new Date(s.observed_at.endsWith('Z') ? s.observed_at : s.observed_at + 'Z').getTime(),
-            btc: parseFloat(s.coin_price) || parseFloat(s.btc_price) || null,
-            up: s.up_cost != null ? parseFloat(s.up_cost) : null,
-            down: s.down_cost != null ? parseFloat(s.down_cost) : null,
-            secsLeft: s.seconds_left,
-          }));
-          // Filter out stale snapshots (btc way off from live price)
-          const refBtc = live.btc || (snaps.length > 0 ? snaps[snaps.length - 1]?.btc : null);
-          const saneSnaps = refBtc
-            ? snaps.filter(s => !s.btc || Math.abs(s.btc - refBtc) / refBtc < 0.005)
-            : snaps;
-          // Use first sane historical tick as open
-          const firstSane = saneSnaps.find(s => s.btc);
-          if (openLockedForSlug.current !== slug && firstSane && live.btc) {
-            const sane = Math.abs(firstSane.btc - live.btc) / live.btc < 0.005;
-            if (sane) {
-              setBtcOpen(firstSane.btc);
-              if (firstSane.up != null) setUpOpen(firstSane.up);
-              if (firstSane.down != null) setDownOpen(firstSane.down);
-              openLockedForSlug.current = slug;
+
+      if (mode === 'eth') {
+        // Fetch ETH snapshots + BTC klines in parallel, merge by nearest timestamp
+        Promise.all([
+          fetch(`${API_BASE}/api/eth-price-history?slug=${slug}&limit=1000`).then(r => r.json()).catch(() => ({ snapshots: [] })),
+          fetch('https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1s&limit=900').then(r => r.json()).catch(() => []),
+        ]).then(([d, klines]) => {
+          const btcArr = Array.isArray(klines) ? klines.map(k => ({ t: k[0], btc: parseFloat(k[4]) })) : [];
+          const snaps = (d.snapshots || []).map(s => {
+            const t = new Date(s.observed_at.endsWith('Z') ? s.observed_at : s.observed_at + 'Z').getTime();
+            // Find nearest BTC kline within 2s
+            let bestBtc = null, bestDist = Infinity;
+            for (const k of btcArr) {
+              const dist = Math.abs(k.t - t);
+              if (dist < bestDist) { bestDist = dist; bestBtc = k.btc; }
+              if (k.t > t) break; // klines are sorted, stop early
+            }
+            if (bestDist > 2000) bestBtc = null;
+            return {
+              t,
+              eth: s.eth_price != null ? parseFloat(s.eth_price) : null,
+              up: s.up_cost != null ? parseFloat(s.up_cost) : null,
+              down: s.down_cost != null ? parseFloat(s.down_cost) : null,
+              secsLeft: s.seconds_left,
+              btc: bestBtc,
+            };
+          });
+          // Fill remaining gaps: forward-fill BTC from klines
+          if (snaps.length > 0 && btcArr.length > 0) {
+            let lastBtc = null;
+            for (const s of snaps) {
+              if (s.btc != null) lastBtc = s.btc;
+              else if (lastBtc != null) s.btc = lastBtc;
             }
           }
-          waitingForHistory.current = false; // allow live capture fallback if no history
-          // Merge: keep old history + new event snapshots + live ticks
+          // Set BTC open from first entry with BTC data
+          const firstBtc = snaps.find(s => s.btc != null);
+          if (firstBtc && !btcOpen) setBtcOpen(firstBtc.btc);
+          waitingForHistory.current = false;
+          if (snaps.length === 0) return;
           setHistory(prev => {
-            if (saneSnaps.length === 0) return prev;
-            const firstSnapT = saneSnaps[0].t;
-            const lastSnapT = saneSnaps[saneSnaps.length - 1].t;
+            const firstSnapT = snaps[0].t;
+            const lastSnapT = snaps[snaps.length - 1].t;
             const older = prev.filter(p => p.t < firstSnapT);
             const newer = prev.filter(p => p.t > lastSnapT);
-            const merged = [...older, ...saneSnaps, ...newer];
+            const merged = [...older, ...snaps, ...newer];
+            // Back-fill then forward-fill so ALL entries have up/down/eth
+            // Back-fill: entries before first DB snapshot get the earliest known value
+            let firstUp = null, firstDown = null, firstEth = null;
+            for (const h of merged) {
+              if (firstUp == null && h.up != null) firstUp = h.up;
+              if (firstDown == null && h.down != null) firstDown = h.down;
+              if (firstEth == null && h.eth != null) firstEth = h.eth;
+              if (firstUp != null && firstDown != null && firstEth != null) break;
+            }
+            for (const h of merged) {
+              if (h.up == null) h.up = firstUp; else break;
+            }
+            for (const h of merged) {
+              if (h.down == null) h.down = firstDown; else break;
+            }
+            for (const h of merged) {
+              if (h.eth == null) h.eth = firstEth; else break;
+            }
+            // Forward-fill: entries after DB gaps get last known value
+            let lastUp = null, lastDown = null, lastEth = null;
+            for (const h of merged) {
+              if (h.up != null) lastUp = h.up; else h.up = lastUp;
+              if (h.down != null) lastDown = h.down; else h.down = lastDown;
+              if (h.eth != null) lastEth = h.eth; else h.eth = lastEth;
+            }
+            const t0ms = parseEventStartMsFromSlug(slug);
+            if (t0ms != null) merged = merged.filter(h => h.t >= t0ms);
+            const lastPoly = [...merged].reverse().find(h => h.up != null || h.down != null);
+            if (lastPoly) {
+              ethLastPolyRef.current = { up: lastPoly.up ?? null, down: lastPoly.down ?? null };
+              try {
+                sessionStorage.setItem(`ethPoly:${slug}`, JSON.stringify(ethLastPolyRef.current));
+              } catch {}
+            }
             return merged.length > 1000 ? merged.slice(-1000) : merged;
           });
-        })
-        .catch(() => { waitingForHistory.current = false; });
+        }).catch(() => { waitingForHistory.current = false; });
+      } else {
+        // Fetch BTC historical snapshots — open price comes from DB (first snapshot)
+        fetch(`${API_BASE}/api/price-history?slug=${slug}&limit=1000`)
+          .then(r => r.json())
+          .then(d => {
+            const snaps = (d.snapshots || []).map(s => ({
+              t: new Date(s.observed_at.endsWith('Z') ? s.observed_at : s.observed_at + 'Z').getTime(),
+              btc: parseFloat(s.coin_price) || parseFloat(s.btc_price) || null,
+              up: s.up_cost != null ? parseFloat(s.up_cost) : null,
+              down: s.down_cost != null ? parseFloat(s.down_cost) : null,
+              secsLeft: s.seconds_left,
+            }));
+            // Filter out stale snapshots (btc way off from live price)
+            const refBtc = live.btc || (snaps.length > 0 ? snaps[snaps.length - 1]?.btc : null);
+            const saneSnaps = refBtc
+              ? snaps.filter(s => !s.btc || Math.abs(s.btc - refBtc) / refBtc < 0.005)
+              : snaps;
+            // Use first sane historical tick as open
+            const firstSane = saneSnaps.find(s => s.btc);
+            if (openLockedForSlug.current !== slug && firstSane && live.btc) {
+              const sane = Math.abs(firstSane.btc - live.btc) / live.btc < 0.005;
+              if (sane) {
+                setBtcOpen(firstSane.btc);
+                if (firstSane.up != null) setUpOpen(firstSane.up);
+                if (firstSane.down != null) setDownOpen(firstSane.down);
+                openLockedForSlug.current = slug;
+              }
+            }
+            waitingForHistory.current = false; // allow live capture fallback if no history
+            // Merge: keep old history + new event snapshots + live ticks
+            setHistory(prev => {
+              if (saneSnaps.length === 0) return prev;
+              const firstSnapT = saneSnaps[0].t;
+              const lastSnapT = saneSnaps[saneSnaps.length - 1].t;
+              const older = prev.filter(p => p.t < firstSnapT);
+              const newer = prev.filter(p => p.t > lastSnapT);
+              const merged = [...older, ...saneSnaps, ...newer];
+              // Back-fill: kline entries before first DB snapshot get earliest known price
+              let firstUp = null, firstDown = null;
+              for (const h of merged) {
+                if (firstUp == null && h.up != null) firstUp = h.up;
+                if (firstDown == null && h.down != null) firstDown = h.down;
+                if (firstUp != null && firstDown != null) break;
+              }
+              for (const h of merged) { if (h.up == null) h.up = firstUp; else break; }
+              for (const h of merged) { if (h.down == null) h.down = firstDown; else break; }
+              // Forward-fill: entries after DB gaps get last known value
+              let lastUp = null, lastDown = null;
+              for (const h of merged) {
+                if (h.up != null) lastUp = h.up; else h.up = lastUp;
+                if (h.down != null) lastDown = h.down; else h.down = lastDown;
+              }
+              return merged.length > 1000 ? merged.slice(-1000) : merged;
+            });
+          })
+          .catch(() => { waitingForHistory.current = false; });
+      }
     }
   }, [live.slug]);
 
@@ -422,19 +724,67 @@ export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sE
 
   // Chart data + indicators — memoized to avoid recomputing every render
   const { chartData, lastSignal, speed } = useMemo(() => {
-    const lastT = history.length > 0 ? history[history.length - 1].t : 0;
-    const windowed = history.filter(h => (lastT - h.t) / 1000 <= chartWindowS);
-    const t0 = windowed.length > 0 ? windowed[0].t : Date.now();
+    const slugForEth = event?.slug || live.slug;
+    const eventStartMs = mode === 'eth' ? parseEventStartMsFromSlug(slugForEth) : null;
+
+    let pool = history;
+    if (eventStartMs != null) pool = history.filter(h => h.t >= eventStartMs);
+
+    const lastT = pool.length > 0 ? pool[pool.length - 1].t : 0;
+    // ETH: keep rows that only have Polymarket up/down (DB often has poly before kline match fills btc/eth)
+    const windowed = pool.filter(h => {
+      const inWin = (lastT - h.t) / 1000 <= chartWindowS;
+      if (!inWin) return false;
+      if (mode !== 'eth') return (h.btc != null || h.eth != null);
+      return h.btc != null || h.eth != null || h.up != null || h.down != null;
+    });
+
+    const t0 = eventStartMs != null
+      ? eventStartMs
+      : (windowed.length > 0 ? windowed[0].t : Date.now());
+
+    const btcAnchor = eventStartMs != null
+      ? (pool.find(h => h.t >= eventStartMs && h.btc != null)?.btc ?? openPrice)
+      : openPrice;
+
+    const ethOpen = mode === 'eth'
+      ? (eventStartMs != null
+          ? (pool.find(h => h.t >= eventStartMs && h.eth != null)?.eth ?? null)
+          : (history.find(h => h.eth != null)?.eth ?? null))
+      : null;
+
     const data = windowed.map((h, i) => ({
       idx: i,
       elapsed: Math.round((h.t - t0) / 1000),
-      btcDelta: openPrice && h.btc ? h.btc - openPrice : null,
+      btcDelta: btcAnchor && h.btc ? ((h.btc - btcAnchor) / btcAnchor) * 100 : null,
+      ethDelta: ethOpen && h.eth ? ((h.eth - ethOpen) / ethOpen) * 100 : null,
+      pctSpread: (btcAnchor && h.btc && ethOpen && h.eth)
+        ? (((h.eth - ethOpen) / ethOpen) - ((h.btc - btcAnchor) / btcAnchor)) * 100
+        : null,
       upPrice: h.up != null ? h.up * 100 : null,
       downPrice: h.down != null ? h.down * 100 : null,
       btcVal: h.btc,
       sE12: h.sE12 ?? null, sE26: h.sE26 ?? null,
       ema12: null, ema26: null, macdHist: null, macdLine: null, macdSignal: null, rsi: null, signal: null,
     }));
+
+    // ETH Polymarket lines: forward-fill cents in-window, then pad from live header if history had no poly
+    if (mode === 'eth' && data.length > 0) {
+      let lu = null;
+      let ld = null;
+      for (const d of data) {
+        if (d.upPrice != null) lu = d.upPrice;
+        else if (lu != null) d.upPrice = lu;
+        if (d.downPrice != null) ld = d.downPrice;
+        else if (ld != null) d.downPrice = ld;
+      }
+      const lpUp = live.up != null ? live.up * 100 : null;
+      const lpDn = live.down != null ? live.down * 100 : null;
+      for (const d of data) {
+        if (d.upPrice == null && lpUp != null) d.upPrice = lpUp;
+        if (d.downPrice == null && lpDn != null) d.downPrice = lpDn;
+      }
+    }
 
     // BTC velocity: price change over 3-second rolling window (matches server trigger)
     for (let i = 0; i < data.length; i++) {
@@ -449,15 +799,15 @@ export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sE
       }
     }
 
-    // MACD (12,26,9) + EMA12/EMA26 for chart
+    // MACD (12,26,9) — same standard alphas as server trigger
     let mf = null, msl = null, ms = null;
     const ma12 = 2 / 13, ma26 = 2 / 27, a9 = 2 / 10;
     for (const d of data) {
       if (d.btcVal == null) continue;
       mf = mf == null ? d.btcVal : d.btcVal * ma12 + mf * (1 - ma12);
       msl = msl == null ? d.btcVal : d.btcVal * ma26 + msl * (1 - ma26);
-      d.ema12 = openPrice ? Math.round((mf - openPrice) * 100) / 100 : null;
-      d.ema26 = openPrice ? Math.round((msl - openPrice) * 100) / 100 : null;
+      d.ema12 = btcAnchor ? Math.round(((mf - btcAnchor) / btcAnchor) * 10000) / 100 : null;
+      d.ema26 = btcAnchor ? Math.round(((msl - btcAnchor) / btcAnchor) * 10000) / 100 : null;
       const ml = mf - msl;
       ms = ms == null ? ml : ml * a9 + ms * (1 - a9);
       d.macdHist = Math.round((ml - ms) * 100) / 100;
@@ -493,7 +843,7 @@ export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sE
     }
 
     // Speed
-    const ticks = history.filter(h => h.btc != null).slice(-10);
+    const ticks = pool.filter(h => h.btc != null).slice(-10);
     let spd = null;
     if (ticks.length >= 2) {
       const dt = (ticks[ticks.length - 1].t - ticks[0].t) / 1000;
@@ -501,15 +851,19 @@ export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sE
     }
 
     return { chartData: data, lastSignal: data.length > 0 ? data[data.length - 1] : null, speed: spd };
-  }, [history, openPrice, chartWindowS]);
+  }, [history, openPrice, chartWindowS, mode, event?.slug, live.slug, live.up, live.down]);
 
 
   // Map autoEma trade entries + hedges onto chart (entry = winning side, hedge = opposite)
   const entryMarkers = useMemo(() => {
     if (!autoEmaLog.length || !history.length) return [];
-    const lastT = history[history.length - 1].t;
-    const windowed = history.filter(h => (lastT - h.t) / 1000 <= chartWindowS);
-    const t0 = windowed.length > 0 ? windowed[0].t : Date.now();
+    const slugForEth = event?.slug || live.slug;
+    const eventStartMs = mode === 'eth' ? parseEventStartMsFromSlug(slugForEth) : null;
+    let pool = history;
+    if (eventStartMs != null) pool = history.filter(h => h.t >= eventStartMs);
+    const lastT = pool[pool.length - 1].t;
+    const windowed = pool.filter(h => (lastT - h.t) / 1000 <= chartWindowS);
+    const t0 = eventStartMs != null ? eventStartMs : (windowed.length > 0 ? windowed[0].t : Date.now());
     const maxElapsed = windowed.length > 0 ? Math.round((windowed[windowed.length - 1].t - t0) / 1000) : chartWindowS;
     const markers = [];
     for (const e of autoEmaLog) {
@@ -528,14 +882,18 @@ export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sE
       }
     }
     return markers;
-  }, [autoEmaLog, history, chartWindowS]);
+  }, [autoEmaLog, history, chartWindowS, mode, event?.slug, live.slug]);
 
   // My trade markers — from Polymarket API (your wallet's on-chain trades)
   const myTradeMarkers = useMemo(() => {
     if (!history.length) return [];
-    const lastT = history[history.length - 1].t;
-    const windowed = history.filter(h => (lastT - h.t) / 1000 <= chartWindowS);
-    const t0 = windowed.length > 0 ? windowed[0].t : Date.now();
+    const slugForEth = event?.slug || live.slug;
+    const eventStartMs = mode === 'eth' ? parseEventStartMsFromSlug(slugForEth) : null;
+    let pool = history;
+    if (eventStartMs != null) pool = history.filter(h => h.t >= eventStartMs);
+    const lastT = pool[pool.length - 1].t;
+    const windowed = pool.filter(h => (lastT - h.t) / 1000 <= chartWindowS);
+    const t0 = eventStartMs != null ? eventStartMs : (windowed.length > 0 ? windowed[0].t : Date.now());
     const maxElapsed = windowed.length > 0 ? Math.round((windowed[windowed.length - 1].t - t0) / 1000) : chartWindowS;
     return myTradesForEvent
       .filter(t => t.price > 0 && (t.ts || 0) > 0)
@@ -548,7 +906,7 @@ export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sE
         return { elapsed, price, isUp, isBuy };
       })
       .filter(m => m.price > 0 && m.elapsed >= 0 && m.elapsed <= maxElapsed);
-  }, [myTradesForEvent, history, chartWindowS]);
+  }, [myTradesForEvent, history, chartWindowS, mode, event?.slug, live.slug]);
 
   // Divergence detection — BTC moved but Up/Down didn't react
   const divergences = [];
@@ -630,9 +988,11 @@ export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sE
     return (
       <div className="bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-xs">
         <div className="text-gray-400">{d.elapsed}s elapsed</div>
-        {d.btcDelta != null && <div className={d.btcDelta >= 0 ? 'text-green-400' : 'text-red-400'}>BTC: {d.btcDelta >= 0 ? '+' : ''}${d.btcDelta.toFixed(2)}</div>}
-        {d.ema12 != null && <div className="text-cyan-400">EMA12: {d.ema12 >= 0 ? '+' : ''}${d.ema12.toFixed(2)}</div>}
-        {d.ema26 != null && <div className="text-purple-400">EMA26: {d.ema26 >= 0 ? '+' : ''}${d.ema26.toFixed(2)}</div>}
+        {d.btcDelta != null && <div className={d.btcDelta >= 0 ? 'text-green-400' : 'text-red-400'}>BTC: {d.btcDelta >= 0 ? '+' : ''}{d.btcDelta.toFixed(3)}%</div>}
+        {d.ethDelta != null && <div className={d.ethDelta >= 0 ? 'text-green-400' : 'text-red-400'}>ETH: {d.ethDelta >= 0 ? '+' : ''}{d.ethDelta.toFixed(3)}%</div>}
+        {d.pctSpread != null && <div className="text-orange-400">ETH vs BTC: {d.pctSpread >= 0 ? '+' : ''}{d.pctSpread.toFixed(3)}% {d.pctSpread > 0 ? '(ETH over)' : '(ETH under)'}</div>}
+        {d.ema12 != null && <div className="text-cyan-400">EMA12: {d.ema12 >= 0 ? '+' : ''}{d.ema12.toFixed(3)}%</div>}
+        {d.ema26 != null && <div className="text-purple-400">EMA26: {d.ema26 >= 0 ? '+' : ''}{d.ema26.toFixed(3)}%</div>}
         {d.btcVal && <div className="text-yellow-400">BTC: ${d.btcVal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>}
         {d.upPrice != null && <div className="text-green-300">Up: {d.upPrice.toFixed(1)}¢</div>}
         {d.downPrice != null && <div className="text-red-300">Down: {d.downPrice.toFixed(1)}¢</div>}
@@ -897,7 +1257,7 @@ export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sE
       {chartData.length > 2 ? (
         <div className="rounded-xl border border-gray-800 bg-gray-900 p-4">
           <div className="flex items-center justify-between mb-3">
-            <h3 className="text-sm font-bold text-gray-300">BTC Price Change vs Polymarket Prices</h3>
+            <h3 className="text-sm font-bold text-gray-300">{mode === 'eth' ? 'BTC Price Change vs ETH Polymarket Prices' : 'BTC Price Change vs Polymarket Prices'}</h3>
             <div className="flex items-center gap-1">
               {[60, 120, 180, 300, 600, 900].map(s => (
                 <button key={s} onClick={() => setChartWindowS(s)}
@@ -910,11 +1270,13 @@ export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sE
             <ComposedChart data={chartData} margin={{ top: 5, right: 10, left: 0, bottom: 5 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#333" />
               <XAxis dataKey="elapsed" tickFormatter={formatElapsed} stroke="#666" tick={{ fontSize: 11 }} interval="preserveStartEnd" />
-              <YAxis yAxisId="btc" orientation="left" width={50} stroke="#eab308" tick={{ fontSize: 11 }} tickFormatter={v => `${v >= 0 ? '+' : ''}$${Math.abs(v).toFixed(0)}`} domain={['auto', 'auto']} label={{ value: 'BTC $', angle: -90, position: 'insideLeft', fill: '#eab308', fontSize: 11 }} />
+              <YAxis yAxisId="btc" orientation="left" width={50} stroke="#eab308" tick={{ fontSize: 11 }} tickFormatter={v => `${v >= 0 ? '+' : ''}${v.toFixed(2)}%`} domain={['auto', 'auto']} label={{ value: mode === 'eth' ? 'BTC/ETH %' : 'BTC %', angle: -90, position: 'insideLeft', fill: '#eab308', fontSize: 11 }} />
               <YAxis yAxisId="poly" orientation="right" width={40} stroke="#4ade80" tick={{ fontSize: 11 }} tickFormatter={v => `${v.toFixed(0)}¢`} domain={[0, 100]} label={{ value: 'Price (¢)', angle: 90, position: 'insideRight', fill: '#4ade80', fontSize: 11 }} />
               <Tooltip content={<CustomTooltip />} position={{ x: 70, y: 0 }} />
               <ReferenceLine yAxisId="btc" y={0} stroke="#555" strokeDasharray="3 3" />
               <Area yAxisId="btc" dataKey="btcDelta" stroke="#eab308" fill="#eab30822" strokeWidth={2} dot={false} connectNulls isAnimationActive={false} />
+              {mode === 'eth' && <Line yAxisId="btc" dataKey="ethDelta" stroke="#8b5cf6" strokeWidth={2} dot={false} connectNulls isAnimationActive={false} />}
+              {mode === 'eth' && <Line yAxisId="btc" dataKey="pctSpread" stroke="#f97316" strokeWidth={1.5} dot={false} connectNulls isAnimationActive={false} strokeDasharray="6 3" />}
               <Line yAxisId="btc" dataKey="ema12" stroke="#06b6d4" strokeWidth={1.5} dot={false} connectNulls isAnimationActive={false} strokeDasharray="4 2" />
               <Line yAxisId="btc" dataKey="ema26" stroke="#a855f7" strokeWidth={1.5} dot={false} connectNulls isAnimationActive={false} strokeDasharray="4 2" />
               <Line yAxisId="poly" dataKey="upPrice" stroke="#4ade80" strokeWidth={2} dot={false} connectNulls isAnimationActive={false} />
@@ -938,7 +1300,9 @@ export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sE
             </ComposedChart>
           </ResponsiveContainer>
           <div className="flex items-center justify-center gap-6 mt-2 text-xs flex-wrap">
-            <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-yellow-500 inline-block"></span> BTC $</span>
+            <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-yellow-500 inline-block"></span> BTC %</span>
+            {mode === 'eth' && <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-violet-500 inline-block"></span> ETH %</span>}
+            {mode === 'eth' && <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-orange-500 inline-block" style={{borderTop:'1px dashed'}}></span> Spread</span>}
             <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-green-400 inline-block"></span> Up</span>
             <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-red-400 inline-block"></span> Down</span>
             <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-cyan-400 inline-block" style={{borderTop:'1px dashed'}}></span> EMA12</span>
