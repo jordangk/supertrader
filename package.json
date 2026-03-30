@@ -7,7 +7,8 @@
     "dev:api": "node server.js",
     "dev:ui": "vite",
     "build": "vite build",
-    "start": "NODE_ENV=production node server.js"
+    "start": "NODE_ENV=production node server.js",
+    "test:kalshi": "node scripts/kalshi-smoke-test.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.80.0",

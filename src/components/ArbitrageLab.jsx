@@ -166,6 +166,7 @@ export default function ArbitrageLab() {
           autoEnabled: recurring || autoEnabled,
           autoThreshold: autoThreshold,
           autoCooldown: autoCooldown,
+          maxShares: maxShares,
           swapPoly: swapPoly,
           recurring: recurring,
         }),
@@ -441,6 +442,7 @@ export default function ArbitrageLab() {
   const [autoEnabled, setAutoEnabled] = useState(false);
   const [autoThreshold, setAutoThreshold] = useState(3); // min profit in cents/sh
   const [autoCooldown, setAutoCooldown] = useState(60); // cooldown in seconds
+  const [maxShares, setMaxShares] = useState(50); // per-campaign cap (global default is 50)
   const [fillAny, setFillAny] = useState(false);
   const autoCooldownUntil = useRef(0);
   const autoLock = useRef(false);
@@ -793,6 +795,7 @@ export default function ArbitrageLab() {
                     // Load this campaign into the main view
                     setExternalUrl(c.kalshi_url);
                     setPolySlug(c.poly_url);
+                    setMaxShares(c.max_shares || 50);
                     if (c.session_id) { setSessionId(c.session_id); setRunning(true); }
                   }}
                   className="flex-1 text-left text-amber-400 hover:text-amber-300 truncate"
@@ -821,7 +824,13 @@ export default function ArbitrageLab() {
                     defaultValue={c.auto_cooldown_sec}
                     onBlur={(e) => fetch(`${API_BASE}/api/arb/campaigns/${c.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ autoCooldown: parseInt(e.target.value) || 60 }) })}
                     className="w-10 bg-transparent border-b border-gray-700 text-center text-[9px] focus:border-amber-500 outline-none"
-                  />s
+                  />s/
+                  <input
+                    type="number"
+                    defaultValue={c.max_shares ?? 50}
+                    onBlur={(e) => fetch(`${API_BASE}/api/arb/campaigns/${c.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ maxShares: parseInt(e.target.value) || 50 }) })}
+                    className="w-9 bg-transparent border-b border-gray-700 text-center text-[9px] focus:border-amber-500 outline-none"
+                  />sh
                 </span>
                 {c.live?.best != null && (
                   <span className={`px-1 py-0.5 rounded text-[9px] font-bold ${c.live.best > 0 ? 'bg-green-900/50 text-green-400' : 'bg-red-900/30 text-red-400'}`}>
@@ -1096,6 +1105,16 @@ export default function ArbitrageLab() {
               className="w-12 bg-gray-900 border border-gray-700 rounded px-1 py-0.5 text-center text-[10px]"
             />
             <span>s</span>
+          </label>
+          <label className="flex items-center gap-1 text-[10px] text-gray-500">
+            <span>max</span>
+            <input
+              type="number"
+              value={maxShares}
+              onChange={(e) => setMaxShares(Math.max(1, parseInt(e.target.value) || 50))}
+              className="w-12 bg-gray-900 border border-gray-700 rounded px-1 py-0.5 text-center text-[10px]"
+            />
+            <span>sh</span>
           </label>
           {autoEnabled && Date.now() < autoCooldownUntil.current && (
             <span className="text-[10px] text-yellow-400">cooling...</span>

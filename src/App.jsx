@@ -16,6 +16,7 @@ import PriceTracker from './components/PriceTracker.jsx';
 import EventSearch from './components/EventSearch.jsx';
 import PriceDivergence from './components/PriceDivergence.jsx';
 import EmaTradeLog from './components/EmaTradeLog.jsx';
+import Btc5mSequenceTab from './components/Btc5mSequenceTab.jsx';
 import { getApiBase } from './apiBase.js';
 
 const AMOUNTS = [50, 25, 10, 5];
@@ -789,15 +790,21 @@ export default function App() {
             </div>
             {/* BTC / ETH tab switcher */}
             <div className="flex gap-2 mb-2">
-              {['btc', 'eth'].map(t => (
-                <button key={t} onClick={() => setTab(t)}
-                  className={`px-4 py-1 rounded text-sm font-bold transition-colors ${tab === t ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'}`}>
-                  {t.toUpperCase()}
+              {[
+                { id: 'btc', label: 'BTC' },
+                { id: 'eth', label: 'ETH' },
+                { id: 'btc5m', label: 'BTC 5m' },
+              ].map((t) => (
+                <button key={t.id} onClick={() => setTab(t.id)}
+                  className={`px-4 py-1 rounded text-sm font-bold transition-colors ${tab === t.id ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'}`}>
+                  {t.label}
                 </button>
               ))}
             </div>
             {tab === 'btc' ? (
               <PriceDivergence key={event?.slug} prices={prices} btc={btc} binanceBtc={binanceBtc} serverEma={serverEma} priceEma={priceEma} event={event} autoEmaLog={autoEma.log || []} />
+            ) : tab === 'btc5m' ? (
+              <Btc5mSequenceTab />
             ) : (
               <>
                 {/* ETH Auto-Trade Toggle */}
