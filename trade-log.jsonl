@@ -1,0 +1,225 @@
+{"ts":"2026-03-24T06:16:46.247Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":48,"gap":-1.561129206073666,"ethUp":0.54,"ethDown":0.48}
+{"ts":"2026-03-24T06:16:46.744Z","strategy":"eth-ema","action":"entry","side":"down","buyPrice":0.46,"shares":5,"gap":-1.561129206073666,"orderId":"0x1d248c11c104adbf62f443e668ae7e1bb3e35f5a7c847fdc18516724537140eb","eventSlug":"eth-updown-15m-1774332900"}
+{"ts":"2026-03-24T06:17:42.633Z","strategy":"eth-ema","action":"hedge","side":"up","buyPrice":0.4,"shares":5,"entryPrice":0.46,"totalCost":86,"profitCents":14,"reason":"ema_cross_back(12¢, gap=$0.1)","eventSlug":"eth-updown-15m-1774332900"}
+{"ts":"2026-03-24T06:17:47.301Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":51,"gap":1.2539556207301068,"ethUp":0.51,"ethDown":0.5}
+{"ts":"2026-03-24T06:17:47.615Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.49,"shares":5,"gap":1.2539556207301068,"orderId":"0xf6496d43c282e1609dbcc7a80028aeb02ed8f58db784c12ddd0596e24ec7f2ab","eventSlug":"eth-updown-15m-1774332900"}
+{"ts":"2026-03-24T06:18:58.727Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":36,"gap":0.09821871827298168,"ethUp":0.36,"ethDown":0.66}
+{"ts":"2026-03-24T06:18:59.228Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.39,"shares":5,"gap":0.9735341909833295,"orderId":"0x0ae95b0b60fc0c4b62c8acb5cab014912e8431ced3e93ea340ffbc44fc5261b5","eventSlug":"eth-updown-15m-1774332900"}
+{"ts":"2026-03-24T06:19:11.146Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.63,"shares":5,"entryPrice":0.39,"totalCost":102,"profitCents":-2,"reason":"ema_cross_back(-2¢, gap=$-0.0)","eventSlug":"eth-updown-15m-1774332900"}
+{"ts":"2026-03-24T06:19:33.247Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":32,"gap":0.114731501629322,"ethUp":0.32,"ethDown":0.69}
+{"ts":"2026-03-24T06:19:33.562Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.32,"shares":5,"gap":1.1968225167519435,"orderId":"0x83e6ab94728f541e56cbf2da6bbe8fabc473f1072b3dd0c72d42fb85f13844d1","eventSlug":"eth-updown-15m-1774332900"}
+{"ts":"2026-03-24T06:19:46.678Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.67,"shares":5,"entryPrice":0.32,"totalCost":99,"profitCents":1,"reason":"ema_cross_back(2¢, gap=$-0.2)","eventSlug":"eth-updown-15m-1774332900"}
+{"ts":"2026-03-24T06:20:28.020Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":30,"gap":0.3523461564580259,"ethUp":0.3,"ethDown":0.73}
+{"ts":"2026-03-24T06:20:28.347Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.3,"shares":5,"gap":0.3523461564580259,"orderId":"0xf7efc4e2b2a5a37907c7e6f41d43f73db3d0097c8f00d3c8cb4df2076375a4a0","eventSlug":"eth-updown-15m-1774332900"}
+{"ts":"2026-03-24T06:21:03.845Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.6,"shares":5,"entryPrice":0.3,"totalCost":90,"profitCents":10,"reason":"ema_cross_back(10¢, gap=$-0.2)","eventSlug":"eth-updown-15m-1774332900"}
+{"ts":"2026-03-24T06:21:26.788Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":47,"gap":0.1623036155480051,"ethUp":0.47,"ethDown":0.54}
+{"ts":"2026-03-24T06:21:27.120Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.46,"shares":5,"gap":0.1623036155480051,"orderId":"0x5d994938f34b38da38bc0b38ec9535fc9d1979a402ae132f7e6dbf4a4c2dbbe6","eventSlug":"eth-updown-15m-1774332900"}
+{"ts":"2026-03-24T06:22:01.459Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.39,"shares":5,"entryPrice":0.46,"totalCost":85,"profitCents":15,"reason":"ema_cross_back(16¢, gap=$-0.1)","eventSlug":"eth-updown-15m-1774332900"}
+{"ts":"2026-03-24T06:22:06.798Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":37,"gap":-1.87044462864427,"ethUp":0.63,"ethDown":0.37}
+{"ts":"2026-03-24T06:22:07.144Z","strategy":"eth-ema","action":"entry","side":"down","buyPrice":0.37,"shares":5,"gap":-1.87044462864427,"orderId":"0xc692ad4c6f4ff422fe05d7e566998ee2c7d1050542f49dd7c0b6d24859376444","eventSlug":"eth-updown-15m-1774332900"}
+{"ts":"2026-03-24T06:22:15.281Z","strategy":"eth-ema","action":"hedge","side":"up","buyPrice":0.62,"shares":5,"entryPrice":0.37,"totalCost":99,"profitCents":1,"reason":"ema_cross_back(1¢, gap=$0.1)","eventSlug":"eth-updown-15m-1774332900"}
+{"ts":"2026-03-24T06:30:16.826Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":36,"gap":-0.4656912693469608,"ethUp":0.64,"ethDown":0.36}
+{"ts":"2026-03-24T06:30:17.596Z","strategy":"eth-ema","action":"entry","side":"down","buyPrice":0.38,"shares":5,"gap":1.3661935963759237,"orderId":"0x3ab4046e6731a16bcc4fa76de0e6eed8cac71d9faf9c88cddf08bf05830ee28b","eventSlug":"eth-updown-15m-1774333800"}
+{"ts":"2026-03-24T06:30:18.993Z","strategy":"eth-ema","action":"hedge","side":"up","buyPrice":0.65,"shares":5,"entryPrice":0.38,"totalCost":103,"profitCents":-3,"reason":"ema_cross_back(-5¢, gap=$1.3)","eventSlug":"eth-updown-15m-1774333800"}
+{"ts":"2026-03-24T06:30:30.083Z","strategy":"eth-ema","action":"hedge-fak","side":"up","price":0.77,"shares":5,"reason":"10s_force"}
+{"ts":"2026-03-24T06:45:03.689Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":46,"gap":3.266141447585718,"ethUp":0.46,"ethDown":0.54}
+{"ts":"2026-03-24T06:45:04.461Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.48,"shares":5,"gap":3.266141447585718,"orderId":"0x40c26bd9a7e46cb8763d95c2a54be6aeb285a240fe2327a8220f35bce6adb9f5","eventSlug":"eth-updown-15m-1774334700"}
+{"ts":"2026-03-24T06:45:32.487Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.51,"shares":5,"entryPrice":0.48,"totalCost":99,"profitCents":1,"reason":"ema_cross_back(-2¢, gap=$-0.0)","eventSlug":"eth-updown-15m-1774334700"}
+{"ts":"2026-03-24T06:45:43.625Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.64,"shares":5,"reason":"10s_force"}
+{"ts":"2026-03-24T06:45:46.581Z","strategy":"btc-ema","action":"entry","side":"up","buyPrice":0.42,"shares":5,"gap":-0.5404815667163598,"fGap":-2.1186085994409076,"orderId":"0xda1ecbe0612e2f2f92e8736818e4b44b065a39e14c3d4ccf73c2577c5a55777c","eventSlug":"btc-updown-15m-1774334700"}
+{"ts":"2026-03-24T06:45:48.074Z","strategy":"btc-ema","action":"hedge","side":"down","buyPrice":0.59,"shares":5,"entryPrice":0.42,"totalCost":101,"profitCents":-1,"reason":"ema_cross_back(-3¢, gap=$-2.1)","eventSlug":"btc-updown-15m-1774334700"}
+{"ts":"2026-03-24T06:45:55.069Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":35,"gap":0.007163939738923375,"ethUp":0.35,"ethDown":0.65}
+{"ts":"2026-03-24T06:45:55.704Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.38,"shares":5,"gap":0.007163939738923375,"orderId":"0xce0ec0def78cedf2413777b3e622cfafcb491403ae64a5e4611a6c4276a12609","eventSlug":"eth-updown-15m-1774334700"}
+{"ts":"2026-03-24T06:45:59.185Z","strategy":"btc-ema","action":"hedge-fak","side":"down","price":0.63,"shares":5,"reason":"10s_force"}
+{"ts":"2026-03-24T06:47:13.761Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.44,"shares":5,"entryPrice":0.38,"totalCost":82,"profitCents":18,"reason":"ema_cross_back(14¢, gap=$-0.2)","eventSlug":"eth-updown-15m-1774334700"}
+{"ts":"2026-03-24T06:47:24.724Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.49,"shares":5,"reason":"10s_force"}
+{"ts":"2026-03-24T06:47:41.024Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":39,"gap":-0.13614457414594838,"ethUp":0.64,"ethDown":0.39}
+{"ts":"2026-03-24T06:47:41.599Z","strategy":"eth-ema","action":"entry","side":"down","buyPrice":0.46,"shares":5,"gap":-0.798748644222524,"orderId":"0xb8a973a939dff75d190bb01af758699a933a04b17b242b5562d51712d3662cb7","eventSlug":"eth-updown-15m-1774334700"}
+{"ts":"2026-03-24T06:48:35.340Z","strategy":"eth-ema","action":"hedge","side":"up","buyPrice":0.61,"shares":5,"entryPrice":0.46,"totalCost":107,"profitCents":-7,"reason":"ema_cross_back(-6¢, gap=$0.1)","eventSlug":"eth-updown-15m-1774334700"}
+{"ts":"2026-03-24T06:48:46.469Z","strategy":"eth-ema","action":"hedge-fak","side":"up","price":0.58,"shares":5,"reason":"10s_force"}
+{"ts":"2026-03-24T06:49:03.022Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":43,"gap":-0.11886429100319518,"ethUp":0.55,"ethDown":0.43}
+{"ts":"2026-03-24T06:49:03.666Z","strategy":"eth-ema","action":"entry","side":"down","buyPrice":0.49,"shares":5,"gap":-1.8150827656681514,"orderId":"0x0df1574ba83a6d89add9880ae8cb86caae388c5f7124f2170a1d8c24ebee1a45","eventSlug":"eth-updown-15m-1774334700"}
+{"ts":"2026-03-24T06:49:34.597Z","strategy":"eth-ema","action":"hedge","side":"up","buyPrice":0.38,"shares":5,"entryPrice":0.49,"totalCost":87,"profitCents":13,"reason":"ema_gap_6(1¢, gap=$-6.1)","eventSlug":"eth-updown-15m-1774334700"}
+{"ts":"2026-03-24T06:49:45.606Z","strategy":"eth-ema","action":"hedge-fak","side":"up","price":0.46,"shares":5,"reason":"10s_force"}
+{"ts":"2026-03-24T06:50:51.433Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":38,"gap":0.17685355647765633,"ethUp":0.38,"ethDown":0.71}
+{"ts":"2026-03-24T06:54:01.470Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":45,"gap":-0.002474453687675293,"ethUp":0.59,"ethDown":0.45}
+{"ts":"2026-03-24T06:54:02.220Z","strategy":"eth-ema","action":"entry","side":"down","buyPrice":0.48,"shares":5,"gap":-1.1117663725829026,"orderId":"0x0bcb14026b0c56656dc5a4703b1fd255cfbd697e720cb2b8b0c11311ef9ae004","eventSlug":"eth-updown-15m-1774334700"}
+{"ts":"2026-03-24T06:54:33.536Z","strategy":"eth-ema","action":"hedge","side":"up","buyPrice":0.47000000000000003,"shares":5,"entryPrice":0.48,"totalCost":95,"profitCents":5,"reason":"ema_cross_back(4¢, gap=$0.1)","eventSlug":"eth-updown-15m-1774334700"}
+{"ts":"2026-03-24T06:54:44.611Z","strategy":"eth-ema","action":"hedge-fak","side":"up","price":0.56,"shares":5,"reason":"10s_force"}
+{"ts":"2026-03-24T06:55:03.275Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":50,"gap":0.05586678760792552,"ethUp":0.5,"ethDown":0.51}
+{"ts":"2026-03-24T06:55:03.851Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.5700000000000001,"shares":5,"gap":0.5579421706993202,"orderId":"0x970b2762b681e17e143af5c49cf929f5bae2cc380ff338c625c881fe06688c47","eventSlug":"eth-updown-15m-1774334700"}
+{"ts":"2026-03-24T06:55:53.382Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.37,"shares":5,"entryPrice":0.5700000000000001,"totalCost":94,"profitCents":6,"reason":"ema_cross_back(5¢, gap=$-0.1)","eventSlug":"eth-updown-15m-1774334700"}
+{"ts":"2026-03-24T06:56:04.300Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.41000000000000003,"shares":5,"reason":"10s_force"}
+{"ts":"2026-03-24T06:56:28.352Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":54,"gap":0.005056300659049384,"ethUp":0.54,"ethDown":0.49}
+{"ts":"2026-03-24T06:56:29.127Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.6,"shares":5,"gap":0.8833418449811816,"orderId":"0xb24c4136504926f36d8ac6a3495ef7e0a72a924a818af84bd9328fc30c541b32","eventSlug":"eth-updown-15m-1774334700"}
+{"ts":"2026-03-24T06:57:28.819Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.02,"shares":5,"entryPrice":0.6,"totalCost":62,"profitCents":38,"reason":"ema_cross_back(36¢, gap=$-0.0)","eventSlug":"eth-updown-15m-1774334700"}
+{"ts":"2026-03-24T06:57:39.587Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.13,"shares":5,"reason":"10s_force"}
+{"ts":"2026-03-24T08:34:06.924Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":32,"gap":-0.03724365893861936,"ethUp":0.67,"ethDown":0.32}
+{"ts":"2026-03-24T08:34:07.732Z","strategy":"eth-ema","action":"entry","side":"down","buyPrice":0.37,"shares":5,"gap":-0.6074964509547849,"orderId":"0xc64dbbb9f52a0d45c6bc0b714f84f9c2cf3c9f443f4b3ce9b0c5a8f8a8eb9485","eventSlug":"eth-updown-15m-1774341000"}
+{"ts":"2026-03-24T08:34:09.413Z","strategy":"eth-ema","action":"hedge","side":"up","buyPrice":0.63,"shares":5,"entryPrice":0.37,"totalCost":100,"profitCents":0,"reason":"ema_cross_back(-2¢, gap=$0.0)","eventSlug":"eth-updown-15m-1774341000"}
+{"ts":"2026-03-24T09:08:14.624Z","strategy":"eth-ema","action":"hedge-fak","side":"up","price":0.48,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T09:08:18.544Z","strategy":"eth-ema","action":"hedge-fak","side":"up","price":0.47000000000000003,"shares":5,"reason":"10s_force_#2"}
+{"ts":"2026-03-24T09:08:21.879Z","strategy":"eth-ema","action":"hedge-fak","side":"up","price":0.47000000000000003,"shares":5,"reason":"10s_force_#3"}
+{"ts":"2026-03-24T09:08:25.189Z","strategy":"eth-ema","action":"hedge-fak","side":"up","price":0.5,"shares":5,"reason":"10s_force_#4"}
+{"ts":"2026-03-24T10:09:14.275Z","strategy":"eth-ema","action":"hedge-fak","side":"up","price":0.52,"shares":5,"reason":"10s_force_#5"}
+{"ts":"2026-03-24T11:10:15.140Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":54,"gap":7.086055232967382,"ethUp":0.54,"ethDown":0.45}
+{"ts":"2026-03-24T11:10:15.925Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.55,"shares":5,"gap":7.086055232967382,"orderId":"0x3ceef2939ff7e8cf934e483f28fa4ee979f2176f8a0368edc705769ea9e1eae0","eventSlug":"eth-updown-15m-1774350000"}
+{"ts":"2026-03-24T11:10:16.343Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.45,"shares":5,"entryPrice":0.55,"totalCost":100,"profitCents":0,"reason":"ema_gap_6(-1¢, gap=$7.3)","eventSlug":"eth-updown-15m-1774350000"}
+{"ts":"2026-03-24T11:10:27.445Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.43,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T11:12:23.651Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":43,"gap":0.07217530879376,"ethUp":0.43,"ethDown":0.58}
+{"ts":"2026-03-24T11:12:24.246Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.45,"shares":5,"gap":0.15838534129157722,"orderId":"0x27b620e19fb3d06c71ed8b16e7e72e7f7f6821f2b29d9f5440dab61ba59e5062","eventSlug":"eth-updown-15m-1774350000"}
+{"ts":"2026-03-24T11:13:23.530Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.92,"shares":5,"entryPrice":0.45,"totalCost":137,"profitCents":-37,"reason":"ema_cross_back(-20¢, gap=$-4.5)","eventSlug":"eth-updown-15m-1774350000"}
+{"ts":"2026-03-24T11:14:25.468Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.99,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T11:14:29.034Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.99,"shares":5,"reason":"10s_force_#2"}
+{"ts":"2026-03-24T11:15:27.051Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.99,"shares":5,"reason":"10s_force_#3"}
+{"ts":"2026-03-24T11:15:30.615Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.99,"shares":5,"reason":"10s_force_#4"}
+{"ts":"2026-03-24T11:16:28.647Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.99,"shares":5,"reason":"10s_force_#5"}
+{"ts":"2026-03-24T11:28:49.975Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":36,"gap":-0.10551707611632466,"ethUp":0.64,"ethDown":0.36}
+{"ts":"2026-03-24T11:31:53.622Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":48,"gap":-0.7630845615004559,"ethUp":0.55,"ethDown":0.48}
+{"ts":"2026-03-24T11:31:54.387Z","strategy":"eth-ema","action":"entry","side":"down","buyPrice":0.43,"shares":5,"gap":1.074919985779443,"orderId":"0x8749969faf3376a82d913a3abb54c8488784a16f09ca4be728e4a2e8501f6aa8","eventSlug":"eth-updown-15m-1774351800"}
+{"ts":"2026-03-24T11:31:55.828Z","strategy":"eth-ema","action":"hedge","side":"up","buyPrice":0.6,"shares":5,"entryPrice":0.43,"totalCost":103,"profitCents":-3,"reason":"ema_cross_back(-2¢, gap=$1.1)","eventSlug":"eth-updown-15m-1774351800"}
+{"ts":"2026-03-24T11:32:54.131Z","strategy":"eth-ema","action":"hedge-fak","side":"up","price":0.68,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T11:45:14.861Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":45,"gap":0.5733996679114377,"ethUp":0.45,"ethDown":0.56}
+{"ts":"2026-03-24T11:45:15.629Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.47000000000000003,"shares":5,"gap":-1.9317759627245152,"orderId":"0x1bf1ce02edd81d572d95fb57e49a029b7131168b175ea9ecbe6b54d172940c23","eventSlug":"eth-updown-15m-1774352700"}
+{"ts":"2026-03-24T11:45:16.077Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.59,"shares":5,"entryPrice":0.47000000000000003,"totalCost":106,"profitCents":-6,"reason":"ema_cross_back(-7¢, gap=$-1.9)","eventSlug":"eth-updown-15m-1774352700"}
+{"ts":"2026-03-24T11:46:15.279Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.55,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T11:48:23.486Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":48,"gap":-0.11612025787088953,"ethUp":0.53,"ethDown":0.48}
+{"ts":"2026-03-24T12:00:38.681Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":43,"gap":-7.668935226248287,"ethUp":0.56,"ethDown":0.43}
+{"ts":"2026-03-24T12:03:42.454Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":46,"gap":0.7027789326891565,"ethUp":0.46,"ethDown":0.57}
+{"ts":"2026-03-24T12:03:43.255Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.46,"shares":5,"gap":3.0836440470730366,"orderId":"0x7f4dc8d3dc755c1fca8a01a47a55cd77e63b15e700863325ddcf46a9ecb1390c","eventSlug":"eth-updown-15m-1774353600"}
+{"ts":"2026-03-24T12:04:44.777Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.59,"shares":5,"entryPrice":0.46,"totalCost":105,"profitCents":-5,"reason":"ema_cross_back(-5¢, gap=$-1.8)","eventSlug":"eth-updown-15m-1774353600"}
+{"ts":"2026-03-24T12:05:46.437Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.78,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T12:16:06.684Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":46,"gap":0.058994176371435,"ethUp":0.46,"ethDown":0.59}
+{"ts":"2026-03-24T12:16:07.503Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.49,"shares":5,"gap":1.1390794518465555,"orderId":"0xdc3761fbd2ae4ab1f70adb2e4479d672953a132e261661a05c976f19635f249a","eventSlug":"eth-updown-15m-1774354500"}
+{"ts":"2026-03-24T12:17:04.390Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.5700000000000001,"shares":5,"entryPrice":0.49,"totalCost":106,"profitCents":-6,"reason":"ema_cross_back(-5¢, gap=$-0.2)","eventSlug":"eth-updown-15m-1774354500"}
+{"ts":"2026-03-24T12:18:05.249Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.66,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T12:31:26.702Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":36,"gap":0.04585686245773424,"ethUp":0.36,"ethDown":0.72}
+{"ts":"2026-03-24T12:31:27.570Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.43,"shares":5,"gap":1.4750114142110942,"orderId":"0x4360f8cbb35ae332b7fd36cf1a1a6c8ff15f2e2a4302feb2605b6f5b53805915","eventSlug":"eth-updown-15m-1774355400"}
+{"ts":"2026-03-24T12:32:29.499Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.65,"shares":5,"entryPrice":0.43,"totalCost":108,"profitCents":-8,"reason":"ema_cross_back(-12¢, gap=$-0.8)","eventSlug":"eth-updown-15m-1774355400"}
+{"ts":"2026-03-24T12:33:30.045Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.89,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T12:45:49.454Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":44,"gap":-0.16694523479077622,"ethUp":0.55,"ethDown":0.44}
+{"ts":"2026-03-24T12:45:50.247Z","strategy":"eth-ema","action":"entry","side":"down","buyPrice":0.47000000000000003,"shares":5,"gap":-0.16694523479077622,"orderId":"0xaa1fef5bf734a26856dbbcc3c7d343899251e2e984d8c35f65dbe1ec967fa8a2","eventSlug":"eth-updown-15m-1774356300"}
+{"ts":"2026-03-24T12:47:56.541Z","strategy":"eth-ema","action":"hedge","side":"up","buyPrice":0.52,"shares":5,"entryPrice":0.47000000000000003,"totalCost":99,"profitCents":1,"reason":"ema_cross_back(-1¢, gap=$0.2)","eventSlug":"eth-updown-15m-1774356300"}
+{"ts":"2026-03-24T12:48:53.337Z","strategy":"eth-ema","action":"hedge-fak","side":"up","price":0.47000000000000003,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T12:50:56.781Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":49,"gap":3.111599477216238,"ethUp":0.49,"ethDown":0.47}
+{"ts":"2026-03-24T12:50:57.396Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.55,"shares":5,"gap":11.310808319226817,"orderId":"0xc0a41635ab10fb258a1227ec031b20f9527605da363d32695312277370ce0985","eventSlug":"eth-updown-15m-1774356300"}
+{"ts":"2026-03-24T12:50:57.831Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.49,"shares":5,"entryPrice":0.55,"totalCost":104,"profitCents":-4,"reason":"ema_gap_6(-6¢, gap=$12.7)","eventSlug":"eth-updown-15m-1774356300"}
+{"ts":"2026-03-24T12:51:58.365Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.6,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T12:53:00.525Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":52,"gap":7.324834560094519,"ethUp":0.52,"ethDown":0.17}
+{"ts":"2026-03-24T12:53:01.644Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.84,"shares":5,"gap":25.24610626542632,"orderId":"0x1af89d0ff7cbe0ca52932b8e5cafe4b6ec2c929fde0f09f3edfb3a3aac81cab6","eventSlug":"eth-updown-15m-1774356300"}
+{"ts":"2026-03-24T12:53:01.906Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.15,"shares":5,"entryPrice":0.84,"totalCost":99,"profitCents":1,"reason":"ema_gap_6(-30¢, gap=$25.8)","eventSlug":"eth-updown-15m-1774356300"}
+{"ts":"2026-03-24T12:54:01.917Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.35000000000000003,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T12:58:07.985Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":33,"gap":-0.059097868382224306,"ethUp":0.68,"ethDown":0.33}
+{"ts":"2026-03-24T13:00:11.483Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":53,"gap":-0.8161894219991517,"ethUp":0.46,"ethDown":0.53}
+{"ts":"2026-03-24T13:00:12.269Z","strategy":"eth-ema","action":"entry","side":"down","buyPrice":0.56,"shares":5,"gap":-0.8161894219991517,"orderId":"0x0994ccfbe43ca33ae7765ba224906ef8b985a764bf7a2f56428cad8133950a12","eventSlug":"eth-updown-15m-1774357200"}
+{"ts":"2026-03-24T13:01:12.920Z","strategy":"eth-ema","action":"hedge","side":"up","buyPrice":0.52,"shares":5,"entryPrice":0.56,"totalCost":108,"profitCents":-8,"reason":"ema_cross_back(-8¢, gap=$0.0)","eventSlug":"eth-updown-15m-1774357200"}
+{"ts":"2026-03-24T13:02:14.843Z","strategy":"eth-ema","action":"hedge-fak","side":"up","price":0.64,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T13:05:22.162Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":39,"gap":0.1837114980605925,"ethUp":0.39,"ethDown":0.61}
+{"ts":"2026-03-24T13:05:22.813Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.48,"shares":5,"gap":1.651120991013677,"orderId":"0x538e879139c04511f2090bbb463bb9bbf5e266f3baf85742a91f4d7e3b21bde4","eventSlug":"eth-updown-15m-1774357200"}
+{"ts":"2026-03-24T13:06:23.372Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.45,"shares":5,"entryPrice":0.48,"totalCost":93,"profitCents":7,"reason":"ema_gap_6(8¢, gap=$6.1)","eventSlug":"eth-updown-15m-1774357200"}
+{"ts":"2026-03-24T13:07:23.329Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.85,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T13:15:35.830Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":52,"gap":-5.93907722599392,"ethUp":0.47,"ethDown":0.52}
+{"ts":"2026-03-24T13:15:36.624Z","strategy":"eth-ema","action":"entry","side":"down","buyPrice":0.55,"shares":5,"gap":1.6955305131370046,"orderId":"0x71913dd9f625f468afaf7d296c0b5630840e4de04f8ea924ed3d0cdec65e94b3","eventSlug":"eth-updown-15m-1774358100"}
+{"ts":"2026-03-24T13:15:36.809Z","strategy":"eth-ema","action":"hedge","side":"up","buyPrice":0.46,"shares":5,"entryPrice":0.55,"totalCost":101,"profitCents":-1,"reason":"ema_cross_back(-2¢, gap=$1.6)","eventSlug":"eth-updown-15m-1774358100"}
+{"ts":"2026-03-24T13:16:37.630Z","strategy":"eth-ema","action":"hedge-fak","side":"up","price":0.48,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T13:31:01.118Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":39,"gap":-0.08117091011375202,"ethUp":0.62,"ethDown":0.39}
+{"ts":"2026-03-24T13:31:01.965Z","strategy":"eth-ema","action":"entry","side":"down","buyPrice":0.43,"shares":5,"gap":-1.1733913486244623,"orderId":"0x5570a0714b9f363f704a65961692c96a64b2f27a4239564844b6e398a667ce5e","eventSlug":"eth-updown-15m-1774359000"}
+{"ts":"2026-03-24T13:31:03.013Z","strategy":"eth-ema","action":"hedge","side":"up","buyPrice":0.58,"shares":5,"entryPrice":0.43,"totalCost":101,"profitCents":-1,"reason":"ema_cross_back(-2¢, gap=$0.3)","eventSlug":"eth-updown-15m-1774359000"}
+{"ts":"2026-03-24T13:32:01.768Z","strategy":"eth-ema","action":"hedge-fak","side":"up","price":0.75,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T13:39:13.521Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":38,"gap":-5.569690421567341,"ethUp":0.63,"ethDown":0.38}
+{"ts":"2026-03-24T13:39:14.335Z","strategy":"eth-ema","action":"entry","side":"down","buyPrice":0.4,"shares":5,"gap":-19.2946634187394,"orderId":"0x9a263bc8385c2d8b261979f9e79ec7c161a637308dae7668c3c5d00b4a5cfaa3","eventSlug":"eth-updown-15m-1774359000"}
+{"ts":"2026-03-24T13:39:14.670Z","strategy":"eth-ema","action":"hedge","side":"up","buyPrice":0.59,"shares":5,"entryPrice":0.4,"totalCost":99,"profitCents":1,"reason":"ema_gap_6(-3¢, gap=$-18.6)","eventSlug":"eth-updown-15m-1774359000"}
+{"ts":"2026-03-24T13:40:14.701Z","strategy":"eth-ema","action":"hedge-fak","side":"up","price":0.28,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T13:45:24.359Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":41,"gap":-0.019625092893022167,"ethUp":0.6,"ethDown":0.41}
+{"ts":"2026-03-24T13:45:25.192Z","strategy":"eth-ema","action":"entry","side":"down","buyPrice":0.43,"shares":5,"gap":-1.4091500669934627,"orderId":"0xd97646d28f89c19ee5f63ff289a7e403d0ec1dde4f7eec7038c0866232d01062","eventSlug":"eth-updown-15m-1774359900"}
+{"ts":"2026-03-24T13:45:27.382Z","strategy":"eth-ema","action":"hedge","side":"up","buyPrice":0.58,"shares":5,"entryPrice":0.43,"totalCost":101,"profitCents":-1,"reason":"ema_cross_back(-3¢, gap=$0.1)","eventSlug":"eth-updown-15m-1774359900"}
+{"ts":"2026-03-24T13:46:24.363Z","strategy":"eth-ema","action":"hedge-fak","side":"up","price":0.68,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T13:46:30.913Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":33,"gap":-0.12810996987436596,"ethUp":0.68,"ethDown":0.33}
+{"ts":"2026-03-24T13:50:31.270Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":48,"gap":0.03580494876530338,"ethUp":0.48,"ethDown":0.52}
+{"ts":"2026-03-24T13:51:35.332Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":41,"gap":0.019922560856770133,"ethUp":0.41,"ethDown":0.59}
+{"ts":"2026-03-24T13:52:36.899Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":30,"gap":0.12216005353462833,"ethUp":0.3,"ethDown":0.71}
+{"ts":"2026-03-24T13:53:35.170Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":40,"gap":6.0207070275470755,"ethUp":0.4,"ethDown":0.6}
+{"ts":"2026-03-24T13:54:37.251Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":51,"gap":-2.0229803253383523,"ethUp":0.52,"ethDown":0.51}
+{"ts":"2026-03-24T13:55:39.558Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":37,"gap":0.020308665844481766,"ethUp":0.37,"ethDown":0.65}
+{"ts":"2026-03-24T13:56:44.293Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":38,"gap":-0.0012474545821135052,"ethUp":0.62,"ethDown":0.38}
+{"ts":"2026-03-24T13:57:44.180Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":45,"gap":-0.01501183715495813,"ethUp":0.56,"ethDown":0.45}
+{"ts":"2026-03-24T13:59:45.486Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":37,"gap":1.7334398250821437,"ethUp":0.37,"ethDown":0.92}
+{"ts":"2026-03-24T14:01:48.137Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":33,"gap":-0.09477026936334454,"ethUp":0.68,"ethDown":0.33}
+{"ts":"2026-03-24T14:02:55.058Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":34,"gap":-0.1802340132642115,"ethUp":0.66,"ethDown":0.34}
+{"ts":"2026-03-24T14:03:55.342Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":37,"gap":-0.02295652971446316,"ethUp":0.64,"ethDown":0.37}
+{"ts":"2026-03-24T14:04:52.741Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":39,"gap":-0.0003494855901635674,"ethUp":0.61,"ethDown":0.39}
+{"ts":"2026-03-24T14:05:57.482Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":34,"gap":-0.06180807129920396,"ethUp":0.69,"ethDown":0.34}
+{"ts":"2026-03-24T14:15:06.169Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":43,"gap":-0.10836548473047003,"ethUp":0.58,"ethDown":0.43}
+{"ts":"2026-03-24T14:15:06.959Z","strategy":"eth-ema","action":"entry","side":"down","buyPrice":0.45,"shares":5,"gap":-1.4557692186866569,"orderId":"0x598ae449f10cb108465a1ca2a84d7cba1ab623ebd0c000f0d81dbace4019185f","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:15:10.731Z","strategy":"eth-ema","action":"hedge","side":"up","buyPrice":0.53,"shares":5,"entryPrice":0.45,"totalCost":98,"profitCents":2,"reason":"ema_cross_back(0¢, gap=$0.0)","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:15:21.860Z","strategy":"eth-ema","action":"hedge-fak","side":"up","price":0.56,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T14:15:31.561Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":44,"gap":-0.03864091762160626,"ethUp":0.58,"ethDown":0.44}
+{"ts":"2026-03-24T14:15:32.161Z","strategy":"eth-ema","action":"entry","side":"down","buyPrice":0.45,"shares":5,"gap":-0.19139340386038128,"orderId":"0x3bd453345c8f13e9ec115e1df6f74c3038c554d8ca556b85082ae5d146b9173a","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:15:42.633Z","strategy":"eth-ema","action":"hedge","side":"up","buyPrice":0.52,"shares":5,"entryPrice":0.45,"totalCost":97,"profitCents":3,"reason":"ema_cross_back(1¢, gap=$0.1)","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:15:53.592Z","strategy":"eth-ema","action":"hedge-fak","side":"up","price":0.54,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T14:16:01.776Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":48,"gap":0.21101529269184027,"ethUp":0.48,"ethDown":0.52}
+{"ts":"2026-03-24T14:16:02.380Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.5,"shares":5,"gap":-0.8823595558858148,"orderId":"0x993e08a8a4be0f10e6d028583df2a88c20cce0863e0afc93f97569dc33e3ce72","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:16:02.908Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.51,"shares":5,"entryPrice":0.5,"totalCost":101,"profitCents":-1,"reason":"ema_cross_back(-2¢, gap=$-0.9)","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:16:13.828Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.61,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T14:16:20.046Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":38,"gap":0.09698721710649494,"ethUp":0.38,"ethDown":0.63}
+{"ts":"2026-03-24T14:16:20.684Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.4,"shares":5,"gap":-1.815225744124703,"orderId":"0x2b15460c22a3cabbe8bc7fd5e636dab5594ae62acd65a60536f256ca0402adae","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:16:21.017Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.62,"shares":5,"entryPrice":0.4,"totalCost":102,"profitCents":-2,"reason":"ema_cross_back(-3¢, gap=$-1.8)","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:16:31.978Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.62,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T14:16:38.177Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":43,"gap":0.048551388915878846,"ethUp":0.43,"ethDown":0.56}
+{"ts":"2026-03-24T14:16:38.747Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.47000000000000003,"shares":5,"gap":1.0496375690825666,"orderId":"0x0eefafe616fdc9ec49adf4020785649b0bda4b64f7d563016759173d5beff763","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:16:41.038Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.53,"shares":5,"entryPrice":0.47000000000000003,"totalCost":100,"profitCents":0,"reason":"ema_cross_back(-2¢, gap=$-0.1)","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:16:52.003Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.5700000000000001,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T14:16:58.029Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":48,"gap":0.1281392234753831,"ethUp":0.48,"ethDown":0.52}
+{"ts":"2026-03-24T14:16:58.635Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.51,"shares":5,"gap":3.171118456744005,"orderId":"0xc8138213684dc95820a70363b99e5e58989cd7c2ec9d28e1c191d6a67ff6503d","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:17:02.784Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.44,"shares":5,"entryPrice":0.51,"totalCost":95,"profitCents":5,"reason":"ema_gap_6(3¢, gap=$6.2)","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:17:13.734Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.47000000000000003,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T14:17:22.915Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":35,"gap":-0.06034218193597951,"ethUp":0.65,"ethDown":0.35}
+{"ts":"2026-03-24T14:17:23.514Z","strategy":"eth-ema","action":"entry","side":"down","buyPrice":0.39,"shares":5,"gap":-2.281743321921354,"orderId":"0x9d0c6ed6ffdd40973a0be2092f4227b44cb86c1dd96e5aad731422b8d68dd252","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:17:29.530Z","strategy":"eth-ema","action":"hedge","side":"up","buyPrice":0.58,"shares":5,"entryPrice":0.39,"totalCost":97,"profitCents":3,"reason":"ema_cross_back(1¢, gap=$0.0)","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:17:40.550Z","strategy":"eth-ema","action":"hedge-fak","side":"up","price":0.59,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T14:17:44.158Z","strategy":"eth-ema","action":"hedge-fak","side":"up","price":0.61,"shares":5,"reason":"10s_force_#2"}
+{"ts":"2026-03-24T14:17:50.970Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":42,"gap":-0.08137150823414174,"ethUp":0.59,"ethDown":0.42}
+{"ts":"2026-03-24T14:17:51.627Z","strategy":"eth-ema","action":"entry","side":"down","buyPrice":0.44,"shares":5,"gap":-0.08137150823414174,"orderId":"0x41709b0bfbfc6340b0656fab71022744fb0d5edcd4d327affe3ac73a990c5edb","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:17:53.770Z","strategy":"eth-ema","action":"hedge","side":"up","buyPrice":0.5700000000000001,"shares":5,"entryPrice":0.44,"totalCost":101,"profitCents":-1,"reason":"ema_cross_back(-3¢, gap=$0.0)","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:18:04.713Z","strategy":"eth-ema","action":"hedge-fak","side":"up","price":0.58,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T14:18:14.345Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":54,"gap":0.14624845731110891,"ethUp":0.54,"ethDown":0.47}
+{"ts":"2026-03-24T14:18:14.974Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.5700000000000001,"shares":5,"gap":1.9283409267053528,"orderId":"0xe5a2c77839f545879bc3682a6329103516166e6df10801ff6ce4aa12205ea647","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:18:16.432Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.41000000000000003,"shares":5,"entryPrice":0.5700000000000001,"totalCost":98,"profitCents":2,"reason":"ema_cross_back(1¢, gap=$-0.5)","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:18:29.070Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.48,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T14:18:40.766Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":39,"gap":-1.8337534062392962,"ethUp":0.61,"ethDown":0.39}
+{"ts":"2026-03-24T14:18:41.409Z","strategy":"eth-ema","action":"entry","side":"down","buyPrice":0.45,"shares":5,"gap":-6.306514546039033,"orderId":"0x38790a33c5c4a3d8060c1b6e8764315cbe193c9e9f918a74a21e000e5b1fa607","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:18:41.929Z","strategy":"eth-ema","action":"hedge","side":"up","buyPrice":0.5700000000000001,"shares":5,"entryPrice":0.45,"totalCost":102,"profitCents":-2,"reason":"ema_gap_6(-2¢, gap=$-6.0)","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:18:52.843Z","strategy":"eth-ema","action":"hedge-fak","side":"up","price":0.61,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T14:18:57.397Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":40,"gap":-0.3909572246033406,"ethUp":0.62,"ethDown":0.4}
+{"ts":"2026-03-24T14:18:57.988Z","strategy":"eth-ema","action":"entry","side":"down","buyPrice":0.42,"shares":5,"gap":-0.8331899128379234,"orderId":"0x3631f09206753e48567659f0bc410739d6119c863cbf29e4268745439a8934db","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:23:28.169Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":46,"gap":0.12274659014139644,"ethUp":0.46,"ethDown":0.52}
+{"ts":"2026-03-24T14:23:29.004Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.49,"shares":5,"gap":0.6021359138164399,"orderId":"0x7422b8e9033733be14e2ec3d139b0bbab3ad4f052fa2802765170e9224f127e2","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:23:29.477Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.54,"shares":5,"entryPrice":0.49,"totalCost":103,"profitCents":-3,"reason":"ema_cross_back(-4¢, gap=$-0.0)","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:23:40.622Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.6,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T14:23:54.138Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":53,"gap":-0.27411541164993736,"ethUp":0.49,"ethDown":0.53}
+{"ts":"2026-03-24T14:24:07.025Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":54,"gap":-0.10677889689572595,"ethUp":0.46,"ethDown":0.54}
+{"ts":"2026-03-24T14:24:07.616Z","strategy":"eth-ema","action":"entry","side":"down","buyPrice":0.5700000000000001,"shares":5,"gap":-0.44101539778893084,"orderId":"0xca75b3100e2c3fa235899567a0a3b8f6c7377f3659359b01f6124b8cd64be736","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:24:10.568Z","strategy":"eth-ema","action":"hedge","side":"up","buyPrice":0.44,"shares":5,"entryPrice":0.5700000000000001,"totalCost":101,"profitCents":-1,"reason":"ema_cross_back(-1¢, gap=$0.0)","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:24:21.472Z","strategy":"eth-ema","action":"hedge-fak","side":"up","price":0.46,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T14:24:29.176Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":42,"gap":0.21654729526969163,"ethUp":0.42,"ethDown":0.59}
+{"ts":"2026-03-24T14:24:29.806Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.44,"shares":5,"gap":2.08559104196555,"orderId":"0xb48414606bdc8fd0829a03a45d484ebc5c6a548ac39294c9326c1dba45d4e63d","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:24:32.387Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.6,"shares":5,"entryPrice":0.44,"totalCost":104,"profitCents":-4,"reason":"ema_cross_back(-5¢, gap=$-0.6)","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:24:43.315Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.63,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T14:24:50.938Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":41,"gap":0.04260748385065938,"ethUp":0.41,"ethDown":0.62}
+{"ts":"2026-03-24T14:24:51.571Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.41000000000000003,"shares":5,"gap":0.9814617098069078,"orderId":"0x5bf241eb38c77fb517d9e49efabdec1f558269e3a1a636b8a85b80aac4ae5357","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:24:59.377Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.53,"shares":5,"entryPrice":0.41000000000000003,"totalCost":94,"profitCents":6,"reason":"ema_cross_back(5¢, gap=$-0.0)","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:25:10.353Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.71,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T14:25:29.270Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":31,"gap":0.03369894835748255,"ethUp":0.31,"ethDown":0.69}
+{"ts":"2026-03-24T14:25:29.867Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.33,"shares":5,"gap":0.3041917590870753,"orderId":"0x2b380037acbf510f55d433dcd43e5d1637d98749746302fe727faa7370d0a415","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:25:33.826Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.64,"shares":5,"entryPrice":0.33,"totalCost":97,"profitCents":3,"reason":"ema_cross_back(2¢, gap=$-0.0)","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:25:44.775Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.68,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T14:25:53.972Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":34,"gap":0.08795754902497066,"ethUp":0.34,"ethDown":0.66}
+{"ts":"2026-03-24T14:25:54.585Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.36,"shares":5,"gap":0.48925424721951316,"orderId":"0xcdc987aa33acac0c5d4d3740853baf6730a32cdac46399927ccae469533ed86f","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:25:58.561Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.66,"shares":5,"entryPrice":0.36,"totalCost":102,"profitCents":-2,"reason":"ema_cross_back(-1¢, gap=$-0.0)","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:26:09.460Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.73,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T14:26:28.307Z","strategy":"eth-ema","action":"trigger","side":"up","winCents":37,"gap":0.30760938807911486,"ethUp":0.37,"ethDown":0.63}
+{"ts":"2026-03-24T14:26:28.915Z","strategy":"eth-ema","action":"entry","side":"up","buyPrice":0.4,"shares":5,"gap":0.30760938807911486,"orderId":"0xc00e166b966542d272864dd23cb3eb179e9e65ccfab6b3c260b274a92ed57a63","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:26:29.892Z","strategy":"eth-ema","action":"hedge","side":"down","buyPrice":0.66,"shares":5,"entryPrice":0.4,"totalCost":106,"profitCents":-6,"reason":"ema_cross_back(-7¢, gap=$-0.0)","eventSlug":"eth-updown-15m-1774361700"}
+{"ts":"2026-03-24T14:26:40.816Z","strategy":"eth-ema","action":"hedge-fak","side":"down","price":0.56,"shares":5,"reason":"10s_force_#1"}
+{"ts":"2026-03-24T14:26:49.861Z","strategy":"eth-ema","action":"trigger","side":"down","winCents":49,"gap":-0.09107901872351043,"ethUp":0.53,"ethDown":0.49}
+{"ts":"2026-03-24T14:26:50.499Z","strategy":"eth-ema","action":"entry","side":"down","buyPrice":0.51,"shares":5,"gap":-1.1265402161135922,"orderId":"0x13319c7d52a5b738ec44ad6b533638076b7ae5a57698111c8868162a468050db","eventSlug":"eth-updown-15m-1774361700"}
