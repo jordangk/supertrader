@@ -30,6 +30,12 @@ function cents(n) {
   return `${((typeof n === 'number' ? n : parseFloat(n)) * 100).toFixed(2)}¢`;
 }
 
+function fmtUsd(n) {
+  if (n == null || n === '' || Number.isNaN(Number(n))) return '—';
+  const x = Number(n);
+  return `${x >= 0 ? '+' : ''}$${x.toFixed(2)}`;
+}
+
 function fetchErrMessage(e, base) {
   if (e?.name === 'TypeError' && String(e.message).includes('fetch')) {
     const where = base || '(same page /api)';
@@ -63,6 +69,8 @@ export default function ArbitrageLab() {
   const [meta, setMeta] = useState({ kalshi: null, poly: null });
   const [campaignsList, setCampaignsList] = useState([]);
   const [pnlData, setPnlData] = useState(null);
+  const [arbSessions, setArbSessions] = useState([]);
+  const [venuePnlRefreshing, setVenuePnlRefreshing] = useState(null);
 
   // Snipe state
   const [snipes, setSnipes] = useState([]);
@@ -114,6 +122,21 @@ export default function ArbitrageLab() {
     }
     loadPnl();
     const iv = setInterval(loadPnl, 15000);
+    return () => clearInterval(iv);
+  }, []);
+
+  // Arb sessions (includes venue_pnl_* from DB — Kalshi fills + Polymarket data-api trades)
+  useEffect(() => {
+    function loadSessions() {
+      fetch(`${API_BASE}/api/arb/sessions`)
+        .then(r => r.json())
+        .then(d => {
+          if (d.sessions) setArbSessions(d.sessions);
+        })
+        .catch(() => {});
+    }
+    loadSessions();
+    const iv = setInterval(loadSessions, 10000);
     return () => clearInterval(iv);
   }, []);
 
@@ -591,6 +614,23 @@ export default function ArbitrageLab() {
     if (bookPollRef.current) clearInterval(bookPollRef.current);
     setBook(null);
     await loadSession(sessionId);
+    try {
+      const sr = await fetch(`${API_BASE}/api/arb/sessions`);
+      const sd = await sr.json();
+      if (sd.sessions) setArbSessions(sd.sessions);
+    } catch { /* ignore */ }
+  }
+
+  async function refreshVenuePnl(sid) {
+    if (!sid) return;
+    setVenuePnlRefreshing(sid);
+    try {
+      await fetch(`${API_BASE}/api/arb/session/${sid}/venue-pnl`, { method: 'POST' }).then(r => r.json());
+      const sr = await fetch(`${API_BASE}/api/arb/sessions`);
+      const sd = await sr.json();
+      if (sd.sessions) setArbSessions(sd.sessions);
+    } catch { /* ignore */ }
+    setVenuePnlRefreshing(null);
   }
 
   const [executing, setExecuting] = useState(null); // 'A' | 'B' | null
@@ -663,6 +703,72 @@ export default function ArbitrageLab() {
           <code className="text-gray-400">/arb</code>. Left: Kalshi · Right: Polymarket ·{' '}
           <span className="text-gray-600">{API_BASE || '(browser → /api → :3001)'}</span>
         </p>
+      </div>
+
+      {/* Venue P&L from Kalshi /portfolio/fills + Polymarket data-api trades (per ended session) */}
+      <div className="border border-emerald-800/50 rounded-lg bg-emerald-950/25 p-2 space-y-1.5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <span className="text-[11px] font-bold text-emerald-400">Venue P&amp;L (K + Poly)</span>
+          <span className="text-[9px] text-gray-500">Direct from APIs · updates after you stop + when markets settle</span>
+        </div>
+        {arbSessions.filter((s) => s.ended_at).length === 0 ? (
+          <p className="text-[10px] text-gray-500">
+            No ended sessions yet. Click <span className="text-gray-400">Stop</span> to end a run; venue rows appear here. If the table stays empty after stopping, apply{' '}
+            <code className="text-gray-600">scripts/sql/arb_session_venue_pnl.sql</code> to your DB.
+          </p>
+        ) : (
+          <div className="overflow-x-auto -mx-0.5">
+            <table className="w-full text-[10px] font-mono border-collapse">
+              <thead>
+                <tr className="text-gray-500 text-left border-b border-gray-800">
+                  <th className="py-1 pr-2 font-normal">Session</th>
+                  <th className="py-1 pr-2 font-normal">Ended</th>
+                  <th className="py-1 pr-2 font-normal">Kalshi</th>
+                  <th className="py-1 pr-2 font-normal">Polymarket</th>
+                  <th className="py-1 pr-2 font-normal">Total</th>
+                  <th className="py-1 pr-2 font-normal">Status</th>
+                  <th className="py-1 font-normal w-14" />
+                </tr>
+              </thead>
+              <tbody>
+                {[...arbSessions]
+                  .filter((s) => s.ended_at)
+                  .sort((a, b) => new Date(b.ended_at) - new Date(a.ended_at))
+                  .slice(0, 12)
+                  .map((s) => (
+                    <tr key={s.id} className={`border-b border-gray-800/80 ${sessionId && s.id === sessionId ? 'bg-amber-950/30' : ''}`}>
+                      <td className="py-1 pr-2 max-w-[140px] truncate text-gray-300" title={s.polymarket_slug || s.label || s.id}>
+                        {s.label || s.polymarket_slug || s.id?.slice(0, 8)}
+                      </td>
+                      <td className="py-1 pr-2 text-gray-500 whitespace-nowrap">
+                        {s.ended_at ? new Date(s.ended_at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'}
+                      </td>
+                      <td className={`py-1 pr-2 ${s.venue_pnl_kalshi != null ? (Number(s.venue_pnl_kalshi) >= 0 ? 'text-green-400' : 'text-red-400') : 'text-gray-600'}`}>
+                        {fmtUsd(s.venue_pnl_kalshi)}
+                      </td>
+                      <td className={`py-1 pr-2 ${s.venue_pnl_polymarket != null ? (Number(s.venue_pnl_polymarket) >= 0 ? 'text-green-400' : 'text-red-400') : 'text-gray-600'}`}>
+                        {fmtUsd(s.venue_pnl_polymarket)}
+                      </td>
+                      <td className={`py-1 pr-2 font-bold ${s.venue_pnl_total != null ? (Number(s.venue_pnl_total) >= 0 ? 'text-green-300' : 'text-red-300') : 'text-gray-600'}`}>
+                        {fmtUsd(s.venue_pnl_total)}
+                      </td>
+                      <td className="py-1 pr-2 text-gray-500">{s.venue_pnl_status || '—'}</td>
+                      <td className="py-1">
+                        <button
+                          type="button"
+                          disabled={venuePnlRefreshing === s.id}
+                          onClick={() => refreshVenuePnl(s.id)}
+                          className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-900/60 text-emerald-300 hover:bg-emerald-800 disabled:opacity-40"
+                        >
+                          {venuePnlRefreshing === s.id ? '…' : '↻'}
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
 
       {/* Active campaigns */}
