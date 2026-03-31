@@ -1,50 +1,37 @@
 ---
-description: Calculate exact P&L for a specific event from actual platform data
+description: Calculate exact P&L for events from actual platform data
 arguments:
-  - name: kalshi_trades
-    description: "Paste Kalshi trade history (e.g., 'Bought No 66.60¢ 5 $3.33 $0.08')"
-  - name: poly_trades
-    description: "Paste Poly trade history (e.g., 'Bought 5.00 Up at 25¢ ($1.25)')"
-  - name: result
-    description: "Which side won: up/yes or down/no"
+  - name: scope
+    description: "kalshi URL, poly URL, or 'last N' for recent events"
 ---
 
-Calculate exact P&L from the user's pasted trade data.
+Calculate P&L from ACTUAL platform data. Never estimate — use real fills and settlements.
 
-## How to calculate:
+## Method:
 
 ### Kalshi:
-For each trade:
-- If the trade's side matches the winning result → payout = shares × $1
-- If not → payout = $0
-- P&L per trade = payout - cost - fees
-
-Sum all KS trades for KS net.
+1. Get fills from `/portfolio/fills` filtered by ticker — gives actual fill price per share
+2. Get settlement from `/portfolio/settlements` — gives actual payout
+3. **KS P&L = settlement payout - SUM(fill_price × shares + fee) for all fills on this ticker**
+4. Note: KS nets YES and NO internally. If you buy 5 YES + 5 NO, net position = 0.
 
 ### Polymarket:
-For each trade:
-- If the trade's side matches the winning result → payout = shares × $1
-- If not → payout = $0
-- P&L per trade = payout - cost
+1. Get activity from `data-api.polymarket.com/activity?user=FUNDER_ADDRESS` filtered by slug
+2. Sum all TRADE entries as `spent`
+3. Sum all REDEEM entries as `back`
+4. **Poly P&L = back - spent**
+5. Do NOT calculate win/loss per trade and also add redeems — that double counts.
 
-Sum all Poly trades for Poly net.
+### Matching KS ticker to Poly slug:
+- KS ticker time = event END time (e.g., 0830 = 08:30 ET)
+- Poly slug timestamp = event START time in UTC
+- Convert: ET end time → UTC → subtract 900s → that's the Poly start timestamp
+- Example: KS 0830 ET = 12:30 UTC. Start = 12:30 - 900 = 11:45 UTC = unix timestamp → poly slug
 
 ### Combined:
-Total = KS net + Poly net
+- NET = KS P&L + Poly P&L
+- A properly hedged arb should have KS and Poly roughly opposite (one wins, one loses, net small positive)
 
-### Format output as:
-```
-=== KALSHI (result: NO/DOWN won) ===
-NO  5sh @ 66.60¢  cost $3.33  → won $5.00  = +$1.67
-YES 5sh @ 77.40¢  cost $3.87  → lost $0    = -$3.87
-KS net: $X.XX
-
-=== POLY (result: DOWN won) ===
-DOWN 5sh @ 30¢  cost $1.50  → won $5.00  = +$3.50
-UP   5sh @ 43¢  cost $2.15  → lost $0    = -$2.15
-Poly net: $X.XX
-
-=== COMBINED: $X.XX ===
-```
-
-Note: On Kalshi YES = UP, NO = DOWN. On Poly Up = YES, Down = NO.
+### Per-coin summary:
+- Group events by coin (BTC/ETH/SOL/XRP)
+- Sum KS P&L and Poly P&L per coin

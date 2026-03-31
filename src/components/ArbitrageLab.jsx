@@ -44,6 +44,35 @@ function fetchErrMessage(e, base) {
   return e?.message || String(e);
 }
 
+function prettyCampaignLabel(c) {
+  const rt = String(c?.recurring_type || '').toLowerCase();
+  const map = {
+    btc15m: 'BTC price up in next 15 mins?',
+    eth15m: 'ETH price up in next 15 mins?',
+    sol15m: 'SOL price up in next 15 mins?',
+    xrp15m: 'XRP price up in next 15 mins?',
+    hype15m: 'HYPE price up in next 15 mins?',
+    bnb15m: 'BNB price up in next 15 mins?',
+    doge15m: 'DOGE price up in next 15 mins?',
+    btc15m_polybtc5m: 'BTC 15m vs BTC 5m',
+    btc15m_polyeth5m: 'BTC 15m vs ETH 5m',
+  };
+  if (map[rt]) return map[rt];
+  return c?.label || c?.kalshi_url?.slice(0, 30) || 'Campaign';
+}
+
+function inferLaunchLabel(externalUrl, polySlug, meta, recurring) {
+  const ext = String(externalUrl || '').toLowerCase();
+  const poly = String(polySlug || '').toLowerCase();
+  // Backend Poly+Poly mode treats first field as active Poly market.
+  const activePoly = ext.includes('polymarket.com/event/') ? ext : poly;
+  if (recurring) {
+    if (/eth-updown-5m-\d+/i.test(activePoly)) return 'BTC 15m vs ETH 5m';
+    if (/btc-updown-5m-\d+/i.test(activePoly)) return 'BTC 15m vs BTC 5m';
+  }
+  return meta?.kalshi?.title || meta?.poly?.question || 'Campaign';
+}
+
 /** Avoid `r.json()` on empty/HTML error pages (proxy down → empty body). */
 async function readJsonOrThrow(res, label) {
   const text = await res.text();
@@ -65,6 +94,8 @@ async function readJsonOrThrow(res, label) {
 export default function ArbitrageLab() {
   const [externalUrl, setExternalUrl] = useState('');
   const [polySlug, setPolySlug] = useState('');
+  /** When true, /api/arb/defaults/btc15m must not overwrite the two URL fields (user typed or loaded a campaign/match). */
+  const inputsDirtyRef = useRef(false);
   const [loadingDefaults, setLoadingDefaults] = useState(true);
   const [meta, setMeta] = useState({ kalshi: null, poly: null });
   const [campaignsList, setCampaignsList] = useState([]);
@@ -157,13 +188,16 @@ export default function ArbitrageLab() {
   async function createCampaign() {
     if (!externalUrl.trim() || !polySlug.trim()) return;
     try {
+      const keepKalshi = externalUrl.trim();
+      const keepPoly = polySlug.trim();
+      const launchLabel = inferLaunchLabel(externalUrl, polySlug, meta, recurring);
       const r = await fetch(`${API_BASE}/api/arb/campaigns`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          kalshiUrl: externalUrl.trim(),
-          polyUrl: polySlug.trim(),
-          label: meta.kalshi?.title || meta.poly?.question || 'Campaign',
+          kalshiUrl: keepKalshi,
+          polyUrl: keepPoly,
+          label: launchLabel,
           autoEnabled: recurring || autoEnabled,
           autoThreshold: autoThreshold,
           autoCooldown: autoCooldown,
@@ -180,6 +214,9 @@ export default function ArbitrageLab() {
           setRunning(true);
           setTicks([]);
         }
+        inputsDirtyRef.current = true;
+        setExternalUrl(keepKalshi);
+        setPolySlug(keepPoly);
       }
     } catch {}
   }
@@ -201,6 +238,7 @@ export default function ArbitrageLab() {
 
   // Fetch both defaults from server; re-fetch when the 15m window rolls over.
   const fetchDefaults = useCallback(() => {
+    if (inputsDirtyRef.current) return;
     setLoadingDefaults(true);
     fetch(`${API_BASE}/api/arb/defaults/btc15m`)
       .then(r => r.json())
@@ -247,6 +285,7 @@ export default function ArbitrageLab() {
   }, []);
 
   function applyMatch(d) {
+    inputsDirtyRef.current = true;
     if (d.kalshiTicker) setExternalUrl(d.kalshiTicker);
     else if (d.kalshiUrl) setExternalUrl(d.kalshiUrl);
     if (d.polyUrl) setPolySlug(d.polyUrl);
@@ -536,10 +575,13 @@ export default function ArbitrageLab() {
 
     if (Date.now() < autoCooldownUntil.current) return;
 
-    const ksYesAsk = book?.kalshi?.yesAsk;
-    const ksNoAsk = book?.kalshi?.noAsk;
-    const polyUpAsk = book?.poly?.up?.bestAsk;
-    const polyDownAsk = book?.poly?.down?.bestAsk;
+    const isPolyPoly = !!book?.polyA;
+    const left = isPolyPoly ? book?.polyA : null;
+    const right = isPolyPoly ? (book?.polyB || book?.poly) : book?.poly;
+    const ksYesAsk = isPolyPoly ? left?.up?.bestAsk : book?.kalshi?.yesAsk;
+    const ksNoAsk = isPolyPoly ? left?.down?.bestAsk : book?.kalshi?.noAsk;
+    const polyUpAsk = right?.up?.bestAsk;
+    const polyDownAsk = right?.down?.bestAsk;
     const threshold = autoThreshold / 100; // convert cents to dollars
 
     // Strategy A: buy Kalshi YES + Poly Down
@@ -691,11 +733,13 @@ export default function ArbitrageLab() {
   const ksLabel = meta.kalshi?.title || meta.kalshi?.eventTitle || 'Kalshi';
   const polyLabel = meta.poly?.question || 'Polymarket';
   const polyOutcomes = meta.poly?.outcomes || ['Up', 'Down'];
+  const activeLaunchLabel = inferLaunchLabel(externalUrl, polySlug, meta, recurring);
   // For Kalshi yes/no subtitles: if they look like "Target Price: $X" or are empty, fall back to Yes/No
   const rawYesSub = meta.kalshi?.yesSubtitle || '';
   const rawNoSub = meta.kalshi?.noSubtitle || '';
   const ksYesSub = rawYesSub && !/target price/i.test(rawYesSub) && !/^TBD$/i.test(rawYesSub) ? rawYesSub : 'Yes';
   const ksNoSub = rawNoSub && !/target price/i.test(rawNoSub) && !/^TBD$/i.test(rawNoSub) ? rawNoSub : 'No';
+  const isPolyPolyBook = !!book?.polyA;
 
   return (
     <div className="rounded-xl border border-amber-900/50 bg-gray-900/80 p-4 space-y-3">
@@ -788,15 +832,20 @@ export default function ArbitrageLab() {
                 <button
                   type="button"
                   onClick={() => {
-                    // Load this campaign into the main view
+                    // Load this campaign into the main view — mark dirty so 15m default fetch won't reset to BTC 15m Kalshi
+                    inputsDirtyRef.current = true;
                     setExternalUrl(c.kalshi_url);
                     setPolySlug(c.poly_url);
                     setMaxShares(c.max_shares || 50);
+                    setSwapPoly(!!c.swap_poly);
                     if (c.session_id) { setSessionId(c.session_id); setRunning(true); }
                   }}
                   className="flex-1 text-left text-amber-400 hover:text-amber-300 truncate"
                 >
-                  {c.label || c.kalshi_url?.slice(0, 30)}
+                  <div className="truncate">{prettyCampaignLabel(c)}</div>
+                  <div className="text-[9px] text-gray-600 truncate">
+                    {c.recurring_type ? `${c.recurring_type} · ` : ''}{String(c.poly_url || '').replace(/^https?:\/\/polymarket\.com\/event\//i, '')}
+                  </div>
                   {c.live?.expiration && (
                     <span className="text-gray-600 ml-1">
                       exp {new Date(c.live.expiration).toLocaleString('en-US', { timeZone: 'America/Los_Angeles', hour: 'numeric', minute: '2-digit' })}
@@ -828,6 +877,19 @@ export default function ArbitrageLab() {
                     className="w-9 bg-transparent border-b border-gray-700 text-center text-[9px] focus:border-amber-500 outline-none"
                   />sh
                 </span>
+                <label className="flex items-center gap-1 text-[9px] text-gray-500">
+                  <input
+                    type="checkbox"
+                    checked={!!c.swap_poly}
+                    onChange={(e) => fetch(`${API_BASE}/api/arb/campaigns/${c.id}`, {
+                      method: 'PATCH',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ swapPoly: e.target.checked }),
+                    }).catch(() => {})}
+                    className="rounded"
+                  />
+                  <span className={c.swap_poly ? 'text-purple-400 font-bold' : ''}>alt</span>
+                </label>
                 {c.live?.best != null && (
                   <span className={`px-1 py-0.5 rounded text-[9px] font-bold ${c.live.best > 0 ? 'bg-green-900/50 text-green-400' : 'bg-red-900/30 text-red-400'}`}>
                     A:{c.live.profitA != null ? `${c.live.profitA > 0 ? '+' : ''}${c.live.profitA.toFixed(1)}¢` : '—'}
@@ -1010,12 +1072,12 @@ export default function ArbitrageLab() {
           <div className="border-t border-gray-800 pt-1.5 space-y-1">
             <div className="flex flex-wrap items-center gap-2 text-[10px]">
               <span className="text-amber-400 font-bold">A:</span>
-              <span className="text-cyan-400 font-mono">Kalshi {ksYesSub !== 'Yes' ? ksYesSub : 'YES'}</span>
+              <span className="text-cyan-400 font-mono">{isPolyPolyBook ? 'Poly-A Up' : `Kalshi ${ksYesSub !== 'Yes' ? ksYesSub : 'YES'}`}</span>
               <span className="text-gray-600">+</span>
               <span className="text-green-400 font-mono">Poly {swapPoly ? polyOutcomes[0] : polyOutcomes[1]}</span>
               <span className="text-gray-600 mx-1">|</span>
               <span className="text-amber-400 font-bold">B:</span>
-              <span className="text-cyan-400 font-mono">Kalshi {ksNoSub !== 'No' ? ksNoSub : 'NO'}</span>
+              <span className="text-cyan-400 font-mono">{isPolyPolyBook ? 'Poly-A Down' : `Kalshi ${ksNoSub !== 'No' ? ksNoSub : 'NO'}`}</span>
               <span className="text-gray-600">+</span>
               <span className="text-green-400 font-mono">Poly {swapPoly ? polyOutcomes[1] : polyOutcomes[0]}</span>
               <button
@@ -1037,7 +1099,7 @@ export default function ArbitrageLab() {
             className="bg-gray-950 border border-gray-700 rounded px-2 py-1.5 font-mono text-[11px] w-full min-w-0"
             placeholder="kalshi.com/…/kxatpmatch-26mar25paufil or KXATPMATCH-…-PAU"
             value={externalUrl}
-            onChange={(e) => { setExternalUrl(e.target.value); setMeta(prev => ({ ...prev, kalshi: null })); }}
+            onChange={(e) => { inputsDirtyRef.current = true; setExternalUrl(e.target.value); setMeta(prev => ({ ...prev, kalshi: null })); }}
             spellCheck={false}
             autoComplete="off"
           />
@@ -1048,7 +1110,7 @@ export default function ArbitrageLab() {
             className="bg-gray-950 border border-gray-700 rounded px-2 py-1.5 font-mono text-[11px] w-full min-w-0"
             placeholder="polymarket.com/…/atp-paul-fils-2026-03-25 or slug only"
             value={polySlug}
-            onChange={(e) => { setPolySlug(e.target.value); setMeta(prev => ({ ...prev, poly: null })); }}
+            onChange={(e) => { inputsDirtyRef.current = true; setPolySlug(e.target.value); setMeta(prev => ({ ...prev, poly: null })); }}
             spellCheck={false}
             autoComplete="off"
           />
@@ -1120,6 +1182,10 @@ export default function ArbitrageLab() {
             <span>recurring</span>
           </label>
           <label className="flex items-center gap-1 text-[10px] text-gray-500">
+            <input type="checkbox" checked={swapPoly} onChange={(e) => setSwapPoly(e.target.checked)} className="rounded" />
+            <span className={swapPoly ? 'text-purple-400 font-bold' : ''}>alternate</span>
+          </label>
+          <label className="flex items-center gap-1 text-[10px] text-gray-500">
             <input type="checkbox" checked={fillAny} onChange={(e) => setFillAny(e.target.checked)} className="rounded" />
             <span className={fillAny ? 'text-red-400 font-bold' : ''}>fill any</span>
           </label>
@@ -1136,23 +1202,40 @@ export default function ArbitrageLab() {
 
       {last && (() => {
         const SHARES = 5;
+        const isPolyPolyLive = !!book?.polyA;
+        const leftPoly = isPolyPolyLive ? book?.polyA : null;
+        const rightPoly = isPolyPolyLive ? (book?.polyB || book?.poly) : (book?.poly || null);
 
         // Live tick prices (real-time from WS)
-        const ksY = last.external_price != null ? Number(last.external_price) : null;
-        const ksN = last.external_no_price != null ? Number(last.external_no_price) : null;
-        const pDown = last.poly_down != null ? Number(last.poly_down) : null;
-        const pUp = last.poly_up != null ? Number(last.poly_up) : null;
+        const ksY = isPolyPolyLive
+          ? (leftPoly?.up?.bestAsk != null ? Number(leftPoly.up.bestAsk) : (leftPoly?.up?.bestBid != null ? Number(leftPoly.up.bestBid) : null))
+          : (last.external_price != null ? Number(last.external_price) : null);
+        const ksN = isPolyPolyLive
+          ? (leftPoly?.down?.bestAsk != null ? Number(leftPoly.down.bestAsk) : (leftPoly?.down?.bestBid != null ? Number(leftPoly.down.bestBid) : null))
+          : (last.external_no_price != null ? Number(last.external_no_price) : null);
+        const pDown = isPolyPolyLive
+          ? (rightPoly?.down?.bestAsk != null ? Number(rightPoly.down.bestAsk) : (rightPoly?.down?.bestBid != null ? Number(rightPoly.down.bestBid) : (last.poly_down != null ? Number(last.poly_down) : null)))
+          : (last.poly_down != null ? Number(last.poly_down) : null);
+        const pUp = isPolyPolyLive
+          ? (rightPoly?.up?.bestAsk != null ? Number(rightPoly.up.bestAsk) : (rightPoly?.up?.bestBid != null ? Number(rightPoly.up.bestBid) : (last.poly_up != null ? Number(last.poly_up) : null)))
+          : (last.poly_up != null ? Number(last.poly_up) : null);
 
         // Execution prices: use REAL ask from book when available, fallback to mid+1¢
-        const ksYesAskBook = book?.kalshi?.yesAsk;
-        const ksNoAskBook = book?.kalshi?.noAsk;
-        const polyUpAskBook = book?.poly?.up?.bestAsk;
-        const polyDownAskBook = book?.poly?.down?.bestAsk;
+        const ksYesAskBook = isPolyPolyLive ? leftPoly?.up?.bestAsk : book?.kalshi?.yesAsk;
+        const ksNoAskBook = isPolyPolyLive ? leftPoly?.down?.bestAsk : book?.kalshi?.noAsk;
+        const polyUpAskBook = rightPoly?.up?.bestAsk;
+        const polyDownAskBook = rightPoly?.down?.bestAsk;
 
         const execKsY = ksYesAskBook ?? (ksY != null ? Math.min(0.99, Math.round(ksY * 100 + 1) / 100) : null);
         const execKsN = ksNoAskBook ?? (ksN != null ? Math.min(0.99, Math.round(ksN * 100 + 1) / 100) : null);
         const execPDown = polyDownAskBook ?? (pDown != null ? Math.min(0.99, Math.round((pDown + 0.01) * 100) / 100) : null);
         const execPUp = polyUpAskBook ?? (pUp != null ? Math.min(0.99, Math.round((pUp + 0.01) * 100) / 100) : null);
+        const missingLiveLeg = isPolyPolyLive && (
+          leftPoly?.up?.bestAsk == null
+          || leftPoly?.down?.bestAsk == null
+          || rightPoly?.up?.bestAsk == null
+          || rightPoly?.down?.bestAsk == null
+        );
 
         // Strategy A: buy Kalshi YES + Poly Down at real ask prices
         const costA = execKsY != null && execPDown != null ? execKsY + execPDown : null;
@@ -1164,7 +1247,7 @@ export default function ArbitrageLab() {
         const profitB5 = profitBper != null ? profitBper * SHARES : null;
 
         // Multi-market combos — only OPPOSITE side pairs (real arbs)
-        const allKs = book?.allKalshi;
+        const allKs = isPolyPolyLive ? null : book?.allKalshi;
         const combos = [];
         if (allKs?.length > 1 && polyOutcomes?.length >= 2) {
           for (const km of allKs) {
@@ -1203,10 +1286,10 @@ export default function ArbitrageLab() {
         }
 
         // Book depth for fill indicators
-        const ksYesAskQty = book?.kalshi?.yesAskQty;
-        const ksNoAskQty = book?.kalshi?.noAskQty;
-        const polyDownDepth = book?.poly?.down?.depthAt1c;
-        const polyUpDepth = book?.poly?.up?.depthAt1c;
+        const ksYesAskQty = isPolyPolyLive ? leftPoly?.up?.depthAt1c : book?.kalshi?.yesAskQty;
+        const ksNoAskQty = isPolyPolyLive ? leftPoly?.down?.depthAt1c : book?.kalshi?.noAskQty;
+        const polyDownDepth = rightPoly?.down?.depthAt1c;
+        const polyUpDepth = rightPoly?.up?.depthAt1c;
 
         // Strategy A fills: need Kalshi YES ask depth >= 5 AND Poly Down ask depth >= 5
         const ksAFills = ksYesAskQty != null ? ksYesAskQty >= SHARES : null;
@@ -1216,9 +1299,14 @@ export default function ArbitrageLab() {
         const polyBFills = polyUpDepth != null ? polyUpDepth >= SHARES : null;
 
         // Book prices for display
-        const ksData = book?.kalshi || {};
-        const polyUpData = book?.poly?.up || {};
-        const polyDownData = book?.poly?.down || {};
+        const ksData = isPolyPolyLive
+          ? {
+            yesBid: leftPoly?.up?.bestBid, yesBidQty: leftPoly?.up?.bestBidQty, yesAsk: leftPoly?.up?.bestAsk, yesAskQty: leftPoly?.up?.bestAskQty,
+            noBid: leftPoly?.down?.bestBid, noBidQty: leftPoly?.down?.bestBidQty, noAsk: leftPoly?.down?.bestAsk, noAskQty: leftPoly?.down?.bestAskQty,
+          }
+          : (book?.kalshi || {});
+        const polyUpData = rightPoly?.up || {};
+        const polyDownData = rightPoly?.down || {};
 
         function fillBadge(label, bidPrice, bidQty, askPrice, askQty, fills) {
           if (bidPrice == null && askPrice == null) return <span className="text-gray-600 text-[9px]">{label}: —</span>;
@@ -1240,18 +1328,23 @@ export default function ArbitrageLab() {
           <div className="space-y-2 border border-gray-800 rounded-lg p-2 bg-black/30">
             <div className="flex flex-wrap gap-2 text-[11px] font-mono">
               <span className="text-gray-500">Latest</span>
-              <span className="text-cyan-300">KS {ksYesSub} {cents(last.external_price)}</span>
-              <span className="text-cyan-500/90">KS {ksNoSub} {cents(last.external_no_price)}</span>
-              <span className="text-green-400">Poly {polyOutcomes[0]} {cents(last.poly_up)}</span>
-              <span className="text-rose-400">Poly {polyOutcomes[1]} {cents(last.poly_down)}</span>
+              <span className="text-cyan-300">{isPolyPolyLive ? 'Poly-A Up' : `KS ${ksYesSub}`} {cents(ksY)}</span>
+              <span className="text-cyan-500/90">{isPolyPolyLive ? 'Poly-A Down' : `KS ${ksNoSub}`} {cents(ksN)}</span>
+              <span className="text-green-400">Poly {polyOutcomes[0]} {cents(pUp)}</span>
+              <span className="text-rose-400">Poly {polyOutcomes[1]} {cents(pDown)}</span>
             </div>
+            {missingLiveLeg && (
+              <div className="text-[10px] text-yellow-400 font-mono">
+                Waiting for live asks on both Poly legs. One market may be stale/expired or currently has no sellers.
+              </div>
+            )}
             {/* Strategy A/B — only for simple events (no multi-market combos) */}
             {combos.length === 0 && <>
             {/* Strategy A */}
             <div className="border-t border-gray-800/60 pt-1 space-y-0.5">
               <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono">
                 <span className="text-gray-500">A:</span>
-                <span className="text-gray-400">KS {ksYesSub} {execKsY != null ? `${(execKsY*100).toFixed(0)}¢` : '—'} + P {polyOutcomes[1]} {execPDown != null ? `${(execPDown*100).toFixed(0)}¢` : '—'} = {costA != null ? cents(costA) : '—'}</span>
+                <span className="text-gray-400">{isPolyPolyLive ? 'P-A Up' : `KS ${ksYesSub}`} {execKsY != null ? `${(execKsY*100).toFixed(0)}¢` : '—'} + P {polyOutcomes[1]} {execPDown != null ? `${(execPDown*100).toFixed(0)}¢` : '—'} = {costA != null ? cents(costA) : '—'}</span>
                 <span className={profitAper != null && profitAper > 0 ? 'text-green-400 font-bold' : profitAper != null && profitAper < 0 ? 'text-red-400' : 'text-gray-500'}>
                   {profitAper != null ? `${profitAper > 0 ? '+' : ''}${(profitAper * 100).toFixed(2)}¢/sh` : '—'}
                 </span>
@@ -1280,7 +1373,7 @@ export default function ArbitrageLab() {
               </div>
               {book && (
                 <div className="flex flex-wrap gap-3 ml-6 font-mono">
-                  {fillBadge(`KS ${ksYesSub}`, ksData.yesBid, ksData.yesBidQty, ksData.yesAsk, ksData.yesAskQty, ksAFills)}
+                  {fillBadge(`${isPolyPolyLive ? 'P-A Up' : `KS ${ksYesSub}`}`, ksData.yesBid, ksData.yesBidQty, ksData.yesAsk, ksData.yesAskQty, ksAFills)}
                   {fillBadge(`P ${polyOutcomes[1]}`, polyDownData.bestBid, polyDownData.bestBidQty, polyDownData.bestAsk, polyDownData.bestAskQty, polyAFills)}
                   {ksAFills != null && polyAFills != null && (
                     <span className={`text-[9px] font-bold ${ksAFills && polyAFills ? 'text-green-400' : 'text-yellow-400'}`}>
@@ -1294,7 +1387,7 @@ export default function ArbitrageLab() {
             <div className="border-t border-gray-800/60 pt-1 space-y-0.5">
               <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono">
                 <span className="text-gray-500">B:</span>
-                <span className="text-gray-400">KS {ksNoSub} {execKsN != null ? `${(execKsN*100).toFixed(0)}¢` : '—'} + P {polyOutcomes[0]} {execPUp != null ? `${(execPUp*100).toFixed(0)}¢` : '—'} = {costB != null ? cents(costB) : '—'}</span>
+                <span className="text-gray-400">{isPolyPolyLive ? 'P-A Down' : `KS ${ksNoSub}`} {execKsN != null ? `${(execKsN*100).toFixed(0)}¢` : '—'} + P {polyOutcomes[0]} {execPUp != null ? `${(execPUp*100).toFixed(0)}¢` : '—'} = {costB != null ? cents(costB) : '—'}</span>
                 <span className={profitBper != null && profitBper > 0 ? 'text-green-400 font-bold' : profitBper != null && profitBper < 0 ? 'text-red-400' : 'text-gray-500'}>
                   {profitBper != null ? `${profitBper > 0 ? '+' : ''}${(profitBper * 100).toFixed(2)}¢/sh` : '—'}
                 </span>
@@ -1323,7 +1416,7 @@ export default function ArbitrageLab() {
               </div>
               {book && (
                 <div className="flex flex-wrap gap-3 ml-6 font-mono">
-                  {fillBadge(`KS ${ksNoSub}`, ksData.noBid, ksData.noBidQty, ksData.noAsk, ksData.noAskQty, ksBFills)}
+                  {fillBadge(`${isPolyPolyLive ? 'P-A Down' : `KS ${ksNoSub}`}`, ksData.noBid, ksData.noBidQty, ksData.noAsk, ksData.noAskQty, ksBFills)}
                   {fillBadge(`P ${polyOutcomes[0]}`, polyUpData.bestBid, polyUpData.bestBidQty, polyUpData.bestAsk, polyUpData.bestAskQty, polyBFills)}
                   {ksBFills != null && polyBFills != null && (
                     <span className={`text-[9px] font-bold ${ksBFills && polyBFills ? 'text-green-400' : 'text-yellow-400'}`}>
@@ -1406,7 +1499,7 @@ export default function ArbitrageLab() {
                   <div className="space-y-1">
                     <div className="font-bold text-xs">
                       {execResult.success
-                        ? <span className="text-green-400">BOTH ORDERS SENT — {meta.kalshi?.title || meta.poly?.question || ''}</span>
+                        ? <span className="text-green-400">BOTH ORDERS SENT — {activeLaunchLabel}</span>
                         : <span className="text-yellow-400">PARTIAL — check below</span>
                       }
                     </div>
