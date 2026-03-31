@@ -768,7 +768,7 @@ export default function ArbitrageLab() {
             <table className="w-full text-[10px] font-mono border-collapse">
               <thead>
                 <tr className="text-gray-500 text-left border-b border-gray-800">
-                  <th className="py-1 pr-2 font-normal">Event</th>
+                  <th className="py-1 pr-2 font-normal">Time (PT)</th>
                   <th className="py-1 pr-2 font-normal">Coin</th>
                   <th className="py-1 pr-2 font-normal">Result</th>
                   <th className="py-1 pr-2 font-normal">KS P&L</th>
@@ -777,24 +777,27 @@ export default function ArbitrageLab() {
                 </tr>
               </thead>
               <tbody>
-                {eventPnl.map((e, i) => (
+                {eventPnl.map((e, i) => {
+                  const ptTime = e.startTs ? new Date(e.startTs * 1000).toLocaleString('en-US', { timeZone: 'America/Los_Angeles', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: true }) : e.ticker;
+                  return (
                   <tr key={i} className="border-b border-gray-800/80">
-                    <td className="py-1 pr-2 text-gray-300">{e.ticker}</td>
+                    <td className="py-1 pr-2 text-gray-300 whitespace-nowrap">{ptTime}</td>
                     <td className="py-1 pr-2 text-gray-400">{e.coin}</td>
                     <td className={`py-1 pr-2 ${e.result === 'yes' ? 'text-green-400' : e.result === 'no' ? 'text-red-400' : 'text-gray-500'}`}>
                       {e.result === 'yes' ? 'UP' : e.result === 'no' ? 'DOWN' : e.result}
                     </td>
                     <td className={`py-1 pr-2 ${e.ks.total >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                      ${e.ks.total.toFixed(2)}
+                      {e.ks.url ? <a href={e.ks.url} target="_blank" rel="noreferrer" className="underline">${e.ks.total.toFixed(2)}</a> : `$${e.ks.total.toFixed(2)}`}
                     </td>
                     <td className={`py-1 pr-2 ${e.poly.total >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-                      ${e.poly.total.toFixed(2)}
+                      {e.poly.url ? <a href={e.poly.url} target="_blank" rel="noreferrer" className="underline">${e.poly.total.toFixed(2)}</a> : `$${e.poly.total.toFixed(2)}`}
                     </td>
                     <td className={`py-1 pr-2 font-bold ${e.combined >= 0 ? 'text-green-300' : 'text-red-300'}`}>
                       ${e.combined.toFixed(2)}
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
                 <tr className="border-t border-gray-700">
                   <td colSpan={3} className="py-1 pr-2 text-gray-400 font-bold">TOTAL</td>
                   <td className={`py-1 pr-2 font-bold ${eventPnl.reduce((a,e)=>a+e.ks.total,0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
