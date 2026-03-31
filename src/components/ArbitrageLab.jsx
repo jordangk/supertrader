@@ -36,6 +36,129 @@ function fmtUsd(n) {
   return `${x >= 0 ? '+' : ''}$${x.toFixed(2)}`;
 }
 
+/**
+ * Poly+Poly: after a partial fill, estimate locked profit if you buy the missing leg at current ask.
+ * Strategy A: P-A Up + P right (Up or Down per swapPoly). Strategy B: P-A Down + P other side.
+ */
+function computePolyPolyHedgeHint({
+  strategy,
+  swapPoly,
+  execResult,
+  tradeRow,
+  book,
+  polyOutcomes,
+  fee,
+}) {
+  const leftPoly = book?.polyA;
+  const rightPoly = book?.polyB || book?.poly;
+  if (!leftPoly || !rightPoly) return null;
+
+  const o0 = polyOutcomes?.[0] || 'Up';
+  const o1 = polyOutcomes?.[1] || 'Down';
+
+  let strat = strategy;
+  let qL = 0;
+  let qR = 0;
+  let leftAvg = 0;
+  let rightAvg = 0;
+
+  if (execResult?.mode === 'poly_poly') {
+    strat = execResult.strategy || strat;
+    qL = Math.round(Number(execResult.kalshi?.fillCount ?? 0));
+    qR = Math.round(Number(execResult.poly?.fillCount ?? 0));
+    leftAvg = Number(execResult.kalshi?.avgFillPrice ?? 0);
+    rightAvg = Number(execResult.poly?.avgFillPrice ?? 0);
+  } else if (tradeRow && String(tradeRow.kalshi_ticker || '').startsWith('POLY:')) {
+    strat = tradeRow.strategy || strat;
+    qL = Math.round(Number(tradeRow.kalshi_shares ?? 0));
+    qR = Math.round(Number(tradeRow.poly_shares ?? 0));
+    leftAvg = Number(tradeRow.kalshi_fill_price ?? 0);
+    rightAvg = Number(tradeRow.poly_fill_price ?? 0);
+  } else {
+    return null;
+  }
+
+  if (!strat || strat === '') return null;
+
+  if (execResult?.mode === 'poly_poly' && execResult.success && qL > 0 && qR > 0 && qL === qR) return null;
+  if ((!execResult || execResult.mode !== 'poly_poly') && tradeRow?.both_filled) return null;
+
+  let leftAsk;
+  let rightAsk;
+  let leftLabel;
+  let rightLabel;
+  if (strat === 'A') {
+    leftAsk = leftPoly.up?.bestAsk != null ? Number(leftPoly.up.bestAsk) : null;
+    rightAsk = swapPoly
+      ? (rightPoly.up?.bestAsk != null ? Number(rightPoly.up.bestAsk) : null)
+      : (rightPoly.down?.bestAsk != null ? Number(rightPoly.down.bestAsk) : null);
+    leftLabel = `P-A ${o0}`;
+    rightLabel = swapPoly ? `P ${o0}` : `P ${o1}`;
+  } else {
+    leftAsk = leftPoly.down?.bestAsk != null ? Number(leftPoly.down.bestAsk) : null;
+    rightAsk = swapPoly
+      ? (rightPoly.down?.bestAsk != null ? Number(rightPoly.down.bestAsk) : null)
+      : (rightPoly.up?.bestAsk != null ? Number(rightPoly.up.bestAsk) : null);
+    leftLabel = `P-A ${o1}`;
+    rightLabel = swapPoly ? `P ${o1}` : `P ${o0}`;
+  }
+
+  if (leftAsk == null || rightAsk == null) return null;
+
+  const missingRight = Math.max(0, qL - qR);
+  const missingLeft = Math.max(0, qR - qL);
+
+  let primaryLine = '';
+  let lockPerShare = null;
+  let lockUsd = null;
+  let detail = '';
+
+  if (missingRight > 0) {
+    lockPerShare = 1 - fee - leftAvg - rightAsk;
+    lockUsd = lockPerShare * missingRight;
+    primaryLine = `Buy ${missingRight} ${rightLabel} @ ${(rightAsk * 100).toFixed(0)}¢ (ask) to match your ${leftLabel} (${qL} sh @ ~${(leftAvg * 100).toFixed(1)}¢)`;
+    detail = `If filled, locks ~${(lockPerShare * 100).toFixed(1)}¢/sh on ${missingRight} sh (${fmtUsd(lockUsd)} total on that slice).`;
+  } else if (missingLeft > 0) {
+    lockPerShare = 1 - fee - leftAsk - rightAvg;
+    lockUsd = lockPerShare * missingLeft;
+    primaryLine = `Buy ${missingLeft} ${leftLabel} @ ${(leftAsk * 100).toFixed(0)}¢ (ask) to match your ${rightLabel} (${qR} sh @ ~${(rightAvg * 100).toFixed(1)}¢)`;
+    detail = `If filled, locks ~${(lockPerShare * 100).toFixed(1)}¢/sh on ${missingLeft} sh (${fmtUsd(lockUsd)} total on that slice).`;
+  } else {
+    return null;
+  }
+
+  const other = strat === 'A' ? 'B' : 'A';
+  let otherCost = null;
+  if (other === 'A') {
+    const la = leftPoly.up?.bestAsk != null ? Number(leftPoly.up.bestAsk) : null;
+    const ra = swapPoly
+      ? (rightPoly.up?.bestAsk != null ? Number(rightPoly.up.bestAsk) : null)
+      : (rightPoly.down?.bestAsk != null ? Number(rightPoly.down.bestAsk) : null);
+    if (la != null && ra != null) otherCost = la + ra;
+  } else {
+    const la = leftPoly.down?.bestAsk != null ? Number(leftPoly.down.bestAsk) : null;
+    const ra = swapPoly
+      ? (rightPoly.down?.bestAsk != null ? Number(rightPoly.down.bestAsk) : null)
+      : (rightPoly.up?.bestAsk != null ? Number(rightPoly.up.bestAsk) : null);
+    if (la != null && ra != null) otherCost = la + ra;
+  }
+  const otherPerShare = otherCost != null ? 1 - fee - otherCost : null;
+
+  return {
+    strategy: strat,
+    primaryLine,
+    detail,
+    lockPerShare,
+    lockUsd,
+    qL,
+    qR,
+    leftLabel,
+    rightLabel,
+    otherStrategy: other,
+    otherPerShare,
+  };
+}
+
 function fetchErrMessage(e, base) {
   if (e?.name === 'TypeError' && String(e.message).includes('fetch')) {
     const where = base || '(same page /api)';
@@ -1327,6 +1450,20 @@ export default function ArbitrageLab() {
           );
         }
 
+        const partialPolyTrade =
+          trades.find((t) => String(t.kalshi_ticker || '').startsWith('POLY:') && !t.both_filled) || null;
+        const polyHedgeHint = isPolyPolyLive && book?.polyA
+          ? computePolyPolyHedgeHint({
+              strategy: execResult?.strategy || partialPolyTrade?.strategy || trades[0]?.strategy,
+              swapPoly,
+              execResult,
+              tradeRow: partialPolyTrade || trades[0] || null,
+              book,
+              polyOutcomes,
+              fee: FEE,
+            })
+          : null;
+
         return (
           <div className="space-y-2 border border-gray-800 rounded-lg p-2 bg-black/30">
             <div className="flex flex-wrap gap-2 text-[11px] font-mono">
@@ -1429,6 +1566,28 @@ export default function ArbitrageLab() {
                 </div>
               )}
             </div>
+            {polyHedgeHint && (
+              <div className="border-t border-amber-700/40 pt-1.5 mt-1 space-y-0.5 rounded bg-amber-950/30 px-2 py-1.5">
+                <div className="text-[10px] text-amber-400 font-semibold">
+                  Complete hedge (strategy {polyHedgeHint.strategy}) — if you buy the missing leg here you lock ≈
+                  <span className={polyHedgeHint.lockPerShare >= 0 ? ' text-green-400' : ' text-red-400'}>
+                    {(polyHedgeHint.lockPerShare * 100).toFixed(1)}¢/sh
+                  </span>
+                </div>
+                <div className="text-[10px] text-gray-200 font-mono leading-snug">{polyHedgeHint.primaryLine}</div>
+                <div className="text-[9px] text-gray-400 font-mono">{polyHedgeHint.detail}</div>
+                {polyHedgeHint.otherPerShare != null && Number.isFinite(polyHedgeHint.otherPerShare) && (
+                  <div className="text-[9px] text-gray-500 font-mono pt-0.5 border-t border-gray-800/80">
+                    Other strategy ({polyHedgeHint.otherStrategy}) at current asks:{' '}
+                    <span className={polyHedgeHint.otherPerShare >= 0 ? 'text-green-400' : 'text-red-400'}>
+                      {(polyHedgeHint.otherPerShare * 100).toFixed(1)}¢/sh
+                    </span>
+                    {' '}
+                    — not the same hedge as your open leg; only the missing leg above completes your pair.
+                  </div>
+                )}
+              </div>
+            )}
             </>}
             {/* All combos for multi-market events */}
             {combos.length > 0 && (
