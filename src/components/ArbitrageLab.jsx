@@ -71,6 +71,7 @@ export default function ArbitrageLab() {
   const [pnlData, setPnlData] = useState(null);
   const [arbSessions, setArbSessions] = useState([]);
   const [venuePnlRefreshing, setVenuePnlRefreshing] = useState(null);
+  const [eventPnl, setEventPnl] = useState([]);
 
   // Snipe state
   const [snipes, setSnipes] = useState([]);
@@ -125,7 +126,7 @@ export default function ArbitrageLab() {
     return () => clearInterval(iv);
   }, []);
 
-  // Arb sessions (includes venue_pnl_* from DB — Kalshi fills + Polymarket data-api trades)
+  // Arb sessions (includes venue_pnl_* from DB — primarily arb_trades fills, with API fallback)
   useEffect(() => {
     function loadSessions() {
       fetch(`${API_BASE}/api/arb/sessions`)
@@ -707,66 +708,61 @@ export default function ArbitrageLab() {
         </p>
       </div>
 
-      {/* Venue P&L from Kalshi /portfolio/fills + Polymarket data-api trades (per ended session) */}
+      {/* Event P&L from actual platform data */}
       <div className="border border-emerald-800/50 rounded-lg bg-emerald-950/25 p-2 space-y-1.5">
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <span className="text-[11px] font-bold text-emerald-400">Venue P&amp;L (K + Poly)</span>
-          <span className="text-[9px] text-gray-500">Direct from APIs · updates after you stop + when markets settle</span>
+          <span className="text-[11px] font-bold text-emerald-400">Event P&L (K + Poly)</span>
+          <span className="text-[9px] text-gray-500">Direct from APIs · updates after markets settle</span>
+          <button type="button" onClick={() => {
+            fetch(`${API_BASE}/api/arb/event-pnl?limit=15`).then(r => r.json()).then(d => setEventPnl(d.events || [])).catch(() => {});
+          }} className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-900/60 text-emerald-300 hover:bg-emerald-800">↻ Refresh</button>
         </div>
-        {arbSessions.filter((s) => s.ended_at).length === 0 ? (
-          <p className="text-[10px] text-gray-500">
-            No ended sessions yet. Click <span className="text-gray-400">Stop</span> to end a run; venue rows appear here. If the table stays empty after stopping, apply{' '}
-            <code className="text-gray-600">scripts/sql/arb_session_venue_pnl.sql</code> to your DB.
-          </p>
+        {eventPnl.length === 0 ? (
+          <p className="text-[10px] text-gray-500">Click refresh to load event P&L from Kalshi + Polymarket APIs.</p>
         ) : (
           <div className="overflow-x-auto -mx-0.5">
             <table className="w-full text-[10px] font-mono border-collapse">
               <thead>
                 <tr className="text-gray-500 text-left border-b border-gray-800">
-                  <th className="py-1 pr-2 font-normal">Session</th>
-                  <th className="py-1 pr-2 font-normal">Ended</th>
-                  <th className="py-1 pr-2 font-normal">Kalshi</th>
-                  <th className="py-1 pr-2 font-normal">Polymarket</th>
-                  <th className="py-1 pr-2 font-normal">Total</th>
-                  <th className="py-1 pr-2 font-normal">Status</th>
-                  <th className="py-1 font-normal w-14" />
+                  <th className="py-1 pr-2 font-normal">Event</th>
+                  <th className="py-1 pr-2 font-normal">Coin</th>
+                  <th className="py-1 pr-2 font-normal">Result</th>
+                  <th className="py-1 pr-2 font-normal">KS P&L</th>
+                  <th className="py-1 pr-2 font-normal">Poly P&L</th>
+                  <th className="py-1 pr-2 font-normal font-bold">Combined</th>
                 </tr>
               </thead>
               <tbody>
-                {[...arbSessions]
-                  .filter((s) => s.ended_at)
-                  .sort((a, b) => new Date(b.ended_at) - new Date(a.ended_at))
-                  .slice(0, 12)
-                  .map((s) => (
-                    <tr key={s.id} className={`border-b border-gray-800/80 ${sessionId && s.id === sessionId ? 'bg-amber-950/30' : ''}`}>
-                      <td className="py-1 pr-2 max-w-[140px] truncate text-gray-300" title={s.polymarket_slug || s.label || s.id}>
-                        {s.label || s.polymarket_slug || s.id?.slice(0, 8)}
-                      </td>
-                      <td className="py-1 pr-2 text-gray-500 whitespace-nowrap">
-                        {s.ended_at ? new Date(s.ended_at).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'}
-                      </td>
-                      <td className={`py-1 pr-2 ${s.venue_pnl_kalshi != null ? (Number(s.venue_pnl_kalshi) >= 0 ? 'text-green-400' : 'text-red-400') : 'text-gray-600'}`}>
-                        {fmtUsd(s.venue_pnl_kalshi)}
-                      </td>
-                      <td className={`py-1 pr-2 ${s.venue_pnl_polymarket != null ? (Number(s.venue_pnl_polymarket) >= 0 ? 'text-green-400' : 'text-red-400') : 'text-gray-600'}`}>
-                        {fmtUsd(s.venue_pnl_polymarket)}
-                      </td>
-                      <td className={`py-1 pr-2 font-bold ${s.venue_pnl_total != null ? (Number(s.venue_pnl_total) >= 0 ? 'text-green-300' : 'text-red-300') : 'text-gray-600'}`}>
-                        {fmtUsd(s.venue_pnl_total)}
-                      </td>
-                      <td className="py-1 pr-2 text-gray-500">{s.venue_pnl_status || '—'}</td>
-                      <td className="py-1">
-                        <button
-                          type="button"
-                          disabled={venuePnlRefreshing === s.id}
-                          onClick={() => refreshVenuePnl(s.id)}
-                          className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-900/60 text-emerald-300 hover:bg-emerald-800 disabled:opacity-40"
-                        >
-                          {venuePnlRefreshing === s.id ? '…' : '↻'}
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
+                {eventPnl.map((e, i) => (
+                  <tr key={i} className="border-b border-gray-800/80">
+                    <td className="py-1 pr-2 text-gray-300">{e.ticker}</td>
+                    <td className="py-1 pr-2 text-gray-400">{e.coin}</td>
+                    <td className={`py-1 pr-2 ${e.result === 'yes' ? 'text-green-400' : e.result === 'no' ? 'text-red-400' : 'text-gray-500'}`}>
+                      {e.result === 'yes' ? 'UP' : e.result === 'no' ? 'DOWN' : e.result}
+                    </td>
+                    <td className={`py-1 pr-2 ${e.ks.total >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                      ${e.ks.total.toFixed(2)}
+                    </td>
+                    <td className={`py-1 pr-2 ${e.poly.total >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                      ${e.poly.total.toFixed(2)}
+                    </td>
+                    <td className={`py-1 pr-2 font-bold ${e.combined >= 0 ? 'text-green-300' : 'text-red-300'}`}>
+                      ${e.combined.toFixed(2)}
+                    </td>
+                  </tr>
+                ))}
+                <tr className="border-t border-gray-700">
+                  <td colSpan={3} className="py-1 pr-2 text-gray-400 font-bold">TOTAL</td>
+                  <td className={`py-1 pr-2 font-bold ${eventPnl.reduce((a,e)=>a+e.ks.total,0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                    ${eventPnl.reduce((a,e)=>a+e.ks.total,0).toFixed(2)}
+                  </td>
+                  <td className={`py-1 pr-2 font-bold ${eventPnl.reduce((a,e)=>a+e.poly.total,0) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                    ${eventPnl.reduce((a,e)=>a+e.poly.total,0).toFixed(2)}
+                  </td>
+                  <td className={`py-1 pr-2 font-bold ${eventPnl.reduce((a,e)=>a+e.combined,0) >= 0 ? 'text-green-300' : 'text-red-300'}`}>
+                    ${eventPnl.reduce((a,e)=>a+e.combined,0).toFixed(2)}
+                  </td>
+                </tr>
               </tbody>
             </table>
           </div>
