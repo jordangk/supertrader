@@ -836,8 +836,9 @@ function restoreEmaState() {
     if (state.lastEntrySide) autoEma.lastEntrySide = state.lastEntrySide;
   } catch (e) { console.error('[EMA] Restore error:', e?.message); }
 }
-restoreEmaState();
-setInterval(saveEmaState, 10_000);
+// EMA persistence disabled to save resources
+// restoreEmaState();
+// setInterval(saveEmaState, 10_000);
 const EMA12_ALPHA = 2 / 13;  // MACD fast (candle-based)
 const EMA26_ALPHA = 2 / 27;  // MACD slow (candle-based)
 const EMA9_ALPHA = 2 / 10;   // MACD signal line (candle-based)
@@ -847,14 +848,14 @@ const FAST_EMA12_ALPHA = 2 / 13;   // standard EMA12
 const FAST_EMA26_ALPHA = 2 / 27;   // standard EMA26
 const FAST_EMA9_ALPHA = 2 / 10;    // standard signal line
 
-// EMA log buffer — flush to Supabase every 5s
+// EMA log buffer — disabled to save resources
 const _emaLogBuffer = [];
-setInterval(async () => {
-  if (_emaLogBuffer.length === 0) return;
-  const batch = _emaLogBuffer.splice(0, _emaLogBuffer.length);
-  const { error } = await supabase.from('ema_snapshots').insert(batch);
-  if (error) console.error('[EMA-LOG] DB error:', error.message);
-}, 5000);
+// setInterval(async () => {
+//   if (_emaLogBuffer.length === 0) return;
+//   const batch = _emaLogBuffer.splice(0, _emaLogBuffer.length);
+//   const { error } = await supabase.from('ema_snapshots').insert(batch);
+//   if (error) console.error('[EMA-LOG] DB error:', error.message);
+// }, 5000);
 
 function updateServerEma(btcPrice) {
   if (liveState.btcStart == null) return;
@@ -894,17 +895,7 @@ function updateServerEma(btcPrice) {
   serverEma.gapHistory.push({ t: now, gap: serverEma.gap, hist: serverEma.histogram });
   if (serverEma.gapHistory.length > 600) serverEma.gapHistory.splice(0, serverEma.gapHistory.length - 600);
 
-  // Log EMA snapshot to DB every 2s for later analysis
-  _emaLogBuffer.push({
-    ts: new Date(now).toISOString(),
-    event_slug: liveState.eventSlug || null,
-    btc_price: btcPrice,
-    btc_delta: delta,
-    e12: serverEma.e12, e26: serverEma.e26, gap: serverEma.gap, histogram: serverEma.histogram,
-    f_e12: serverEma.fE12, f_e26: serverEma.fE26, f_gap: fGap, f_histogram: serverEma.fHistogram,
-    up_price: liveState.upPrice, down_price: liveState.downPrice,
-    up_e12: serverEma.upE12, up_e26: serverEma.upE26, down_e12: serverEma.downE12, down_e26: serverEma.downE26,
-  });
+  // EMA DB logging disabled to save resources
 }
 
 function resetServerEma() {
@@ -1694,8 +1685,28 @@ async function resolveCopyTokens(slug) {
 
 // Get current market price for a token
 async function getCopyPrice(tokenId, orderSide) {
-  // For BUY orders: fetch ASK price (side=sell) so we cross the spread
-  // For SELL orders: fetch BID price (side=buy) so we hit bids
+  // Try KS 15m price first (more accurate for 15m events)
+  try {
+    const ksRes = await fetch(`http://localhost:${process.env.PORT || 3001}/api/arb/ks-price/btc`);
+    if (ksRes.ok) {
+      const ks = await ksRes.json();
+      if (ks.yesAsk && ks.noAsk) {
+        // Figure out which outcome this tokenId maps to
+        // Check k9TokenMap for this tokenId's outcome
+        const info = k9TokenMap[tokenId];
+        const outcome = info?.outcome?.toLowerCase();
+        if (outcome === 'up') {
+          // Poly UP = KS YES
+          return orderSide === 'buy' ? ks.yesAsk : ks.yesBid;
+        } else if (outcome === 'down') {
+          // Poly DOWN = KS NO
+          return orderSide === 'buy' ? ks.noAsk : ks.noBid;
+        }
+      }
+    }
+  } catch {}
+
+  // Fallback to Poly CLOB price
   const bookSide = orderSide === 'buy' ? 'sell' : 'buy';
   try {
     const res = await fetch(`https://clob.polymarket.com/price?token_id=${tokenId}&side=${bookSide}`);
@@ -2131,31 +2142,19 @@ function connectClobStream(tokenIds) {
         }
         // Skip book messages — they cause flashing with stale mid-market on thin 5m events
 
+        // Poly WS prices disabled — KS prices are the sole source (synced every 3s)
+        // Only use Poly WS for flow ticks
         if (price != null && !isNaN(price) && price > 0 && price < 1) {
           if (assetId === liveState.tokenUp) {
-            liveState.upPrice = price;
-            if (liveState.upStartPrice == null) liveState.upStartPrice = price;
             recordFlowTick('up', price);
-            // Update Up price EMA
-            const priceCents = price * 100;
-            serverEma.upE12 = serverEma.upE12 == null ? priceCents : priceCents * FAST_EMA12_ALPHA + serverEma.upE12 * (1 - FAST_EMA12_ALPHA);
-            serverEma.upE26 = serverEma.upE26 == null ? priceCents : priceCents * FAST_EMA26_ALPHA + serverEma.upE26 * (1 - FAST_EMA26_ALPHA);
-            changed = true;
           } else if (assetId === liveState.tokenDown) {
-            liveState.downPrice = price;
-            if (liveState.downStartPrice == null) liveState.downStartPrice = price;
             recordFlowTick('down', price);
-            // Update Down price EMA
-            const priceCents = price * 100;
-            serverEma.downE12 = serverEma.downE12 == null ? priceCents : priceCents * FAST_EMA12_ALPHA + serverEma.downE12 * (1 - FAST_EMA12_ALPHA);
-            serverEma.downE26 = serverEma.downE26 == null ? priceCents : priceCents * FAST_EMA26_ALPHA + serverEma.downE26 * (1 - FAST_EMA26_ALPHA);
-            changed = true;
           }
         }
       }
       if (changed) {
         lastWsPrice = Date.now();
-        broadcast({ type: 'prices', ...liveState, priceEma: { upE12: serverEma.upE12, upE26: serverEma.upE26, downE12: serverEma.downE12, downE26: serverEma.downE26 } });
+        broadcast({ type: 'prices', ...liveState });
       }
     } catch {}
   });
@@ -2270,6 +2269,204 @@ function scheduleEthEvent() {
   const nextSlot = (Math.floor(nowSecs / 900) + 1) * 900;
   const delay = (nextSlot * 1000) - now + 3000; // 3s after slot boundary
   ethEventTimer = setTimeout(() => { refreshEthEvent(); scheduleEthEvent(); }, delay);
+}
+
+// ── BTC 5m event tracking (Poly only) ────────────────────────────────────
+let btc5mEvent = null;
+let btc5mClobWs = null;
+let btc5mState = {
+  eventSlug: null, tokenUp: null, tokenDown: null,
+  upPrice: null, downPrice: null, btcStart: null, btcCurrent: null,
+  endTime: null, title: null, tickSize: '0.01', negRisk: false,
+};
+const btc5mSnapshotBuffer = [];
+
+async function fetchActive5mEvent() {
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const slot = Math.floor(now / 300) * 300;
+    const slug = `btc-updown-5m-${slot}`;
+    const res = await fetch(`https://gamma-api.polymarket.com/events?slug=${slug}`);
+    const data = await res.json();
+    const event = Array.isArray(data) ? data[0] : data;
+    if (!event) return null;
+    const market = event.markets?.[0];
+    if (!market) return null;
+    const tokenIds = typeof market.clobTokenIds === 'string' ? JSON.parse(market.clobTokenIds) : market.clobTokenIds;
+    console.log(`[BTC5M] Found: ${event.slug} — ${event.title}`);
+    return {
+      slug: event.slug, title: event.title,
+      startDate: event.startDate, endDate: event.endDate,
+      tokenUp: tokenIds[0], tokenDown: tokenIds[1],
+      tickSize: market.orderPriceMinTickSize || '0.01',
+      negRisk: !!market.negRisk,
+    };
+  } catch (e) {
+    console.error('[BTC5M] fetch error:', e.message);
+    return null;
+  }
+}
+
+function connect5mClobStream(tokenIds) {
+  if (btc5mClobWs) btc5mClobWs.close();
+  btc5mClobWs = new WebSocket('wss://ws-subscriptions-clob.polymarket.com/ws/market');
+
+  btc5mClobWs.on('open', () => {
+    console.log('[BTC5M CLOB WS] connected');
+    btc5mClobWs.send(JSON.stringify({ assets_ids: tokenIds, type: 'market' }));
+  });
+
+  btc5mClobWs.on('message', (raw) => {
+    try {
+      const msgs = JSON.parse(raw);
+      const arr = Array.isArray(msgs) ? msgs : [msgs];
+      let changed = false;
+      for (const msg of arr) {
+        let price = null;
+        const assetId = msg.asset_id || msg.market;
+        if (msg.event_type === 'price_change' || msg.type === 'price_change') price = parseFloat(msg.price);
+        else if (msg.event_type === 'last_trade_price' || msg.type === 'last_trade_price') price = parseFloat(msg.price);
+        if (price != null && !isNaN(price) && price > 0 && price < 1) {
+          if (assetId === btc5mState.tokenUp) {
+            btc5mState.upPrice = price;
+            changed = true;
+          } else if (assetId === btc5mState.tokenDown) {
+            btc5mState.downPrice = price;
+            changed = true;
+          }
+        }
+      }
+      if (changed) {
+        btc5mState.btcCurrent = liveState.binanceBtc;
+        broadcast({ type: 'btc5m_prices', ...btc5mState });
+      }
+    } catch {}
+  });
+
+  btc5mClobWs.on('close', () => {
+    console.log('[BTC5M CLOB WS] disconnected, reconnecting in 3s...');
+    setTimeout(() => { if (btc5mState.tokenUp) connect5mClobStream([btc5mState.tokenUp, btc5mState.tokenDown]); }, 3000);
+  });
+  btc5mClobWs.on('error', (e) => console.error('[BTC5M CLOB WS] error:', e.message));
+}
+
+async function refresh5mEvent() {
+  const event = await fetchActive5mEvent();
+  if (!event) { console.log('[BTC5M] No active 5m event found'); return; }
+  btc5mEvent = event;
+  btc5mState.eventSlug = event.slug;
+  btc5mState.title = event.title;
+  btc5mState.tokenUp = event.tokenUp;
+  btc5mState.tokenDown = event.tokenDown;
+  btc5mState.endTime = event.endDate;
+  btc5mState.tickSize = event.tickSize;
+  btc5mState.negRisk = event.negRisk;
+  btc5mState.upPrice = null;
+  btc5mState.downPrice = null;
+  // Capture BTC start from Binance
+  btc5mState.btcStart = liveState.binanceBtc || null;
+  btc5mState.btcCurrent = liveState.binanceBtc || null;
+  broadcast({ type: 'btc5m_event', event });
+  connect5mClobStream([event.tokenUp, event.tokenDown]);
+  // Fetch initial prices
+  try {
+    const [upP, downP] = await Promise.all([fetchClobPrice(event.tokenUp), fetchClobPrice(event.tokenDown)]);
+    if (upP != null) btc5mState.upPrice = upP;
+    if (downP != null) btc5mState.downPrice = downP;
+    broadcast({ type: 'btc5m_prices', ...btc5mState });
+  } catch {}
+}
+
+let btc5mEventTimer = null;
+function schedule5mEvent() {
+  if (btc5mEventTimer) clearTimeout(btc5mEventTimer);
+  const now = Date.now();
+  const nowSecs = Math.floor(now / 1000);
+  const nextSlot = (Math.floor(nowSecs / 300) + 1) * 300;
+  const delay = (nextSlot * 1000) - now + 3000; // 3s after 5m boundary
+  btc5mEventTimer = setTimeout(() => { refresh5mEvent(); schedule5mEvent(); }, delay);
+}
+
+// Server-side Auto-99: fires in last 5s if winning side > 90¢ and been > 80¢ for 1 min
+const auto99State = { enabled: false, firedSlug: null, priceLog: [] };
+app.post('/api/btc5m/auto99/toggle', (req, res) => {
+  auto99State.enabled = !auto99State.enabled;
+  if (!auto99State.enabled) { auto99State.firedSlug = null; auto99State.priceLog = []; }
+  console.log(`[auto-99] ${auto99State.enabled ? 'ENABLED' : 'DISABLED'}`);
+  res.json({ enabled: auto99State.enabled });
+});
+app.get('/api/btc5m/auto99/status', (req, res) => {
+  res.json({ enabled: auto99State.enabled, firedSlug: auto99State.firedSlug, logSize: auto99State.priceLog.length });
+});
+
+setInterval(async () => {
+  if (!auto99State.enabled) return;
+  if (!btc5mState.eventSlug || !btc5mEvent?.endDate) return;
+  // No firedSlug guard — fires every second when conditions met
+
+  const up = btc5mState.upPrice;
+  const down = btc5mState.downPrice;
+  if (!up || !down) return;
+
+  const winningSide = up > down ? 'up' : 'down';
+  const winningPrice = Math.max(up, down);
+  const now = Date.now();
+
+  // Log price
+  auto99State.priceLog.push({ t: now, price: winningPrice, side: winningSide });
+  auto99State.priceLog = auto99State.priceLog.filter(p => now - p.t < 90000);
+
+  // Reset on new event
+  if (auto99State.priceLog.length > 0 && auto99State.priceLog[0].t > now - 2000) {
+    // Fresh event — wait for data to accumulate
+  }
+
+  // Fire every second in last 4 seconds IF: >80¢ for past 15s AND current >90¢
+  const secsLeft = Math.max(0, (new Date(btc5mEvent.endDate).getTime() - now) / 1000);
+  if (secsLeft > 4 || secsLeft < 0) return;
+
+  // Current must be > 90¢
+  if (winningPrice < 0.90) return;
+
+  // Must have been > 80¢ for the past 15 seconds, same side
+  const last15s = auto99State.priceLog.filter(p => now - p.t < 15000);
+  if (last15s.length < 5) return; // need enough data
+  if (!last15s.every(p => p.price >= 0.80 && p.side === winningSide)) return;
+
+  // FIRE
+  auto99State.firedSlug = btc5mState.eventSlug;
+  console.log(`[auto-99] FIRING: ${winningSide} @ 99¢ (price ${(winningPrice*100).toFixed(0)}¢, ${secsLeft.toFixed(1)}s left)`);
+
+  try {
+    const tokenId = winningSide === 'up' ? btc5mState.tokenUp : btc5mState.tokenDown;
+    if (!tokenId || !clobClient) return;
+    const tick = btc5mEvent.tickSize || '0.01';
+    const signed = await clobClient.createOrder(
+      { tokenID: tokenId, price: 0.99, size: 5, side: 'BUY' },
+      { tickSize: String(tick), negRisk: btc5mEvent.negRisk || false },
+    );
+    const result = await clobClient.postOrder(signed, 'GTC');
+    console.log(`[auto-99] PLACED: ${winningSide} 5sh @ 99¢ — id:${result?.orderID?.slice(0,8)} status:${result?.status}`);
+    broadcast({ type: 'auto_99', side: winningSide, status: result?.status, orderId: result?.orderID });
+  } catch (e) {
+    console.error('[auto-99] Error:', e.message?.slice(0, 100));
+  }
+}, 1000);
+
+// BTC 5m snapshots — capture every 5s
+function push5mSnapshot() {
+  if (!btc5mState.eventSlug) return;
+  if (btc5mState.upPrice == null && btc5mState.downPrice == null) return;
+  const endDate = btc5mEvent?.endDate ? new Date(btc5mEvent.endDate) : null;
+  const secsLeft = endDate ? Math.max(0, Math.floor((endDate - Date.now()) / 1000)) : null;
+  btc5mSnapshotBuffer.push({
+    event_slug: btc5mState.eventSlug,
+    btc_price: liveState.binanceBtc,
+    up_cost: btc5mState.upPrice,
+    down_cost: btc5mState.downPrice,
+    observed_at: new Date().toISOString(),
+    seconds_left: secsLeft,
+  });
 }
 
 // ── Binance BTC/USDT real-time price ─────────────────────────────────────
@@ -2400,37 +2597,42 @@ async function fireAutoScalp(side) {
   const sizeShares = autoScalp.shares;
 
   try {
-    const [upMkt, downMkt] = await Promise.all([fetchClobBidAsk(upTokenId), fetchClobBidAsk(downTokenId)]);
-    const upMarket = upMkt.bestAsk ?? liveState.upPrice;
-    const downMarket = downMkt.bestAsk ?? liveState.downPrice;
+    // Use KS prices instead of Poly
+    const upMarket = liveState.upPrice;
+    const downMarket = liveState.downPrice;
     if (!upMarket || upMarket <= 0 || !downMarket || downMarket <= 0) { _autoScalpAbort(); return; }
 
     // Winning side (higher price) → -1¢, losing side (hammered) → -3¢
     const upWinning = upMarket >= downMarket;
     const upDiscount = upWinning ? 0.01 : 0.03;
     const downDiscount = upWinning ? 0.03 : 0.01;
-    const upBuyPrice = Math.max(0.01, Math.min(Math.round((upMarket - upDiscount) / tick) * tick, 0.99));
-    const downBuyPrice = Math.max(0.01, Math.min(Math.round((downMarket - downDiscount) / tick) * tick, 0.99));
-    const totalCost = Math.round((upBuyPrice + downBuyPrice) * 100);
+    const upBuyPriceCents = Math.max(1, Math.min(Math.round((upMarket - upDiscount) * 100), 99));
+    const downBuyPriceCents = Math.max(1, Math.min(Math.round((downMarket - downDiscount) * 100), 99));
+    const totalCost = upBuyPriceCents + downBuyPriceCents;
     const profitCentsActual = 100 - totalCost;
 
     if (profitCentsActual <= 0) { _autoScalpAbort(); return; }
 
-    console.log(`[AUTO-SCALP] GTC UP ${sizeShares}sh @ ${(upBuyPrice*100).toFixed(0)}¢ + GTC DN @ ${(downBuyPrice*100).toFixed(0)}¢ (mkt ${(upMarket*100).toFixed(0)}/${(downMarket*100).toFixed(0)}¢, +${profitCentsActual}¢)`);
-    const upOrder = await clobClient.createOrder({ tokenID: upTokenId, price: upBuyPrice, size: sizeShares, side: 'BUY' }, { tickSize, negRisk });
-    const downOrder = await clobClient.createOrder({ tokenID: downTokenId, price: downBuyPrice, size: sizeShares, side: 'BUY' }, { tickSize, negRisk });
+    console.log(`[AUTO-SCALP] KS GTC YES ${sizeShares}sh @ ${upBuyPriceCents}¢ + NO @ ${downBuyPriceCents}¢ (mkt ${(upMarket*100).toFixed(0)}/${(downMarket*100).toFixed(0)}¢, +${profitCentsActual}¢)`);
 
-    const results = await clobClient.postOrders([
-      { order: upOrder, orderType: 'GTC' },
-      { order: downOrder, orderType: 'GTC' },
+    // Place both KS limit orders via internal API
+    const [upRes, downRes] = await Promise.all([
+      fetch(`http://localhost:${process.env.PORT || 3001}/api/ks-limit`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ side: 'yes', shares: sizeShares, priceCents: upBuyPriceCents }),
+      }).then(r => r.json()).catch(() => ({})),
+      fetch(`http://localhost:${process.env.PORT || 3001}/api/ks-limit`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ side: 'no', shares: sizeShares, priceCents: downBuyPriceCents }),
+      }).then(r => r.json()).catch(() => ({})),
     ]);
-    const arr = Array.isArray(results) ? results : (results?.responses || [results] || []);
-    const upResult = arr[0];
-    const downResult = arr[1];
-    const upOk = upResult?.success || upResult?.status === 'matched' || upResult?.status === 'live';
-    const downOk = downResult?.success || downResult?.status === 'live' || downResult?.status === 'matched';
-    let upId = upResult?.orderID ?? upResult?.order_id;
-    let downId = downResult?.orderID ?? downResult?.order_id;
+
+    const upOk = upRes?.ok;
+    const downOk = downRes?.ok;
+    let upId = upRes?.orderId;
+    let downId = downRes?.orderId;
+    const upBuyPrice = upBuyPriceCents / 100;
+    const downBuyPrice = downBuyPriceCents / 100;
 
     if (!upOk && !downOk) { _autoScalpAbort(); return; }
 
@@ -3082,10 +3284,27 @@ function startPricePoll() {
     if (pricePollInFlight) return; // skip if previous request still pending
     pricePollInFlight = true;
     try {
-      const [upPrice, downPrice] = await Promise.all([
-        fetchClobPrice(liveState.tokenUp),
-        fetchClobPrice(liveState.tokenDown),
-      ]);
+      // Try KS 15m prices first (more accurate), fall back to Poly CLOB
+      let upPrice = null, downPrice = null;
+      try {
+        const ksRes = await fetch(`http://localhost:${process.env.PORT || 3001}/api/arb/ks-price/btc`);
+        if (ksRes.ok) {
+          const ks = await ksRes.json();
+          if (ks.yesAsk && ks.noAsk) {
+            upPrice = ks.yesAsk;    // KS YES = UP
+            downPrice = ks.noAsk;   // KS NO = DOWN
+          }
+        }
+      } catch {}
+      // Fallback to Poly CLOB if KS not available
+      if (upPrice == null || downPrice == null) {
+        const [polyUp, polyDown] = await Promise.all([
+          fetchClobPrice(liveState.tokenUp),
+          fetchClobPrice(liveState.tokenDown),
+        ]);
+        if (upPrice == null) upPrice = polyUp;
+        if (downPrice == null) downPrice = polyDown;
+      }
       let changed = false;
       if (upPrice != null && upPrice !== liveState.upPrice) { liveState.upPrice = upPrice; changed = true; }
       if (downPrice != null && downPrice !== liveState.downPrice) { liveState.downPrice = downPrice; changed = true; }
@@ -5281,6 +5500,19 @@ async function pushSnapshot() {
     }
   } catch (e) { /* ignore — bid/ask are optional */ }
 
+  // Fetch KS 15m prices from arb session
+  let ksYesAsk = null, ksYesBid = null, ksNoAsk = null, ksNoBid = null;
+  try {
+    const ksRes = await fetch(`http://localhost:${process.env.PORT || 3001}/api/arb/ks-price/btc`);
+    if (ksRes.ok) {
+      const ks = await ksRes.json();
+      ksYesAsk = ks.yesAsk ?? null;
+      ksYesBid = ks.yesBid ?? null;
+      ksNoAsk = ks.noAsk ?? null;
+      ksNoBid = ks.noBid ?? null;
+    }
+  } catch {}
+
   snapshotBuffer.push({
     event_slug: liveState.eventSlug,
     btc_price: liveState.btcCurrent,
@@ -5291,6 +5523,10 @@ async function pushSnapshot() {
     up_best_ask: upAsk,
     down_best_bid: downBid,
     down_best_ask: downAsk,
+    ks_yes_ask: ksYesAsk,
+    ks_yes_bid: ksYesBid,
+    ks_no_ask: ksNoAsk,
+    ks_no_bid: ksNoBid,
     up_spread: upBid != null && upAsk != null ? Number((upAsk - upBid).toFixed(4)) : null,
     down_spread: downBid != null && downAsk != null ? Number((downAsk - downBid).toFixed(4)) : null,
     observed_at: new Date().toISOString(),
@@ -5350,7 +5586,21 @@ async function pushEthSnapshot() {
 }
 
 // Capture a snapshot every 5s (was 1s — reduced to lower Supabase + Polymarket API load)
-setInterval(() => { pushSnapshot(); pushEthSnapshot(); }, 5000);
+setInterval(() => { pushSnapshot(); pushEthSnapshot(); push5mSnapshot(); }, 5000);
+
+// Sync KS 15m prices into liveState every 3s (overrides Poly WS prices for BTC)
+setInterval(async () => {
+  try {
+    const ksRes = await fetch(`http://localhost:${process.env.PORT || 3001}/api/arb/ks-price/btc`);
+    if (!ksRes.ok) return;
+    const ks = await ksRes.json();
+    if (!ks.yesAsk || !ks.noAsk) return;
+    let changed = false;
+    if (ks.yesAsk !== liveState.upPrice) { liveState.upPrice = ks.yesAsk; changed = true; }
+    if (ks.noAsk !== liveState.downPrice) { liveState.downPrice = ks.noAsk; changed = true; }
+    if (changed) broadcast({ type: 'prices', ...liveState });
+  } catch {}
+}, 3000);
 
 // Flush buffer to Supabase every 5s
 setInterval(async () => {
@@ -5375,6 +5625,542 @@ setInterval(async () => {
     console.error('[ETH-SNAPSHOT] flush error:', e.message);
   }
 }, 5000);
+
+// Flush BTC 5m snapshot buffer to Supabase every 5s
+setInterval(async () => {
+  if (!btc5mSnapshotBuffer.length) return;
+  const batch = btc5mSnapshotBuffer.splice(0, btc5mSnapshotBuffer.length);
+  try {
+    const { error } = await supabase.from('btc_5m_snapshots').insert(batch);
+    if (error) console.error('[BTC5M-SNAPSHOT] batch error:', error.message);
+  } catch (e) {
+    console.error('[BTC5M-SNAPSHOT] flush error:', e.message);
+  }
+}, 5000);
+
+// ── BTC 5m API endpoints ──────────────────────────────────────────────────
+app.get('/api/btc5m/event', (req, res) => {
+  res.json({
+    ...btc5mState,
+    btcCurrent: liveState.binanceBtc || btc5mState.btcCurrent,
+  });
+});
+
+app.get('/api/btc5m/price-history', async (req, res) => {
+  const slug = req.query.slug || btc5mState.eventSlug;
+  const limit = parseInt(req.query.limit || '500');
+  if (!slug) return res.json({ snapshots: [] });
+  try {
+    const { data, error } = await supabase
+      .from('btc_5m_snapshots')
+      .select('observed_at, btc_price, up_cost, down_cost, seconds_left')
+      .eq('event_slug', slug)
+      .order('observed_at', { ascending: false })
+      .limit(limit);
+    if (error) return res.json({ snapshots: [], error: error.message });
+    res.json({ snapshots: (data || []).reverse(), slug });
+  } catch (e) {
+    res.json({ snapshots: [], error: e.message });
+  }
+});
+
+app.post('/api/btc5m/buy', async (req, res) => {
+  const { side, shares: reqShares, limitPrice, orderType } = req.body;
+  if (!btc5mEvent) return res.status(400).json({ error: 'No active 5m event' });
+  if (!['up', 'down'].includes(side)) return res.status(400).json({ error: 'Invalid side' });
+  if (!clobClient) return res.status(500).json({ error: 'CLOB client not ready' });
+
+  const tokenId = side === 'up' ? btc5mState.tokenUp : btc5mState.tokenDown;
+  if (!tokenId) return res.status(400).json({ error: 'No token ID' });
+
+  const tickSize = btc5mEvent.tickSize || '0.01';
+  const tick = parseFloat(tickSize);
+  const negRisk = btc5mEvent.negRisk || false;
+  const shares = Math.max(1, Math.round(parseFloat(reqShares || 5)));
+  const price = limitPrice
+    ? Math.max(0.01, Math.min(Math.round(Math.round(parseFloat(limitPrice) * 100) / 100 / tick) * tick, 0.99))
+    : Math.max(0.01, Math.min(Math.round(Math.round((side === 'up' ? btc5mState.upPrice : btc5mState.downPrice) * 100) / 100 / tick) * tick, 0.99));
+
+  // Respond instantly
+  res.json({ success: true, price, shares, status: 'sending' });
+
+  // Fire and forget
+  (async () => {
+    try {
+      const t0 = Date.now();
+      const signed = await clobClient.createOrder(
+        { tokenID: tokenId, price, size: shares, side: 'BUY' },
+        { tickSize: String(tick), negRisk },
+      );
+      const otype = orderType === 'GTC' ? 'GTC' : 'GTC';
+      const result = await clobClient.postOrder(signed, otype);
+      console.log(`[BTC5M BUY] ${side} ${shares}sh @ ${(price * 100).toFixed(0)}¢ — ${Date.now() - t0}ms — id:`, result?.orderID || result);
+      logTrade('btc5m', 'buy', { side, price, shares, eventSlug: btc5mState.eventSlug, orderId: result?.orderID });
+      broadcast({ type: 'btc5m_order', status: 'placed', side, price, shares, orderID: result?.orderID });
+    } catch (e) {
+      console.error('[BTC5M BUY] error:', e?.message);
+      broadcast({ type: 'btc5m_order', status: 'failed', side, price, shares, error: e?.message });
+    }
+  })();
+});
+
+// Live + ending soon events (CORS proxy for Gamma API)
+app.get('/api/ending-soon', async (req, res) => {
+  try {
+    // Fetch live events + events ending within 7 days
+    const [liveRes, soonRes] = await Promise.all([
+      fetch('https://gamma-api.polymarket.com/events?active=true&closed=false&live=true&limit=100').then(r => r.json()).catch(() => []),
+      fetch(`https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=200&end_date_min=${new Date().toISOString().slice(0,10)}T00:00:00Z&end_date_max=${new Date(Date.now()+7*86400000).toISOString().slice(0,10)}T23:59:59Z`).then(r => r.json()).catch(() => []),
+    ]);
+
+    const liveEvents = Array.isArray(liveRes) ? liveRes : [];
+    const soonMarkets = Array.isArray(soonRes) ? soonRes : [];
+
+    // Convert live events to a flat list with markets
+    const liveFlat = [];
+    for (const e of liveEvents) {
+      const slug = (e.slug || '').toLowerCase();
+      if (slug.includes('updown') || slug.includes('up-or-down')) continue; // skip crypto
+      if (e.ended) continue; // skip finished matches
+      for (const m of (e.markets || [])) {
+        liveFlat.push({
+          ...m,
+          _eventTitle: e.title,
+          _live: true,
+          _score: e.score,
+          _period: e.period,
+          _ended: e.ended,
+          _eventSlug: e.slug,
+          _startTime: e.startTime,
+          _finishedTimestamp: e.finishedTimestamp,
+        });
+      }
+    }
+
+    // Filter non-crypto from soon markets
+    const soonFiltered = soonMarkets.filter(m => {
+      const q = (m.question || '').toLowerCase();
+      return !q.includes('up or down') && !q.includes('bitcoin up') && !q.includes('ethereum up') &&
+             !q.includes('solana up') && !q.includes('xrp up') && !q.includes('dogecoin up') &&
+             !q.includes('bnb up') && !q.includes('hyperliquid up');
+    });
+
+    // Combine: live first, then ending soon
+    const combined = [...liveFlat, ...soonFiltered];
+    res.json(combined);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Auto-99 for live sports events: when a match ends, buy winner at 99¢
+const liveEventTracker = { enabled: false, knownLive: new Map(), fired: new Set(), log: [] };
+
+app.post('/api/live99/toggle', (req, res) => {
+  liveEventTracker.enabled = !liveEventTracker.enabled;
+  console.log(`[live-99] ${liveEventTracker.enabled ? 'ENABLED' : 'DISABLED'}`);
+  res.json({ enabled: liveEventTracker.enabled });
+});
+
+app.get('/api/live99/status', (req, res) => {
+  res.json({
+    enabled: liveEventTracker.enabled,
+    tracking: liveEventTracker.knownLive.size,
+    fired: liveEventTracker.fired.size,
+    log: liveEventTracker.log.slice(0, 20),
+  });
+});
+
+// Poll live events every 3 seconds
+setInterval(async () => {
+  if (!liveEventTracker.enabled || !clobClient) return;
+
+  try {
+    const r = await fetch('https://gamma-api.polymarket.com/events?active=true&closed=false&live=true&limit=100');
+    const events = await r.json();
+    if (!Array.isArray(events)) return;
+
+    const currentLive = new Set();
+
+    for (const e of events) {
+      const slug = e.slug;
+      if (!slug) continue;
+      // Skip crypto
+      if (slug.includes('updown') || slug.includes('up-or-down')) continue;
+
+      currentLive.add(slug);
+
+      // Track it if new
+      if (!liveEventTracker.knownLive.has(slug)) {
+        liveEventTracker.knownLive.set(slug, { title: e.title, markets: e.markets, score: e.score, period: e.period, ouFired: new Set() });
+      } else {
+        // Update score/period — check if score changed
+        const tracked = liveEventTracker.knownLive.get(slug);
+        const oldScore = tracked.score;
+        tracked.score = e.score;
+        tracked.period = e.period;
+        tracked.markets = e.markets || tracked.markets;
+
+        // Score changed → check O/U markets
+        if (e.score && e.score !== oldScore && clobClient) {
+          // Parse total score: "3-2" → 5, "32-48" → 80
+          const parts = String(e.score).split(/[-,]/);
+          const nums = parts.map(p => parseInt(p.trim())).filter(n => !isNaN(n));
+          const totalScore = nums.length >= 2 ? nums[0] + nums[1] : null;
+
+          if (totalScore != null) {
+            for (const m of (e.markets || [])) {
+              const q = (m.question || '').toLowerCase();
+              // Match O/U markets: "O/U 4.5", "O/U 5.5", "Totals O/U"
+              const ouMatch = q.match(/o\/u\s*([\d.]+)/);
+              if (!ouMatch) continue;
+              const line = parseFloat(ouMatch[1]);
+              const condId = m.conditionId;
+              if (!condId || tracked.ouFired.has(condId)) continue;
+
+              // Total already over the line → buy Over
+              if (totalScore > line) {
+                tracked.ouFired.add(condId);
+                const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
+                const outcomes = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes;
+                if (!tokens || tokens.length < 2) continue;
+                // Over is usually index 0
+                const overIdx = outcomes ? outcomes.findIndex(o => o.toLowerCase().includes('over')) : 0;
+                const overToken = tokens[overIdx >= 0 ? overIdx : 0];
+                const overLabel = outcomes ? outcomes[overIdx >= 0 ? overIdx : 0] : 'Over';
+                const negRisk = m.negRisk != null ? m.negRisk : true;
+
+                console.log(`[live-ou] SCORE ${e.score} (total ${totalScore}) > O/U ${line} → BUY ${overLabel} | ${e.title}`);
+
+                // Try 99.9¢, if rejected try 99¢, then stop
+                (async () => {
+                  try {
+                    let result;
+                    try {
+                      const signed = await clobClient.createOrder({ tokenID: overToken, price: 0.999, size: 20, side: 'BUY' }, { tickSize: '0.001', negRisk });
+                      result = await clobClient.postOrder(signed, 'GTC');
+                    } catch {
+                      try {
+                        const signed2 = await clobClient.createOrder({ tokenID: overToken, price: 0.99, size: 20, side: 'BUY' }, { tickSize: '0.01', negRisk });
+                        result = await clobClient.postOrder(signed2, 'GTC');
+                      } catch {
+                        const signed3 = await clobClient.createOrder({ tokenID: overToken, price: 0.99, size: 20, side: 'BUY' }, { tickSize: '0.01', negRisk: !negRisk });
+                        result = await clobClient.postOrder(signed3, 'GTC');
+                      }
+                    }
+                    console.log(`[live-ou] ${e.title?.slice(0,25)} | O/U ${line} | ${overLabel} 20sh → ${result?.status}`);
+                    liveEventTracker.log.unshift({ ts: Date.now(), event: e.title, score: e.score, market: `O/U ${line}`, side: overLabel, price: '99.9¢', status: result?.status });
+                    if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
+                  } catch (err) {
+                    console.error(`[live-ou] Error O/U ${line}:`, err.message?.slice(0, 60));
+                  }
+                })();
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Check for events that WERE live but are NO LONGER in the live list
+    for (const [slug, data] of liveEventTracker.knownLive) {
+      if (currentLive.has(slug)) continue; // still live
+      if (liveEventTracker.fired.has(slug)) continue; // already fired
+
+      // This event just ended! Re-fetch fresh data and fire 99¢ on ALL markets
+      liveEventTracker.fired.add(slug);
+      liveEventTracker.knownLive.delete(slug);
+
+      console.log(`[live-99] EVENT ENDED: ${data.title} (${data.score}) — waiting 10s for prices to settle`);
+
+      // Wait 10 seconds for prices to settle before placing orders
+      await new Promise(r => setTimeout(r, 10000));
+
+      // Re-fetch event to get latest prices for all markets
+      let freshMarkets = data.markets || [];
+      try {
+        const freshRes = await fetch(`https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(slug)}`);
+        const freshData = await freshRes.json();
+        const freshEvent = Array.isArray(freshData) ? freshData[0] : freshData;
+        if (freshEvent?.markets?.length) freshMarkets = freshEvent.markets;
+      } catch {}
+
+      console.log(`[live-99] ${data.title}: ${freshMarkets.length} markets to check`);
+
+      let placed = 0;
+      // Buy winning side on ALL markets in the event
+      for (const m of freshMarkets) {
+        if (m.closed) continue;
+        const prices = m.outcomePrices ? (typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices) : null;
+        const tokens = m.clobTokenIds ? (typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds) : null;
+        const outcomes = m.outcomes ? (typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes) : null;
+        if (!prices || !tokens || prices.length < 2) continue;
+
+        const p0 = parseFloat(prices[0]);
+        const p1 = parseFloat(prices[1]);
+        // Winner must be > 90¢ AND loser must be < 10¢ — clear result
+        const winIdx = p0 >= p1 ? 0 : 1;
+        const winPrice = Math.max(p0, p1);
+        const losePrice = Math.min(p0, p1);
+        const winToken = tokens[winIdx];
+        const winOutcome = outcomes ? outcomes[winIdx] : winIdx === 0 ? 'Yes' : 'No';
+
+        if (!winToken || winPrice < 0.90 || losePrice > 0.15) {
+          console.log(`[live-99] SKIP ${m.question?.slice(0,30)}: winner=${(winPrice*100).toFixed(0)}¢ loser=${(losePrice*100).toFixed(0)}¢ — not clear enough`);
+          continue;
+        }
+
+        // Verify price from CLOB book before placing
+        try {
+          const bookRes = await fetch('https://clob.polymarket.com/price?token_id=' + winToken + '&side=sell');
+          const bookData = await bookRes.json();
+          const clobAsk = bookData?.price ? parseFloat(bookData.price) : null;
+          if (clobAsk != null && clobAsk < 0.90) {
+            console.log(`[live-99] SKIP ${m.question?.slice(0,30)}: CLOB ask=${(clobAsk*100).toFixed(0)}¢ too low`);
+            continue;
+          }
+        } catch {}
+
+        // Try 99.9¢ first (0.001 tick), fall back to 99¢ (0.01 tick)
+        const negRisk = m.negRisk != null ? m.negRisk : true;
+        const orderSize = 20; // 20 shares per market
+
+        try {
+          let result = null;
+          try {
+            const signed = await clobClient.createOrder(
+              { tokenID: winToken, price: 0.999, size: orderSize, side: 'BUY' },
+              { tickSize: '0.001', negRisk },
+            );
+            result = await clobClient.postOrder(signed, 'GTC');
+          } catch {
+            try {
+              const signed2 = await clobClient.createOrder(
+                { tokenID: winToken, price: 0.99, size: orderSize, side: 'BUY' },
+                { tickSize: '0.01', negRisk },
+              );
+              result = await clobClient.postOrder(signed2, 'GTC');
+            } catch {
+              const signed3 = await clobClient.createOrder(
+                { tokenID: winToken, price: 0.99, size: orderSize, side: 'BUY' },
+                { tickSize: '0.01', negRisk: !negRisk },
+              );
+              result = await clobClient.postOrder(signed3, 'GTC');
+            }
+          }
+          placed++;
+          const logEntry = {
+            ts: Date.now(),
+            event: data.title,
+            score: data.score,
+            market: m.question?.slice(0, 50),
+            side: winOutcome,
+            price: (winPrice * 100).toFixed(0) + '¢',
+            status: result?.status,
+            orderId: result?.orderID?.slice(0, 12),
+          };
+          liveEventTracker.log.unshift(logEntry);
+          if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
+          console.log(`[live-99] PLACED: ${data.title} | ${m.question?.slice(0,30)} | ${winOutcome} ${orderSize}sh @ 99.9¢ → ${result?.status}`);
+        } catch (err) {
+          console.error(`[live-99] Error: ${m.question?.slice(0,30)}:`, err.message?.slice(0, 80));
+        }
+      }
+      console.log(`[live-99] ${data.title}: placed ${placed} orders across ${freshMarkets.length} markets`);
+    }
+
+    // Clean up old fired slugs (keep last 200)
+    if (liveEventTracker.fired.size > 200) {
+      const arr = [...liveEventTracker.fired];
+      liveEventTracker.fired = new Set(arr.slice(-100));
+    }
+  } catch (e) {
+    // silent — don't spam logs on API errors
+  }
+}, 3000);
+
+// Scan for decided markets (99%+) and place 99.9¢ bids
+const decidedScanner = { enabled: false, placed: new Set(), log: [] };
+
+app.post('/api/decided99/toggle', (req, res) => {
+  decidedScanner.enabled = !decidedScanner.enabled;
+  console.log(`[decided-99] ${decidedScanner.enabled ? 'ENABLED' : 'DISABLED'}`);
+  res.json({ enabled: decidedScanner.enabled });
+});
+
+app.get('/api/decided99/status', (req, res) => {
+  res.json({ enabled: decidedScanner.enabled, placed: decidedScanner.placed.size, log: decidedScanner.log.slice(0, 20) });
+});
+
+// Scan every 10s for decided markets
+setInterval(async () => {
+  if (!decidedScanner.enabled || !clobClient) return;
+
+  try {
+    const r = await fetch('https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=200&order=volume&ascending=false');
+    const markets = await r.json();
+    if (!Array.isArray(markets)) return;
+
+    for (const m of markets) {
+      const condId = m.conditionId;
+      if (!condId || decidedScanner.placed.has(condId)) continue;
+
+      const prices = m.outcomePrices ? JSON.parse(m.outcomePrices) : null;
+      const tokens = m.clobTokenIds ? JSON.parse(m.clobTokenIds) : null;
+      const outcomes = m.outcomes ? JSON.parse(m.outcomes) : null;
+      if (!prices || !tokens || prices.length < 2) continue;
+
+      const p0 = parseFloat(prices[0]);
+      const p1 = parseFloat(prices[1]);
+      const winPrice = Math.max(p0, p1);
+      const losePrice = Math.min(p0, p1);
+
+      // Bid when winner hits 99.9%
+      if (winPrice < 0.999 || losePrice > 0.05) continue;
+
+      // Skip crypto up/down
+      const q = (m.question || '').toLowerCase();
+      if (q.includes('up or down') || q.includes('updown')) continue;
+
+      const winIdx = p0 >= p1 ? 0 : 1;
+      const winToken = tokens[winIdx];
+      const winOutcome = outcomes ? outcomes[winIdx] : 'Yes';
+      if (!winToken) continue;
+
+      decidedScanner.placed.add(condId);
+      const negRisk = m.negRisk != null ? m.negRisk : true;
+
+      try {
+        let result = null;
+        try {
+          const signed = await clobClient.createOrder(
+            { tokenID: winToken, price: 0.999, size: 5, side: 'BUY' },
+            { tickSize: '0.001', negRisk },
+          );
+          result = await clobClient.postOrder(signed, 'GTC');
+        } catch {
+          try {
+            const signed2 = await clobClient.createOrder(
+              { tokenID: winToken, price: 0.99, size: 5, side: 'BUY' },
+              { tickSize: '0.01', negRisk },
+            );
+            result = await clobClient.postOrder(signed2, 'GTC');
+          } catch {
+            const signed3 = await clobClient.createOrder(
+              { tokenID: winToken, price: 0.99, size: 5, side: 'BUY' },
+              { tickSize: '0.01', negRisk: false },
+            );
+            result = await clobClient.postOrder(signed3, 'GTC');
+          }
+        }
+        const logEntry = { ts: Date.now(), market: m.question?.slice(0, 50), side: winOutcome, price: (winPrice*100).toFixed(1) + '¢', status: result?.status };
+        decidedScanner.log.unshift(logEntry);
+        if (decidedScanner.log.length > 100) decidedScanner.log.length = 100;
+        console.log(`[decided-99] PLACED: ${winOutcome} 5sh @ 99.9¢ | ${m.question?.slice(0,40)} → ${result?.status}`);
+      } catch (err) {
+        console.error(`[decided-99] Error: ${m.question?.slice(0,30)}:`, err.message?.slice(0, 80));
+      }
+
+      await new Promise(r => setTimeout(r, 200)); // rate limit
+    }
+  } catch {}
+}, 10000);
+
+// Helper: place 5 limit orders of 5sh each at 99.9¢ (or 99¢ fallback)
+async function place99x5(tokenId, negRisk) {
+  const results = [];
+  for (let i = 0; i < 5; i++) {
+    try {
+      let result = null;
+      try {
+        const signed = await clobClient.createOrder(
+          { tokenID: tokenId, price: 0.999, size: 5, side: 'BUY' },
+          { tickSize: '0.001', negRisk },
+        );
+        result = await clobClient.postOrder(signed, 'GTC');
+      } catch {
+        try {
+          const signed2 = await clobClient.createOrder(
+            { tokenID: tokenId, price: 0.99, size: 5, side: 'BUY' },
+            { tickSize: '0.01', negRisk },
+          );
+          result = await clobClient.postOrder(signed2, 'GTC');
+        } catch {
+          const signed3 = await clobClient.createOrder(
+            { tokenID: tokenId, price: 0.99, size: 5, side: 'BUY' },
+            { tickSize: '0.01', negRisk: !negRisk },
+          );
+          result = await clobClient.postOrder(signed3, 'GTC');
+        }
+      }
+      results.push(result);
+    } catch (err) {
+      results.push({ error: err.message?.slice(0, 50) });
+    }
+    await new Promise(r => setTimeout(r, 100));
+  }
+  return results;
+}
+
+// General Poly buy — any market, any token
+app.post('/api/poly/buy', async (req, res) => {
+  if (!clobClient) return res.status(500).json({ error: 'CLOB client not ready' });
+  const { tokenId, shares: reqShares, limitPrice, tickSize: reqTick, negRisk: reqNeg, orderType } = req.body;
+  if (!tokenId) return res.status(400).json({ error: 'tokenId required' });
+  const shares = Math.max(1, Math.round(parseFloat(reqShares || 5)));
+  const price = Math.max(0.01, Math.min(parseFloat(limitPrice || 0.99), 0.99));
+  const tickSize = reqTick || '0.01';
+  const negRisk = reqNeg || false;
+  try {
+    const signed = await clobClient.createOrder(
+      { tokenID: tokenId, price, size: shares, side: 'BUY' },
+      { tickSize: String(tickSize), negRisk },
+    );
+    const result = await clobClient.postOrder(signed, orderType || 'GTC');
+    console.log(`[poly-buy] ${shares}sh @ ${(price*100).toFixed(0)}¢ token:${tokenId.slice(0,12)} → ${result?.status || result?.orderID?.slice(0,8)}`);
+    res.json({ ok: true, status: result?.status, orderId: result?.orderID, filled: result?.status === 'matched' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/btc5m/limit99', async (req, res) => {
+  if (!btc5mEvent) return res.status(400).json({ error: 'No active 5m event' });
+  if (!clobClient) return res.status(500).json({ error: 'CLOB client not ready' });
+
+  const upP = btc5mState.upPrice || 0;
+  const downP = btc5mState.downPrice || 0;
+  if (upP === 0 && downP === 0) return res.status(400).json({ error: 'No prices' });
+
+  const winSide = upP >= downP ? 'up' : 'down';
+  const tokenId = winSide === 'up' ? btc5mState.tokenUp : btc5mState.tokenDown;
+  if (!tokenId) return res.status(400).json({ error: 'No token' });
+
+  const tickSize = btc5mEvent.tickSize || '0.01';
+  const tick = parseFloat(tickSize);
+  const negRisk = btc5mEvent.negRisk || false;
+  const price = 0.99;
+  const shares = 5;
+
+  res.json({ success: true, side: winSide, price, shares, status: 'sending' });
+
+  (async () => {
+    try {
+      const t0 = Date.now();
+      const signed = await clobClient.createOrder(
+        { tokenID: tokenId, price, size: shares, side: 'BUY' },
+        { tickSize: String(tick), negRisk },
+      );
+      const result = await clobClient.postOrder(signed, 'GTC');
+      console.log(`[BTC5M 99¢] ${winSide} ${shares}sh @ 99¢ — ${Date.now() - t0}ms — id:`, result?.orderID || result);
+      logTrade('btc5m', 'limit99', { side: winSide, price, shares, eventSlug: btc5mState.eventSlug, orderId: result?.orderID });
+      broadcast({ type: 'btc5m_order', status: 'placed', side: winSide, price, shares, orderID: result?.orderID });
+    } catch (e) {
+      console.error('[BTC5M 99¢] error:', e?.message);
+      broadcast({ type: 'btc5m_order', status: 'failed', side: winSide, price, error: e?.message });
+    }
+  })();
+});
 
 // ── Event archive (from price_change_analysis + live snapshots) ──────────────
 app.get('/api/event-archive', async (req, res) => {
@@ -5487,7 +6273,7 @@ app.get('/api/price-history', async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('polymarket_15m_snapshots')
-      .select('observed_at, btc_price, coin_price, up_cost, down_cost, seconds_left')
+      .select('observed_at, btc_price, coin_price, up_cost, down_cost, seconds_left, ks_yes_ask, ks_yes_bid, ks_no_ask, ks_no_bid')
       .eq('event_slug', slug)
       .order('observed_at', { ascending: false })
       .limit(limit);
@@ -7246,24 +8032,25 @@ server.listen(PORT, async () => {
   await ensureAllowance();
   await refreshEvent();
   await refreshEthEvent();
+  await refresh5mEvent();
   connectBtcStream();
   connectBinanceStream();
   startPricePoll();
   scheduleNextEvent();
   scheduleEthEvent();
+  schedule5mEvent();
   const splitReady = !!FUNDER_ADDRESS && !!process.env.PRIVATE_KEY;
   const scriptExists = fs.existsSync(SPLIT_SCRIPT);
   console.log(`[SPLIT] autoSplit=${autoSplit.enabled ? 'ON' : 'OFF'}, amount=$${autoSplit.amount}, ready=${splitReady}, script=${scriptExists}`);
-  await seedK9SeenTx();
-  await loadK9CopyState();
+  // K9 watcher DISABLED to save resources
+  // await seedK9SeenTx();
+  // await loadK9CopyState();
   await loadStopLossFromDb();
-  connectK9Watcher();
-  // HTTP poll fallback: catch missed WS events every 15s
-  setTimeout(k9HttpPoll, 5000); // first poll after 5s
-  setInterval(k9HttpPoll, 15000);
-  // Monitor k9 trades vs Polymarket every 60s
-  setTimeout(k9TradeMonitor, 20000);
-  setInterval(k9TradeMonitor, 60000);
+  // connectK9Watcher();
+  // setTimeout(k9HttpPoll, 5000);
+  // setInterval(k9HttpPoll, 15000);
+  // setTimeout(k9TradeMonitor, 20000);
+  // setInterval(k9TradeMonitor, 60000);
   // Whale watcher DISABLED to save resources
 
   // Auto-flow: check every 3s for smooth price trends

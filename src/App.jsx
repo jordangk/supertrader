@@ -17,6 +17,8 @@ import EventSearch from './components/EventSearch.jsx';
 import PriceDivergence from './components/PriceDivergence.jsx';
 import EmaTradeLog from './components/EmaTradeLog.jsx';
 import Btc5mSequenceTab from './components/Btc5mSequenceTab.jsx';
+import Btc5mTrader from './components/Btc5mTrader.jsx';
+import EndingSoon from './components/EndingSoon.jsx';
 import { getApiBase } from './apiBase.js';
 
 const AMOUNTS = [50, 25, 10, 5];
@@ -794,6 +796,8 @@ export default function App() {
                 { id: 'btc', label: 'BTC' },
                 { id: 'eth', label: 'ETH' },
                 { id: 'btc5m', label: 'BTC 5m' },
+                { id: 'btc5mTrader', label: '5m Trade' },
+                { id: 'ending', label: 'Ending Soon' },
               ].map((t) => (
                 <button key={t.id} onClick={() => setTab(t.id)}
                   className={`px-4 py-1 rounded text-sm font-bold transition-colors ${tab === t.id ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'}`}>
@@ -805,6 +809,10 @@ export default function App() {
               <PriceDivergence key={event?.slug} prices={prices} btc={btc} binanceBtc={binanceBtc} serverEma={serverEma} priceEma={priceEma} event={event} autoEmaLog={autoEma.log || []} />
             ) : tab === 'btc5m' ? (
               <Btc5mSequenceTab />
+            ) : tab === 'btc5mTrader' ? (
+              <Btc5mTrader />
+            ) : tab === 'ending' ? (
+              <EndingSoon />
             ) : (
               <>
                 {/* ETH Auto-Trade Toggle */}

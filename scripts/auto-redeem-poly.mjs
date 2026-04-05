@@ -82,7 +82,7 @@ async function checkAndRedeem() {
     if (!posRes.ok) return;
     const positions = await posRes.json();
 
-    const redeemable = (positions || []).filter(p => p.redeemable && p.curPrice === 1);
+    const redeemable = (positions || []).filter(p => p.redeemable);
     if (!redeemable.length) return;
 
     // Group by conditionId (avoid duplicate redeems)

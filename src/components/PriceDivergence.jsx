@@ -24,6 +24,11 @@ export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sE
   const [buyStatus, setBuyStatus] = useState(null); // { side, msg, ok }
   const [pos, setPos] = useState({ up: null, down: null }); // positions from Polymarket
   const [openOrders, setOpenOrders] = useState([]); // pending limit orders
+  const [ksOrders, setKsOrders] = useState([]); // KS resting orders
+  const [ksAuto, setKsAuto] = useState(false); // KS auto-trade on/off
+  const [ksAutoSide, setKsAutoSide] = useState('up'); // which side to limit
+  const [ksAutoCooldown, setKsAutoCooldown] = useState(60); // seconds between trades
+  const ksAutoRef = useRef({ enabled: false, orderId: null, lastFillTime: 0, side: 'up', cooldown: 60 });
   const [chartWindowS, setChartWindowS] = useState(180); // chart zoom in seconds
   const [myTradesForEvent, setMyTradesForEvent] = useState([]);
   const [stopLoss, setStopLoss] = useState(null); // { side: 'up'|'down', trigger: cents, shares }
@@ -571,13 +576,136 @@ export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sE
     }
   }, [live.slug]);
 
-  // Poll positions every 10s and open orders every 5s
+  // Fetch KS resting orders
+  const fetchKsOrders = async () => {
+    try {
+      const r = await fetch(`${API_BASE}/api/ks-orders`);
+      const d = await r.json();
+      setKsOrders(d.orders || []);
+    } catch {}
+  };
+
+  // Poll positions every 10s, open orders every 5s, KS orders every 5s
   const prevOrderCount = useRef(0);
   useEffect(() => {
     const ordersIv = setInterval(fetchOpenOrders, 5000);
+    const ksIv = setInterval(fetchKsOrders, 5000);
     const posIv = setInterval(() => { if (live.slug) fetchPositions(live.slug); }, 10000);
-    return () => { clearInterval(ordersIv); clearInterval(posIv); };
+    fetchKsOrders();
+    return () => { clearInterval(ordersIv); clearInterval(ksIv); clearInterval(posIv); };
   }, [live.slug]);
+
+  // KS Auto-trade: limit -5¢, if filled → market opposite, cooldown
+  useEffect(() => {
+    ksAutoRef.current.enabled = ksAuto;
+    ksAutoRef.current.side = ksAutoSide;
+    ksAutoRef.current.cooldown = ksAutoCooldown;
+  }, [ksAuto, ksAutoSide, ksAutoCooldown]);
+
+  useEffect(() => {
+    const iv = setInterval(async () => {
+      const ref = ksAutoRef.current;
+      if (!ref.enabled) return;
+
+      // Cooldown check
+      if (Date.now() - ref.lastFillTime < ref.cooldown * 1000) return;
+
+      const side = ref.side;
+      const ksSide = side === 'up' ? 'yes' : 'no';
+      const rawPrice = side === 'up' ? live.up : live.down;
+      if (!rawPrice || rawPrice <= 0) return;
+
+      // Check if we have a resting order already
+      if (ref.orderId) {
+        // Check if it filled
+        try {
+          const r = await fetch(`${API_BASE}/api/ks-orders`);
+          const d = await r.json();
+          const resting = (d.orders || []).find(o => o.order_id === ref.orderId && o.status === 'resting');
+          const filled = (d.orders || []).find(o => o.order_id === ref.orderId && (o._filled || o.status === 'executed'));
+
+          if (filled) {
+            // Filled! Hedge opposite side — price must guarantee profit
+            ref.orderId = null;
+            ref.lastFillTime = Date.now();
+            const oppSide = ksSide === 'yes' ? 'no' : 'yes';
+            // Entry price from the filled order
+            const fillCost = parseFloat(filled.taker_fill_cost_dollars || '0') + parseFloat(filled.maker_fill_cost_dollars || '0');
+            const fillCount = parseFloat(filled.fill_count_fp || '5');
+            const entryPriceCents = fillCount > 0 ? Math.round(fillCost / fillCount * 100) : Math.round(rawPrice * 100 - 3);
+            // Max hedge price = 100 - entry - 2 (keep 2¢ profit margin)
+            const maxHedgeCents = Math.max(1, 100 - entryPriceCents - 2);
+            const oppAsk = oppSide === 'yes' ? live.up : live.down;
+            const oppAskCents = oppAsk ? Math.round(oppAsk * 100) : 99;
+            // Only hedge if ask is within profitable range
+            if (oppAskCents > maxHedgeCents) {
+              console.log(`[ks-auto] Filled ${ksSide}@${entryPriceCents}¢, but ${oppSide} ask ${oppAskCents}¢ > max ${maxHedgeCents}¢ — skip hedge`);
+            } else {
+              const hedgeCents = Math.min(maxHedgeCents, oppAskCents + 1);
+              console.log(`[ks-auto] Filled ${ksSide}@${entryPriceCents}¢, hedging ${oppSide} @ ${hedgeCents}¢ (max ${maxHedgeCents}¢)`);
+              try {
+                await fetch(`${API_BASE}/api/ks-limit`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ side: oppSide, shares: 5, priceCents: hedgeCents }),
+                });
+              } catch {}
+            }
+            fetchKsOrders();
+            return;
+          }
+
+          if (resting) {
+            // Still resting — cancel and replace with fresh price
+            try { await fetch(`${API_BASE}/api/ks-orders/${ref.orderId}`, { method: 'DELETE' }); } catch {}
+            ref.orderId = null;
+          } else {
+            // Not found — might have been cancelled by slot change
+            ref.orderId = null;
+          }
+        } catch {
+          ref.orderId = null;
+        }
+      }
+
+      // Place new limit at -5¢
+      const priceCents = Math.max(1, Math.round(rawPrice * 100 - 3));
+      try {
+        const r = await fetch(`${API_BASE}/api/ks-limit`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ side: ksSide, shares: 5, priceCents }),
+        });
+        const d = await r.json();
+        if (d.ok && d.status === 'resting') {
+          ref.orderId = d.orderId;
+        } else if (d.ok && d.filled > 0) {
+          // Filled immediately — hedge at profitable price
+          ref.lastFillTime = Date.now();
+          const oppSide = ksSide === 'yes' ? 'no' : 'yes';
+          const entryPriceCents = priceCents; // the limit we placed
+          const maxHedgeCents = Math.max(1, 100 - entryPriceCents - 2);
+          const oppAsk = oppSide === 'yes' ? live.up : live.down;
+          const oppAskCents = oppAsk ? Math.round(oppAsk * 100) : 99;
+          if (oppAskCents <= maxHedgeCents) {
+            const hedgeCents = Math.min(maxHedgeCents, oppAskCents + 1);
+            console.log(`[ks-auto] Immediate fill ${ksSide}@${entryPriceCents}¢, hedge ${oppSide}@${hedgeCents}¢`);
+            try {
+              await fetch(`${API_BASE}/api/ks-limit`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ side: oppSide, shares: 5, priceCents: hedgeCents }),
+              });
+            } catch {}
+          } else {
+            console.log(`[ks-auto] Immediate fill ${ksSide}@${entryPriceCents}¢, skip hedge — ${oppSide} ask ${oppAskCents}¢ > max ${maxHedgeCents}¢`);
+          }
+        }
+        fetchKsOrders();
+      } catch {}
+    }, 3000);
+    return () => clearInterval(iv);
+  }, [live.up, live.down]);
   useEffect(() => {
     if (prevOrderCount.current > 0 && openOrders.length < prevOrderCount.current) {
       // An order disappeared (filled or cancelled) — refresh positions
@@ -594,19 +722,19 @@ export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sE
       setTimeout(() => setBuyStatus(null), 2000);
       return;
     }
-    const price = Math.max(0.01, Math.round((rawPrice + offsetCents / 100) * 100) / 100);
-    const amount = Math.round(5 * price * 100) / 100; // 5 shares * price = USD to spend
-    const label = offsetCents ? `5sh @ ${(price * 100).toFixed(0)}¢ (${offsetCents > 0 ? '+' : ''}${offsetCents}¢)` : `5sh @ ${(price * 100).toFixed(0)}¢`;
+    const priceCents = Math.max(1, Math.round(rawPrice * 100 + offsetCents));
+    const ksSide = side === 'up' ? 'yes' : 'no';
+    const label = `KS ${ksSide.toUpperCase()} 5sh @ ${priceCents}¢`;
     setBuyStatus({ side, msg: `${label}...`, ok: null });
     try {
-      const res = await fetch(`${API_BASE}/api/buy`, {
+      const res = await fetch(`${API_BASE}/api/ks-buy`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ side, amount, limitPrice: price, shares: 5 }),
+        body: JSON.stringify({ side: ksSide, shares: 5, priceCents }),
       });
       const data = await res.json();
       if (res.ok) {
-        setBuyStatus({ side, msg: `Sent ${label}`, ok: true });
+        setBuyStatus({ side, msg: `${label} filled:${data.filled}`, ok: true });
         setTimeout(() => { fetchPositions(live.slug); fetchOpenOrders(); }, 2000);
       } else {
         setBuyStatus({ side, msg: data.error || 'Failed', ok: false });
@@ -617,24 +745,55 @@ export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sE
     setTimeout(() => setBuyStatus(null), 3000);
   };
 
-  const quickSell = async (side, shares) => {
-    const sh = shares || 5;
-    setBuyStatus({ side, msg: `Sell ${sh}sh ${side}...`, ok: null });
+  const bothLimit = async (offsetCents = -5) => {
+    const upPrice = live.up, downPrice = live.down;
+    if (!upPrice || !downPrice) {
+      setBuyStatus({ side: 'up', msg: 'No prices', ok: false });
+      setTimeout(() => setBuyStatus(null), 2000);
+      return;
+    }
+    const yesCents = Math.max(1, Math.round(upPrice * 100 + offsetCents));
+    const noCents = Math.max(1, Math.round(downPrice * 100 + offsetCents));
+    setBuyStatus({ side: 'up', msg: `Both: YES@${yesCents}¢ + NO@${noCents}¢...`, ok: null });
     try {
-      const res = await fetch(`${API_BASE}/api/sell`, {
+      const [r1, r2] = await Promise.all([
+        fetch(`${API_BASE}/api/ks-limit`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ side: 'yes', shares: 5, priceCents: yesCents }) }),
+        fetch(`${API_BASE}/api/ks-limit`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ side: 'no', shares: 5, priceCents: noCents }) }),
+      ]);
+      const [d1, d2] = await Promise.all([r1.json(), r2.json()]);
+      setBuyStatus({ side: 'up', msg: `YES@${yesCents}¢:${d1.status} NO@${noCents}¢:${d2.status}`, ok: r1.ok && r2.ok });
+      fetchKsOrders();
+    } catch (e) {
+      setBuyStatus({ side: 'up', msg: 'Error', ok: false });
+    }
+    setTimeout(() => setBuyStatus(null), 3000);
+  };
+
+  const limitBuy = async (side, offsetCents = -5) => {
+    const rawPrice = side === 'up' ? live.up : live.down;
+    if (!rawPrice || rawPrice <= 0) {
+      setBuyStatus({ side, msg: 'No price', ok: false });
+      setTimeout(() => setBuyStatus(null), 2000);
+      return;
+    }
+    const priceCents = Math.max(1, Math.round(rawPrice * 100 + offsetCents));
+    const ksSide = side === 'up' ? 'yes' : 'no';
+    const label = `KS LIMIT ${ksSide.toUpperCase()} 5sh @ ${priceCents}¢`;
+    setBuyStatus({ side, msg: `${label}...`, ok: null });
+    try {
+      const res = await fetch(`${API_BASE}/api/ks-limit`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ side, shares: sh }),
+        body: JSON.stringify({ side: ksSide, shares: 5, priceCents }),
       });
       const data = await res.json();
-      if (res.ok && data.success) {
-        setBuyStatus({ side, msg: `Sold ${sh}sh ${side} @ ${(data.price * 100).toFixed(0)}¢`, ok: true });
-        setTimeout(() => { fetchPositions(live.slug); fetchOpenOrders(); }, 2000);
+      if (res.ok) {
+        setBuyStatus({ side, msg: `${label} ${data.status} filled:${data.filled}`, ok: true });
       } else {
-        setBuyStatus({ side, msg: data.error || 'Sell failed', ok: false });
+        setBuyStatus({ side, msg: data.error || 'Failed', ok: false });
       }
     } catch (e) {
-      setBuyStatus({ side, msg: 'Sell error', ok: false });
+      setBuyStatus({ side, msg: 'Error', ok: false });
     }
     setTimeout(() => setBuyStatus(null), 3000);
   };
@@ -1084,6 +1243,7 @@ export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sE
       <div className="px-4 py-3 rounded-lg bg-gray-900 border border-gray-800 space-y-2">
         {/* Row 1: Buy buttons + status */}
         <div className="flex items-center gap-2 flex-wrap">
+          {/* IOC market buys */}
           <button onClick={() => quickBuy('up', -3)} disabled={expired || buyStatus?.side === 'up'}
             className="px-2 py-1.5 rounded bg-green-900/30 hover:bg-green-800/40 disabled:opacity-40 text-green-400/60 font-bold text-[10px] transition-colors">-3¢</button>
           <button onClick={() => quickBuy('up')} disabled={expired || buyStatus?.side === 'up'}
@@ -1097,33 +1257,45 @@ export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sE
           <button onClick={() => quickBuy('down', 3)} disabled={expired || buyStatus?.side === 'down'}
             className="px-2 py-1.5 rounded bg-red-900/30 hover:bg-red-800/40 disabled:opacity-40 text-red-400/60 font-bold text-[10px] transition-colors">+3¢</button>
           <span className="text-gray-700">|</span>
-          {/* Scalp: FAK buy + GTC hedge */}
-          <button onClick={() => scalp('up', 1)} disabled={expired || buyStatus?.side === 'up'}
-            className="px-2 py-1.5 rounded bg-green-900/70 hover:bg-green-800/80 disabled:opacity-40 text-green-100 font-bold text-[10px] transition-colors border border-green-600/50">S↑ 1¢</button>
-          <button onClick={() => scalp('up', 2)} disabled={expired || buyStatus?.side === 'up'}
-            className="px-2 py-1.5 rounded bg-green-900/50 hover:bg-green-800/60 disabled:opacity-40 text-green-200 font-bold text-[10px] transition-colors border border-green-700/40">S↑ 2¢</button>
-          <button onClick={() => scalp('up', 5)} disabled={expired || buyStatus?.side === 'up'}
-            className="px-2 py-1.5 rounded bg-green-900/30 hover:bg-green-800/40 disabled:opacity-40 text-green-300/70 font-bold text-[10px] transition-colors border border-green-700/20">S↑ 5¢</button>
-          <button onClick={() => scalp('down', 1)} disabled={expired || buyStatus?.side === 'down'}
-            className="px-2 py-1.5 rounded bg-red-900/70 hover:bg-red-800/80 disabled:opacity-40 text-red-100 font-bold text-[10px] transition-colors border border-red-600/50">S↓ 1¢</button>
-          <button onClick={() => scalp('down', 2)} disabled={expired || buyStatus?.side === 'down'}
-            className="px-2 py-1.5 rounded bg-red-900/50 hover:bg-red-800/60 disabled:opacity-40 text-red-200 font-bold text-[10px] transition-colors border border-red-700/40">S↓ 2¢</button>
-          <button onClick={() => scalp('down', 5)} disabled={expired || buyStatus?.side === 'down'}
-            className="px-2 py-1.5 rounded bg-red-900/30 hover:bg-red-800/40 disabled:opacity-40 text-red-300/70 font-bold text-[10px] transition-colors border border-red-700/20">S↓ 5¢</button>
+          {/* Limit orders (GTC, sit on book) */}
+          <button onClick={() => limitBuy('up', -5)} disabled={expired || buyStatus?.side === 'up'}
+            className="px-2 py-1.5 rounded bg-green-900/70 hover:bg-green-800/80 disabled:opacity-40 text-green-100 font-bold text-[10px] transition-colors border border-green-600/50">L↑ -5¢</button>
+          <button onClick={() => limitBuy('up', -3)} disabled={expired || buyStatus?.side === 'up'}
+            className="px-2 py-1.5 rounded bg-green-900/50 hover:bg-green-800/60 disabled:opacity-40 text-green-200 font-bold text-[10px] transition-colors border border-green-700/40">L↑ -3¢</button>
+          <button onClick={() => limitBuy('up', -1)} disabled={expired || buyStatus?.side === 'up'}
+            className="px-2 py-1.5 rounded bg-green-900/30 hover:bg-green-800/40 disabled:opacity-40 text-green-300/70 font-bold text-[10px] transition-colors border border-green-700/20">L↑ -1¢</button>
+          <button onClick={() => limitBuy('down', -5)} disabled={expired || buyStatus?.side === 'down'}
+            className="px-2 py-1.5 rounded bg-red-900/70 hover:bg-red-800/80 disabled:opacity-40 text-red-100 font-bold text-[10px] transition-colors border border-red-600/50">L↓ -5¢</button>
+          <button onClick={() => limitBuy('down', -3)} disabled={expired || buyStatus?.side === 'down'}
+            className="px-2 py-1.5 rounded bg-red-900/50 hover:bg-red-800/60 disabled:opacity-40 text-red-200 font-bold text-[10px] transition-colors border border-red-700/40">L↓ -3¢</button>
+          <button onClick={() => limitBuy('down', -1)} disabled={expired || buyStatus?.side === 'down'}
+            className="px-2 py-1.5 rounded bg-red-900/30 hover:bg-red-800/40 disabled:opacity-40 text-red-300/70 font-bold text-[10px] transition-colors border border-red-700/20">L↓ -1¢</button>
           <span className="text-gray-700">|</span>
-          {/* Quick Sell */}
-          <button onClick={() => quickSell('up')} disabled={expired || buyStatus?.side === 'up'}
-            className="px-2 py-1.5 rounded bg-green-900/50 hover:bg-green-800/60 disabled:opacity-40 text-green-200 font-bold text-[10px] transition-colors border border-green-600/30">Sell ↑</button>
-          <button onClick={() => quickSell('down')} disabled={expired || buyStatus?.side === 'down'}
-            className="px-2 py-1.5 rounded bg-red-900/50 hover:bg-red-800/60 disabled:opacity-40 text-red-200 font-bold text-[10px] transition-colors border border-red-600/30">Sell ↓</button>
-          {pos.up?.shares > 0 && (
-            <button onClick={() => quickSell('up', Math.ceil(pos.up.shares * 0.25))} disabled={expired || buyStatus?.side === 'up'}
-              className="px-2 py-1.5 rounded bg-green-900/30 hover:bg-green-800/40 disabled:opacity-40 text-green-300/70 font-bold text-[10px] transition-colors border border-green-700/20">25% ↑ ({Math.ceil(pos.up.shares * 0.25)})</button>
-          )}
-          {pos.down?.shares > 0 && (
-            <button onClick={() => quickSell('down', Math.ceil(pos.down.shares * 0.25))} disabled={expired || buyStatus?.side === 'down'}
-              className="px-2 py-1.5 rounded bg-red-900/30 hover:bg-red-800/40 disabled:opacity-40 text-red-300/70 font-bold text-[10px] transition-colors border border-red-700/20">25% ↓ ({Math.ceil(pos.down.shares * 0.25)})</button>
-          )}
+          <button onClick={() => bothLimit(-3)} disabled={expired}
+            className="px-2 py-1.5 rounded bg-amber-900/50 hover:bg-amber-800/60 disabled:opacity-40 text-amber-200 font-bold text-[10px] transition-colors border border-amber-700/40">Both -3¢</button>
+          <button onClick={() => bothLimit(-5)} disabled={expired}
+            className="px-2 py-1.5 rounded bg-amber-900/70 hover:bg-amber-800/80 disabled:opacity-40 text-amber-100 font-bold text-[10px] transition-colors border border-amber-600/50">Both -5¢</button>
+          <span className="text-gray-700">|</span>
+          {/* KS Auto-trade */}
+          <button
+            onClick={() => {
+              setKsAuto(!ksAuto);
+              if (ksAuto && ksAutoRef.current.orderId) {
+                // Turning off — cancel resting order
+                fetch(`${API_BASE}/api/ks-orders/${ksAutoRef.current.orderId}`, { method: 'DELETE' }).catch(() => {});
+                ksAutoRef.current.orderId = null;
+              }
+            }}
+            className={`px-2 py-1.5 rounded font-bold text-[10px] transition-colors border ${ksAuto ? 'bg-cyan-700 text-white border-cyan-500 animate-pulse' : 'bg-gray-800 text-gray-400 border-gray-700 hover:bg-gray-700'}`}
+          >{ksAuto ? 'AUTO ON' : 'auto'}</button>
+          {ksAuto && <>
+            <button onClick={() => setKsAutoSide(ksAutoSide === 'up' ? 'down' : 'up')}
+              className={`px-2 py-1 rounded text-[10px] font-bold ${ksAutoSide === 'up' ? 'bg-green-800 text-green-200' : 'bg-red-800 text-red-200'}`}
+            >{ksAutoSide === 'up' ? '↑ UP' : '↓ DN'}</button>
+            <input type="number" value={ksAutoCooldown} onChange={e => setKsAutoCooldown(parseInt(e.target.value) || 60)}
+              className="w-10 bg-transparent border-b border-gray-700 text-center text-[9px] text-gray-400 focus:border-cyan-500 outline-none" />
+            <span className="text-[9px] text-gray-600">s cool</span>
+          </>}
           <span className="text-gray-700">|</span>
           {/* Stop Loss inline */}
           {stopLoss ? (
@@ -1243,6 +1415,51 @@ export default function PriceDivergence({ prices, btc, binanceBtc, serverEma: sE
                         await fetch(`${API_BASE}/api/cancel`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ orderID: orderId }) });
                         fetchOpenOrders();
                       } catch {}
+                    }}
+                    className="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 hover:bg-red-900/40 text-gray-500 hover:text-red-400 transition-colors ml-1"
+                  >✕</button>}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* KS Open Orders */}
+      {ksOrders.length > 0 && (
+        <div className="px-4 py-2 rounded-lg bg-gray-900 border border-amber-800/30">
+          <div className="flex items-center gap-2 mb-1">
+            <span className="text-[10px] uppercase tracking-wider text-amber-500">KS Orders ({ksOrders.length})</span>
+            <button
+              onClick={async () => {
+                try { await fetch(`${API_BASE}/api/ks-cancel-all`, { method: 'POST' }); } catch {}
+                if (ksAutoRef.current.orderId) ksAutoRef.current.orderId = null;
+                fetchKsOrders();
+              }}
+              className="text-[10px] px-2 py-0.5 rounded bg-amber-900/30 hover:bg-amber-800/40 text-amber-500 transition-colors"
+            >Cancel All</button>
+          </div>
+          <div className="space-y-0.5">
+            {ksOrders.map((o, i) => {
+              const price = o.yes_price_dollars || o.no_price_dollars;
+              const priceCents = price ? Math.round(parseFloat(price) * 100) : 0;
+              const shares = parseFloat(o.initial_count_fp || o.remaining_count_fp || 0);
+              const filled = parseFloat(o.fill_count_fp || 0);
+              const side = o.side?.toUpperCase();
+              const isFilled = o._filled || o.status === 'executed';
+              const fillCost = parseFloat(o.taker_fill_cost_dollars || '0') + parseFloat(o.maker_fill_cost_dollars || '0');
+              const avgFill = filled > 0 ? Math.round(fillCost / filled * 100) : priceCents;
+              return (
+                <div key={o.order_id || i} className={`flex items-center gap-2 text-xs font-mono ${isFilled ? 'opacity-70' : ''}`}>
+                  {isFilled && <span className="text-green-500 text-[9px]">✓</span>}
+                  <span className={side === 'YES' ? 'text-green-400' : 'text-red-400'}>{side}</span>
+                  <span className="text-white">{(isFilled ? filled : shares).toFixed(0)}sh</span>
+                  <span className="text-gray-500">@ {isFilled ? avgFill + '¢ filled' : priceCents + '¢'}</span>
+                  {!isFilled && filled > 0 && <span className="text-amber-400">(partial {filled.toFixed(0)})</span>}
+                  <span className="text-gray-600 text-[9px]">{o.ticker?.slice(-10)}</span>
+                  {!isFilled && <button
+                    onClick={async () => {
+                      try { await fetch(`${API_BASE}/api/ks-orders/${o.order_id}`, { method: 'DELETE' }); fetchKsOrders(); } catch {}
                     }}
                     className="text-[10px] px-1.5 py-0.5 rounded bg-gray-800 hover:bg-red-900/40 text-gray-500 hover:text-red-400 transition-colors ml-1"
                   >✕</button>}

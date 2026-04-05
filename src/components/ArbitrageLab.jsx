@@ -327,6 +327,7 @@ export default function ArbitrageLab() {
           maxShares: maxShares,
           swapPoly: swapPoly,
           recurring: recurring,
+          polyOnly: polyOnly,
         }),
       });
       const d = await r.json();
@@ -359,34 +360,41 @@ export default function ArbitrageLab() {
   }
   const slotRef = useRef(current15mSlot());
 
-  // Fetch both defaults from server; re-fetch when the 15m window rolls over.
-  const fetchDefaults = useCallback(() => {
-    if (inputsDirtyRef.current) return;
-    setLoadingDefaults(true);
+  /**
+   * Pull current-slot metadata from `/defaults/btc15m` so titles/dates stay in sync with the 15m window.
+   * When `inputsDirtyRef` is set (campaign launch, pasted URLs), we still refresh meta — only the Kalshi/Poly URL fields are frozen.
+   */
+  const fetchDefaults = useCallback((opts = {}) => {
+    const silent = !!opts.silent;
+    if (!silent) setLoadingDefaults(true);
     fetch(`${API_BASE}/api/arb/defaults/btc15m`)
       .then(r => r.json())
       .then(d => {
-        if (d.kalshi) setExternalUrl(d.kalshi);
-        if (d.poly) setPolySlug(d.poly);
         setMeta({
           kalshi: d.kalshiMeta || null,
           poly: d.polyMeta || null,
         });
+        if (!inputsDirtyRef.current) {
+          if (d.kalshi) setExternalUrl(d.kalshi);
+          if (d.poly) setPolySlug(d.poly);
+        }
       })
       .catch(() => {})
-      .finally(() => setLoadingDefaults(false));
+      .finally(() => {
+        if (!silent) setLoadingDefaults(false);
+      });
   }, []);
 
   useEffect(() => {
     fetchDefaults();
-    // Check every 10s if the 15m slot changed; refresh if so
+    // Poll slot often enough that we don't sit on a stale window for minutes after rollover.
     const iv = setInterval(() => {
       const now = current15mSlot();
       if (now !== slotRef.current) {
         slotRef.current = now;
-        fetchDefaults();
+        fetchDefaults({ silent: true });
       }
-    }, 10_000);
+    }, 5_000);
     return () => clearInterval(iv);
   }, [fetchDefaults]);
   // Find match: paste one link, AI finds the other
@@ -592,7 +600,11 @@ export default function ArbitrageLab() {
   const [selectedCombos, setSelectedCombos] = useState([]);
 
   function addCombo(combo) {
-    const key = `${combo.ksMarket.ticker}-${combo.ksSide}-${combo.polySide}`;
+    // Stable keys for A/B (strategy-A / strategy-B); multi-market rows omit combo.key and use ticker-side-outcome
+    const key =
+      combo.key != null && String(combo.key).length > 0
+        ? String(combo.key)
+        : `${combo.ksMarket.ticker}-${combo.ksSide}-${combo.polySide}`;
     if (selectedCombos.find(c => c.key === key)) return;
     setSelectedCombos(prev => [...prev, { ...combo, key }]);
   }
@@ -607,6 +619,7 @@ export default function ArbitrageLab() {
   const [autoCooldown, setAutoCooldown] = useState(60); // cooldown in seconds
   const [maxShares, setMaxShares] = useState(50); // per-campaign cap (global default is 50)
   const [fillAny, setFillAny] = useState(false);
+  const [polyOnly, setPolyOnly] = useState(false);
   const autoCooldownUntil = useRef(0);
   const autoLock = useRef(false);
   const pollRef = useRef(null);
@@ -715,27 +728,37 @@ export default function ArbitrageLab() {
     const costB = ksNoAsk != null && polyUpAsk != null ? ksNoAsk + polyUpAsk : null;
     const profitB = costB != null ? 1 - FEE - costB : null;
 
+    const isMultiKs = Array.isArray(book?.allKalshi) && book.allKalshi.length > 1;
+    // If user picked specific strategies (A/B), only auto-trade those — single-market mode only
+    const filterBySelection = selectedCombos.length > 0 && !isMultiKs;
+    const allowA = !filterBySelection || selectedCombos.some((c) => c.strategy === 'A' || c.key === 'strategy-A');
+    const allowB = !filterBySelection || selectedCombos.some((c) => c.strategy === 'B' || c.key === 'strategy-B');
+
     let bestStrategy = null;
     if (fillAny) {
       // Fill at any price — pick whichever side has data, prefer the better one
-      if (profitA != null && profitB != null) bestStrategy = profitA >= profitB ? 'A' : 'B';
-      else if (profitA != null) bestStrategy = 'A';
-      else if (profitB != null) bestStrategy = 'B';
+      if (allowA && allowB && profitA != null && profitB != null) bestStrategy = profitA >= profitB ? 'A' : 'B';
+      else if (allowA && profitA != null) bestStrategy = 'A';
+      else if (allowB && profitB != null) bestStrategy = 'B';
     } else {
-      if (profitA != null && profitA >= threshold && (profitB == null || profitA >= profitB)) bestStrategy = 'A';
-      else if (profitB != null && profitB >= threshold) bestStrategy = 'B';
+      if (allowA && profitA != null && profitA >= threshold && (profitB == null || !allowB || profitA >= profitB)) bestStrategy = 'A';
+      else if (allowB && profitB != null && profitB >= threshold) bestStrategy = 'B';
     }
 
     if (bestStrategy) {
       autoLock.current = true;
       const profit = bestStrategy === 'A' ? profitA : profitB;
       console.log(`[auto-arb] Triggering strategy ${bestStrategy}: ${(profit * 100).toFixed(1)}¢/sh profit ${fillAny ? '(FILL ANY)' : ''}`);
-      executeArb(bestStrategy, fillAny).then(() => {
-        autoCooldownUntil.current = Date.now() + autoCooldown * 1000;
-        autoLock.current = false;
-      });
+      executeArb(bestStrategy, fillAny)
+        .then(() => {
+          autoCooldownUntil.current = Date.now() + autoCooldown * 1000;
+        })
+        .catch(() => {})
+        .finally(() => {
+          autoLock.current = false;
+        });
     }
-  }, [book, autoEnabled, running, sessionId, autoThreshold, autoCooldown]);
+  }, [book, autoEnabled, running, sessionId, autoThreshold, autoCooldown, fillAny, selectedCombos]);
 
   async function start() {
     setError(null);
@@ -875,6 +898,52 @@ export default function ArbitrageLab() {
         </p>
       </div>
 
+      {/* Wallet balance graph */}
+      {pnlData?.history?.length > 1 && (
+        <div className="border border-gray-800 rounded-lg bg-gray-950/50 p-2 space-y-1.5">
+          <div className="flex items-center justify-between">
+            <span className="text-[11px] font-bold text-gray-300">Wallet Balance</span>
+            {pnlData?.current && (
+              <span className="text-[10px] text-gray-400">
+                KS ${Number(pnlData.current.kalshi_balance).toFixed(0)} + Poly ${(Number(pnlData.current.poly_usdc) + Number(pnlData.current.poly_positions)).toFixed(0)}
+                {' = '}
+                <span className="text-white font-bold">${Number(pnlData.current.total).toFixed(0)}</span>
+                <span className={`ml-1 font-bold ${Number(pnlData.current.profit) >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                  ({Number(pnlData.current.profit) >= 0 ? '+' : ''}${Number(pnlData.current.profit).toFixed(2)})
+                </span>
+              </span>
+            )}
+          </div>
+          <ResponsiveContainer width="100%" height={120}>
+            <LineChart data={(() => {
+              const fiveHoursAgo = new Date(Date.now() - 5 * 60 * 60 * 1000).toISOString();
+              const pts = [...pnlData.history].reverse().filter(h => h.ts >= fiveHoursAgo).map(h => ({ total: Number(h.total), profit: Number(h.profit), ts: h.ts }));
+              // Filter out glitch snapshots (>30% drop from neighbors)
+              const filtered = pts.filter((p, i) => {
+                if (pts.length < 3 || i === 0 || i === pts.length - 1) return true;
+                const avg = (pts[i-1].total + pts[i+1].total) / 2;
+                return p.total > avg * 0.7;
+              });
+              return filtered.map(h => ({
+                time: new Date(h.ts).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true }),
+                total: h.total,
+                profit: h.profit,
+              }));
+            })()}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#333" />
+              <XAxis dataKey="time" tick={{ fontSize: 9, fill: '#666' }} interval="preserveStartEnd" />
+              <YAxis tick={{ fontSize: 9, fill: '#666' }} domain={['auto', 'auto']} tickFormatter={v => `$${v}`} />
+              <Tooltip
+                contentStyle={{ background: '#111', border: '1px solid #333', fontSize: 11 }}
+                formatter={(v, name) => [`$${Number(v).toFixed(2)}`, name === 'total' ? 'Total' : 'P&L']}
+              />
+              <Line type="monotone" dataKey="total" stroke="#f59e0b" dot={false} strokeWidth={2} name="total" />
+              <Line type="monotone" dataKey="profit" stroke="#22c55e" dot={false} strokeWidth={1} strokeDasharray="4 2" name="profit" />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+
       {/* Event P&L from actual platform data */}
       <div className="border border-emerald-800/50 rounded-lg bg-emerald-950/25 p-2 space-y-1.5">
         <div className="flex flex-wrap items-center justify-between gap-2">
@@ -983,6 +1052,7 @@ export default function ArbitrageLab() {
                 </span>
                 {c.recurring && <span className="px-1.5 py-0.5 rounded bg-blue-700 text-white text-[9px] font-bold">recurring</span>}
                 {c.swap_poly && <span className="px-1.5 py-0.5 rounded bg-purple-700 text-white text-[9px] font-bold">swapped</span>}
+                {c.poly_only && <span className="px-1.5 py-0.5 rounded bg-cyan-700 text-white text-[9px] font-bold">poly only</span>}
                 <span className="flex items-center gap-0.5 text-gray-500">
                   <input
                     type="number"
@@ -1015,6 +1085,19 @@ export default function ArbitrageLab() {
                     className="rounded"
                   />
                   <span className={c.swap_poly ? 'text-purple-400 font-bold' : ''}>alt</span>
+                </label>
+                <label className="flex items-center gap-1 text-[9px] text-gray-500">
+                  <input
+                    type="checkbox"
+                    checked={!!c.poly_only}
+                    onChange={(e) => fetch(`${API_BASE}/api/arb/campaigns/${c.id}`, {
+                      method: 'PATCH',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ polyOnly: e.target.checked }),
+                    }).catch(() => {})}
+                    className="rounded"
+                  />
+                  <span className={c.poly_only ? 'text-cyan-400 font-bold' : ''}>poly</span>
                 </label>
                 {c.live?.best != null && (
                   <span className={`px-1 py-0.5 rounded text-[9px] font-bold ${c.live.best > 0 ? 'bg-green-900/50 text-green-400' : 'bg-red-900/30 text-red-400'}`}>
@@ -1256,7 +1339,16 @@ export default function ArbitrageLab() {
           </button>
         )}
         {!running && (
-          <button type="button" onClick={fetchDefaults} disabled={loadingDefaults} className="px-3 py-2 rounded-lg bg-gray-700 text-gray-300 text-xs hover:bg-gray-600 disabled:opacity-50">
+          <button
+            type="button"
+            onClick={() => {
+              inputsDirtyRef.current = false;
+              fetchDefaults();
+            }}
+            disabled={loadingDefaults}
+            className="px-3 py-2 rounded-lg bg-gray-700 text-gray-300 text-xs hover:bg-gray-600 disabled:opacity-50"
+            title="Reload current 15m Kalshi + Polymarket links and titles"
+          >
             Refresh defaults
           </button>
         )}
@@ -1315,6 +1407,10 @@ export default function ArbitrageLab() {
             <input type="checkbox" checked={fillAny} onChange={(e) => setFillAny(e.target.checked)} className="rounded" />
             <span className={fillAny ? 'text-red-400 font-bold' : ''}>fill any</span>
           </label>
+          <label className="flex items-center gap-1 text-[10px] text-gray-500">
+            <input type="checkbox" checked={polyOnly} onChange={(e) => setPolyOnly(e.target.checked)} className="rounded" />
+            <span className={polyOnly ? 'text-cyan-400 font-bold' : ''}>poly only</span>
+          </label>
           <button
             type="button"
             onClick={createCampaign}
@@ -1326,25 +1422,26 @@ export default function ArbitrageLab() {
         </div>
       </div>
 
-      {last && (() => {
+      {(last || (running && sessionId)) && (() => {
         const SHARES = 5;
+        const t = last || {};
         const isPolyPolyLive = !!book?.polyA;
         const leftPoly = isPolyPolyLive ? book?.polyA : null;
         const rightPoly = isPolyPolyLive ? (book?.polyB || book?.poly) : (book?.poly || null);
 
-        // Live tick prices (real-time from WS)
+        // Live tick prices (real-time from WS) — `t` allows book-only UI before first tick arrives
         const ksY = isPolyPolyLive
           ? (leftPoly?.up?.bestAsk != null ? Number(leftPoly.up.bestAsk) : (leftPoly?.up?.bestBid != null ? Number(leftPoly.up.bestBid) : null))
-          : (last.external_price != null ? Number(last.external_price) : null);
+          : (t.external_price != null ? Number(t.external_price) : null);
         const ksN = isPolyPolyLive
           ? (leftPoly?.down?.bestAsk != null ? Number(leftPoly.down.bestAsk) : (leftPoly?.down?.bestBid != null ? Number(leftPoly.down.bestBid) : null))
-          : (last.external_no_price != null ? Number(last.external_no_price) : null);
+          : (t.external_no_price != null ? Number(t.external_no_price) : null);
         const pDown = isPolyPolyLive
-          ? (rightPoly?.down?.bestAsk != null ? Number(rightPoly.down.bestAsk) : (rightPoly?.down?.bestBid != null ? Number(rightPoly.down.bestBid) : (last.poly_down != null ? Number(last.poly_down) : null)))
-          : (last.poly_down != null ? Number(last.poly_down) : null);
+          ? (rightPoly?.down?.bestAsk != null ? Number(rightPoly.down.bestAsk) : (rightPoly?.down?.bestBid != null ? Number(rightPoly.down.bestBid) : (t.poly_down != null ? Number(t.poly_down) : null)))
+          : (t.poly_down != null ? Number(t.poly_down) : null);
         const pUp = isPolyPolyLive
-          ? (rightPoly?.up?.bestAsk != null ? Number(rightPoly.up.bestAsk) : (rightPoly?.up?.bestBid != null ? Number(rightPoly.up.bestBid) : (last.poly_up != null ? Number(last.poly_up) : null)))
-          : (last.poly_up != null ? Number(last.poly_up) : null);
+          ? (rightPoly?.up?.bestAsk != null ? Number(rightPoly.up.bestAsk) : (rightPoly?.up?.bestBid != null ? Number(rightPoly.up.bestBid) : (t.poly_up != null ? Number(t.poly_up) : null)))
+          : (t.poly_up != null ? Number(t.poly_up) : null);
 
         // Execution prices: use REAL ask from book when available, fallback to mid+1¢
         const ksYesAskBook = isPolyPolyLive ? leftPoly?.up?.bestAsk : book?.kalshi?.yesAsk;
@@ -1647,11 +1744,14 @@ export default function ArbitrageLab() {
                 })}
               </div>
             )}
-            {(last.error_external || last.error_poly) && (
+            {(t.error_external || t.error_poly) && (
               <div className="text-[10px] text-red-400 font-mono space-y-0.5">
-                {last.error_external && <div>Kalshi: {last.error_external}</div>}
-                {last.error_poly && <div>Polymarket: {last.error_poly}</div>}
+                {t.error_external && <div>Kalshi: {t.error_external}</div>}
+                {t.error_poly && <div>Polymarket: {t.error_poly}</div>}
               </div>
+            )}
+            {!last && running && sessionId && (
+              <div className="text-[10px] text-yellow-500/90">Waiting for first price tick… book quotes below still work for execute.</div>
             )}
             {execResult && (
               <div className={`text-[11px] font-mono p-2 rounded border ${execResult.success ? 'border-green-700 bg-green-900/30' : 'border-red-700 bg-red-900/30'}`}>
