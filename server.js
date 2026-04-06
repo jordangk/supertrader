@@ -5978,13 +5978,16 @@ async function placeLive99Order(tokenId, size, negRisk, label) {
     return null;
   }
 
+  // 30 minute expiration — use GTD order type
+  const expiration = Math.floor(Date.now() / 1000) + 1800;
+
   let result;
   try {
-    const signed = await clobClient.createOrder({ tokenID: tokenId, price: 0.999, size, side: 'BUY' }, { tickSize: '0.001', negRisk });
-    result = await clobClient.postOrder(signed, 'GTC');
+    const signed = await clobClient.createOrder({ tokenID: tokenId, price: 0.999, size, side: 'BUY', expiration }, { tickSize: '0.001', negRisk });
+    result = await clobClient.postOrder(signed, 'GTD');
   } catch {
-    const signed2 = await clobClient.createOrder({ tokenID: tokenId, price: 0.99, size, side: 'BUY' }, { tickSize: '0.01', negRisk });
-    result = await clobClient.postOrder(signed2, 'GTC');
+    const signed2 = await clobClient.createOrder({ tokenID: tokenId, price: 0.99, size, side: 'BUY', expiration }, { tickSize: '0.01', negRisk });
+    result = await clobClient.postOrder(signed2, 'GTD');
   }
   console.log(`${label} → ${result?.status} id:${result?.orderID?.slice(0,8)}`);
   return result;
@@ -6281,61 +6284,75 @@ setInterval(async () => {
           }
         }
 
-        // ── Game Total O/U: when score crosses line, Over is guaranteed ──
-        // STRICT: only "Team vs Team: O/U X.5" — NO player props, NO halves, NO quarters
-        const ouParts = String(e.score || '').split(/[-]/).map(p => parseInt(p.trim())).filter(n => !isNaN(n));
-        const ouTotal = ouParts.length >= 2 ? ouParts[0] + ouParts[1] : null;
-        if (e.score && !String(e.score).includes('|') && ouTotal != null && ouTotal > 0 && clobClient) {
-          for (const m of (e.markets || [])) {
-            const q = (m.question || '');
-            const ql = q.toLowerCase();
-            if (!ql.includes('o/u')) continue;
-            // SKIP player props and per-period
-            if (ql.includes('points') || ql.includes('rebounds') || ql.includes('assists')) continue;
-            if (ql.includes('kills') || ql.includes('map ') || ql.includes('game ')) continue;
-            if (ql.includes('total set') || ql.includes('total games')) continue;
-            if (ql.includes('1h ') || ql.includes('2h ')) continue;
-            if (ql.includes('set ')) continue;
-            const ouMatch = ql.match(/o\/u\s*([\d.]+)/);
-            if (!ouMatch) continue;
-            const line = parseFloat(ouMatch[1]);
-            if (line < 3.5) continue;
-            const condId = m.conditionId;
-            if (!tracked.ouFired) tracked.ouFired = new Set();
-            if (!condId || tracked.ouFired.has(condId)) continue;
+      }
+    }
 
-            if (ouTotal > line) {
-              tracked.ouFired.add(condId);
-              const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
-              const outcomes = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes;
-              if (!tokens || tokens.length < 2) continue;
-              const overIdx = outcomes ? outcomes.findIndex(o => o.toLowerCase().includes('over')) : 0;
-              const overToken = tokens[overIdx >= 0 ? overIdx : 0];
-              const overLabel = outcomes ? outcomes[overIdx >= 0 ? overIdx : 0] : 'Over';
-              const negRisk = m.negRisk != null ? m.negRisk : true;
+    // ── Game Total O/U: check ALL tracked non-esports games on every poll ──
+    for (const [slug, data] of liveEventTracker.knownLive) {
+      if (!data.score || String(data.score).includes('|') || String(data.score).includes(',')) continue;
+      if (!clobClient) continue;
+      // If no markets yet, fetch them
+      if (!data.markets?.length) {
+        try {
+          const evRes = await fetch(`https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(slug)}`);
+          const evData = await evRes.json();
+          const ev = Array.isArray(evData) ? evData[0] : evData;
+          if (ev?.markets?.length) data.markets = ev.markets;
+        } catch {}
+        if (!data.markets?.length) continue;
+      }
+      const ouParts = String(data.score).split('-').map(p => parseInt(p.trim())).filter(n => !isNaN(n));
+      if (ouParts.length < 2) continue;
+      const ouTotal = ouParts[0] + ouParts[1];
+      if (ouTotal === 0) continue;
+      if (!data.ouFired) data.ouFired = new Set();
 
-              // Price check: both sides sum <= 103¢
-              try {
-                const [r0, r1] = await Promise.all([
-                  fetch('https://clob.polymarket.com/price?token_id=' + tokens[0] + '&side=sell'),
-                  fetch('https://clob.polymarket.com/price?token_id=' + tokens[1] + '&side=sell'),
-                ]);
-                const d0 = await r0.json(), d1 = await r1.json();
-                const a0 = d0?.price ? parseFloat(d0.price) : null;
-                const a1 = d1?.price ? parseFloat(d1.price) : null;
-                if (a0 == null || a1 == null) { console.log(`[live-ou] SKIP O/U ${line}: no price | ${e.title}`); continue; }
-                if (a0 + a1 > 1.03) { console.log(`[live-ou] SKIP O/U ${line}: ${(a0*100).toFixed(0)}+${(a1*100).toFixed(0)}=${((a0+a1)*100).toFixed(0)}¢ > 103 | ${e.title}`); continue; }
-              } catch { continue; }
+      for (const m of data.markets) {
+        const q = (m.question || '');
+        const ql = q.toLowerCase();
+        if (!ql.includes('o/u')) continue;
+        if (ql.includes('points') || ql.includes('rebounds') || ql.includes('assists')) continue;
+        if (ql.includes('kills') || ql.includes('map ') || ql.includes('game ')) continue;
+        if (ql.includes('total set') || ql.includes('total games')) continue;
+        if (ql.includes('1h ') || ql.includes('2h ')) continue;
+        if (ql.includes('set ')) continue;
+        const ouMatch = ql.match(/o\/u\s*([\d.]+)/);
+        if (!ouMatch) continue;
+        const line = parseFloat(ouMatch[1]);
+        if (line < 3.5) continue;
+        const condId = m.conditionId;
+        if (!condId || data.ouFired.has(condId)) continue;
 
-              console.log(`[live-ou] SCORE ${e.score} (total ${ouTotal}) > O/U ${line} → BUY ${overLabel} | ${e.title}`);
-              try {
-                const result = await placeLive99Order(overToken, 10, negRisk, `[live-ou] ${overLabel} O/U ${line} 10sh`);
-                liveEventTracker.log.unshift({ ts: Date.now(), event: e.title, score: e.score, market: `O/U ${line}`, side: overLabel, price: '99.9¢', status: result?.status });
-                if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
-              } catch (err) {
-                console.error(`[live-ou] Error O/U ${line}:`, err.message?.slice(0, 60));
-              }
-            }
+        if (ouTotal > line) {
+          data.ouFired.add(condId);
+          const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
+          const outcomes = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes;
+          if (!tokens || tokens.length < 2) continue;
+          const overIdx = outcomes ? outcomes.findIndex(o => o.toLowerCase().includes('over')) : 0;
+          const overToken = tokens[overIdx >= 0 ? overIdx : 0];
+          const overLabel = outcomes ? outcomes[overIdx >= 0 ? overIdx : 0] : 'Over';
+          const negRisk = m.negRisk != null ? m.negRisk : true;
+
+          // Price check: both sides sum <= 103¢
+          try {
+            const [r0, r1] = await Promise.all([
+              fetch('https://clob.polymarket.com/price?token_id=' + tokens[0] + '&side=sell'),
+              fetch('https://clob.polymarket.com/price?token_id=' + tokens[1] + '&side=sell'),
+            ]);
+            const d0 = await r0.json(), d1 = await r1.json();
+            const a0 = d0?.price ? parseFloat(d0.price) : null;
+            const a1 = d1?.price ? parseFloat(d1.price) : null;
+            if (a0 == null || a1 == null) { data.ouFired.delete(condId); continue; }
+            if (a0 + a1 > 1.03) { data.ouFired.delete(condId); continue; }
+          } catch { data.ouFired.delete(condId); continue; }
+
+          console.log(`[live-ou] SCORE ${data.score} (total ${ouTotal}) > O/U ${line} → BUY ${overLabel} | ${data.title}`);
+          try {
+            const result = await placeLive99Order(overToken, 10, negRisk, `[live-ou] ${overLabel} O/U ${line} 10sh`);
+            liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: `O/U ${line}`, side: overLabel, price: '99.9¢', status: result?.status });
+            if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
+          } catch (err) {
+            console.error(`[live-ou] Error O/U ${line}:`, err.message?.slice(0, 60));
           }
         }
       }
@@ -6482,7 +6499,17 @@ setInterval(async () => {
     // ── Esports BO3/BO5: Games Total O/U when series score guarantees more games ──
     for (const [slug, data] of liveEventTracker.knownLive) {
       if (!data.score || !String(data.score).includes('|') || !String(data.score).includes('Bo')) continue;
-      if (!data.markets?.length || !clobClient) continue;
+      if (!clobClient) continue;
+      // Fetch markets if not loaded yet
+      if (!data.markets?.length) {
+        try {
+          const evRes = await fetch(`https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(slug)}`);
+          const evData = await evRes.json();
+          const ev = Array.isArray(evData) ? evData[0] : evData;
+          if (ev?.markets?.length) data.markets = ev.markets;
+        } catch {}
+        if (!data.markets?.length) continue;
+      }
       if (!data._esportsFired) data._esportsFired = new Set();
 
       const scoreParts = String(data.score).split('|');
@@ -6588,6 +6615,65 @@ setInterval(async () => {
             if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
           } catch (err) {
             console.error(`[esports] Error Map ${mapNum}:`, err.message?.slice(0, 60));
+          }
+        }
+
+        // ── Esports completed map props: buy winner on all decided Game X markets ──
+        // "Game 1: Both Teams Destroy Barracks?", "First Blood in Game 1?", etc.
+        for (const m of data.markets) {
+          const q = m.question || '';
+          const ql = q.toLowerCase();
+          // Match "Game X:" or "Game X " at the start, or "in Game X"
+          const gameMatch = ql.match(/(?:^game\s*(\d+)|in\s+game\s+(\d+))/);
+          if (!gameMatch) continue;
+          const gameNum = parseInt(gameMatch[1] || gameMatch[2]);
+          if (gameNum > mapsPlayed) continue; // game not finished
+          // Skip markets we already handle (map winner, O/U, handicap)
+          if (ql.includes('winner') || ql.includes('o/u') || ql.includes('handicap')) continue;
+
+          const condId = m.conditionId;
+          if (!condId || data._esportsFired.has(condId)) continue;
+
+          const prices = m.outcomePrices ? (typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices) : null;
+          const tokens = m.clobTokenIds ? (typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds) : null;
+          const outcomes = m.outcomes ? (typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes) : null;
+          if (!prices || !tokens || prices.length < 2 || !outcomes) continue;
+
+          const p0 = parseFloat(prices[0]), p1 = parseFloat(prices[1]);
+          if (Math.max(p0, p1) < 0.90) continue; // not decided enough
+          const mktVol = parseFloat(m.volume || 0);
+          if (mktVol < 50) continue; // skip no-volume markets
+
+          const winIdx = p0 >= p1 ? 0 : 1;
+          const winToken = tokens[winIdx];
+          const winLabel = outcomes[winIdx];
+          const negRisk = m.negRisk != null ? m.negRisk : true;
+
+          // CLOB check: sum < 150¢ and winner > 98¢
+          try {
+            const [r0, r1] = await Promise.all([
+              fetch('https://clob.polymarket.com/price?token_id=' + tokens[0] + '&side=sell'),
+              fetch('https://clob.polymarket.com/price?token_id=' + tokens[1] + '&side=sell'),
+            ]);
+            const d0 = await r0.json(), d1 = await r1.json();
+            const a0 = d0?.price ? parseFloat(d0.price) : null;
+            const a1 = d1?.price ? parseFloat(d1.price) : null;
+            if (a0 == null || a1 == null) continue;
+            const clobSum = a0 + a1;
+            const winAsk = winIdx === 0 ? a0 : a1;
+            if (clobSum > 1.50) continue;
+            if (clobSum > 1.03 && (winAsk < 0.98 || mktVol < 50)) continue;
+          } catch { continue; }
+
+          data._esportsFired.add(condId);
+          const shares = 10;
+          console.log(`[esports] ${data.title.slice(0,25)} Game ${gameNum}: ${q.slice(0,35)} → ${winLabel} ($${mktVol.toFixed(0)} vol)`);
+          try {
+            const result = await placeLive99Order(winToken, shares, negRisk, `[esports] ${winLabel} ${q.slice(0,25)} ${shares}sh`);
+            liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: q.slice(0, 50), side: winLabel, price: '99.9¢', status: result?.status });
+            if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
+          } catch (err) {
+            console.error(`[esports] Error prop ${q.slice(0,25)}:`, err.message?.slice(0, 60));
           }
         }
 
@@ -6811,6 +6897,7 @@ setInterval(async () => {
           continue;
         }
 
+        let orderSize = 10;
         // Verify BOTH sides from CLOB — sum must be <= 103¢
         try {
           const [r0, r1] = await Promise.all([
@@ -6824,31 +6911,39 @@ setInterval(async () => {
             console.log(`[live-99] SKIP ${m.question?.slice(0,30)}: no price data`);
             continue;
           }
-          if (a0 + a1 > 1.03) {
-            console.log(`[live-99] SKIP ${m.question?.slice(0,30)}: ${(a0*100).toFixed(0)}+${(a1*100).toFixed(0)}=${((a0+a1)*100).toFixed(0)}¢ > 103`);
+          const clobSum = a0 + a1;
+          const winAsk = winIdx === 0 ? a0 : a1;
+          const mktVol = parseFloat(m.volume || 0);
+          if (clobSum > 1.50) {
+            console.log(`[live-99] SKIP ${m.question?.slice(0,30)}: ${(a0*100).toFixed(0)}+${(a1*100).toFixed(0)}=${(clobSum*100).toFixed(0)}¢ > 150`);
             continue;
           }
-          // Trust Gamma — place limit regardless of current ask
+          // If sum > 103 but < 150, only buy if winner > 98¢ and volume > $50 (5sh instead of 10)
+          if (clobSum > 1.03 && (winAsk < 0.98 || mktVol < 50)) {
+            console.log(`[live-99] SKIP ${m.question?.slice(0,30)}: ${(a0*100).toFixed(0)}+${(a1*100).toFixed(0)}=${(clobSum*100).toFixed(0)}¢ > 103, ask ${(winAsk*100).toFixed(0)}¢ vol $${mktVol.toFixed(0)}`);
+            continue;
+          }
+          orderSize = clobSum > 1.03 ? 5 : 10; // Smaller size for less certain markets
         } catch { continue; }
 
         // Try 99.9¢ first (0.001 tick), fall back to 99¢ (0.01 tick)
         const negRisk = m.negRisk != null ? m.negRisk : true;
-        const orderSize = 10; // 10 shares per market
 
         try {
           let result = null;
+          const expiration = Math.floor(Date.now() / 1000) + 1800; // 30 min
           try {
             const signed = await clobClient.createOrder(
-              { tokenID: winToken, price: 0.999, size: orderSize, side: 'BUY' },
+              { tokenID: winToken, price: 0.999, size: orderSize, side: 'BUY', expiration },
               { tickSize: '0.001', negRisk },
             );
-            result = await clobClient.postOrder(signed, 'GTC');
+            result = await clobClient.postOrder(signed, 'GTD');
           } catch {
             const signed2 = await clobClient.createOrder(
-              { tokenID: winToken, price: 0.99, size: orderSize, side: 'BUY' },
+              { tokenID: winToken, price: 0.99, size: orderSize, side: 'BUY', expiration },
               { tickSize: '0.01', negRisk },
             );
-            result = await clobClient.postOrder(signed2, 'GTC');
+            result = await clobClient.postOrder(signed2, 'GTD');
           }
           placed++;
           const logEntry = {
@@ -6888,6 +6983,244 @@ setInterval(async () => {
     // silent — don't spam logs on API errors
   }
 }, 3000);
+
+// ── Startup scan: catch recently ended events we missed during restarts ──
+setTimeout(async () => {
+  if (!clobClient) return;
+  console.log('[startup-scan] Scanning for recently ended events...');
+  try {
+    // Fetch events that were live recently — check if any ended
+    const r = await fetch('https://gamma-api.polymarket.com/events?active=true&closed=false&limit=200&order=volume&ascending=false');
+    const events = await r.json();
+    if (!Array.isArray(events)) return;
+
+    let placed = 0;
+    for (const e of events) {
+      const slug = e.slug;
+      if (!slug) continue;
+      if (liveEventTracker.fired.has(slug)) continue; // already handled
+      if (e.live) continue; // still live
+      if (!e.ended) continue; // not ended
+
+      // Skip crypto
+      if (slug.includes('updown') || slug.includes('up-or-down')) continue;
+
+      const mkts = e.markets || [];
+      let hasDecided = false;
+      for (const m of mkts) {
+        const prices = m.outcomePrices ? (typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices) : null;
+        if (!prices || prices.length < 2) continue;
+        if (Math.max(parseFloat(prices[0]), parseFloat(prices[1])) >= 0.90) { hasDecided = true; break; }
+      }
+      if (!hasDecided) continue;
+
+      liveEventTracker.fired.add(slug);
+      console.log(`[startup-scan] Found ended event: ${e.title} (${e.score})`);
+
+      // Same logic as end-of-game scanner
+      for (const m of mkts) {
+        if (m.closed) continue;
+        const prices = m.outcomePrices ? (typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices) : null;
+        const tokens = m.clobTokenIds ? (typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds) : null;
+        const outcomes = m.outcomes ? (typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes) : null;
+        if (!prices || !tokens || prices.length < 2) continue;
+
+        const p0 = parseFloat(prices[0]), p1 = parseFloat(prices[1]);
+        const winIdx = p0 >= p1 ? 0 : 1;
+        const winPrice = Math.max(p0, p1);
+        const losePrice = Math.min(p0, p1);
+        const winToken = tokens[winIdx];
+        const winOutcome = outcomes ? outcomes[winIdx] : winIdx === 0 ? 'Yes' : 'No';
+        const negRisk = m.negRisk != null ? m.negRisk : true;
+
+        if (!winToken || winPrice < 0.90 || losePrice > 0.15) continue;
+
+        // Both sides sum check
+        try {
+          const [r0, r1] = await Promise.all([
+            fetch('https://clob.polymarket.com/price?token_id=' + tokens[0] + '&side=sell'),
+            fetch('https://clob.polymarket.com/price?token_id=' + tokens[1] + '&side=sell'),
+          ]);
+          const d0 = await r0.json(), d1 = await r1.json();
+          const a0 = d0?.price ? parseFloat(d0.price) : null;
+          const a1 = d1?.price ? parseFloat(d1.price) : null;
+          if (a0 == null || a1 == null) continue;
+          if (a0 + a1 > 1.03) continue;
+        } catch { continue; }
+
+        try {
+          const result = await placeLive99Order(winToken, 10, negRisk, `[startup-scan] ${winOutcome} on ${m.question?.slice(0,30)} 10sh`);
+          if (result) placed++;
+        } catch {}
+      }
+    }
+    console.log(`[startup-scan] Done. Placed ${placed} orders on missed events.`);
+  } catch (err) {
+    console.error('[startup-scan] Error:', err.message?.slice(0, 100));
+  }
+}, 10000); // Run 10s after startup
+
+// ── Weather Temperature Scanner ──
+// Every hour, check actual observed temps and buy on decided weather markets
+const WEATHER_CITIES = {
+  tokyo: { station: 'RJTT:9:JP', tz: 'Asia/Tokyo' },
+  singapore: { station: 'WSSS:9:SG', tz: 'Asia/Singapore' },
+  // wellington: { station: 'NZWN:9:NZ', tz: 'Pacific/Auckland' },
+  // paris: { station: 'LFPG:9:FR', tz: 'Europe/Paris' },
+  // miami: { station: 'KMIA:9:US', tz: 'America/New_York' },
+  // seoul: { station: 'RKSS:9:KR', tz: 'Asia/Seoul' },
+};
+const weatherFired = new Set(); // track conditionIds we've already placed on
+
+async function getObservedMaxTemp(station, dateStr) {
+  try {
+    const r = await fetch(`https://api.weather.com/v1/location/${station}/observations/historical.json?apiKey=e1f10a1e78da46f5b10a1e78da96f525&units=m&startDate=${dateStr}&endDate=${dateStr}`);
+    const data = await r.json();
+    const obs = data.observations || [];
+    if (!obs.length) return null;
+    const temps = obs.map(o => o.temp).filter(t => t != null);
+    return temps.length ? Math.max(...temps) : null;
+  } catch { return null; }
+}
+
+async function runWeatherScan() {
+    try {
+      if (!clobClient) { scheduleWeatherScan(); return; }
+
+      const now = new Date();
+      const bal = await getUsdcBalance();
+      if (bal < 10) { scheduleWeatherScan(); return; }
+
+      for (const [city, info] of Object.entries(WEATHER_CITIES)) {
+        // Get today's date in the city's timezone
+        const localDate = new Date(now.toLocaleString('en-US', { timeZone: info.tz }));
+        const localHour = localDate.getHours();
+
+        // Format date for API: YYYYMMDD
+        const y = localDate.getFullYear();
+        const m = String(localDate.getMonth() + 1).padStart(2, '0');
+        const d = String(localDate.getDate()).padStart(2, '0');
+        const dateStr = `${y}${m}${d}`;
+        const slugDate = `${y}-${m}-${d}`;
+
+        // Get observed max temp
+        const maxTemp = await getObservedMaxTemp(info.station, dateStr);
+        if (maxTemp == null) continue;
+
+        // Find Poly event for this city and date
+        const slug = `highest-temperature-in-${city}-on-${slugDate.replace(/-0/g, '-').replace(/-/g, '-')}`;
+        // Poly slugs use format: highest-temperature-in-wellington-on-april-6-2026
+        const monthNames = ['january','february','march','april','may','june','july','august','september','october','november','december'];
+        const polySlug = `highest-temperature-in-${city}-on-${monthNames[localDate.getMonth()]}-${localDate.getDate()}-${y}`;
+
+        let event;
+        try {
+          const er = await fetch(`https://gamma-api.polymarket.com/events?slug=${polySlug}`);
+          const ed = await er.json();
+          event = Array.isArray(ed) ? ed[0] : ed;
+        } catch { continue; }
+        if (!event?.markets?.length) continue;
+
+        console.log(`[weather] ${city} ${slugDate} | max observed: ${maxTemp}°C | hour: ${localHour} | ${event.markets.length} markets`);
+
+        for (const mkt of event.markets) {
+          const q = (mkt.question || '');
+          const condId = mkt.conditionId;
+          if (!condId || weatherFired.has(condId)) continue;
+
+          const tokens = typeof mkt.clobTokenIds === 'string' ? JSON.parse(mkt.clobTokenIds) : mkt.clobTokenIds;
+          const outcomes = typeof mkt.outcomes === 'string' ? JSON.parse(mkt.outcomes) : mkt.outcomes;
+          if (!tokens || tokens.length < 2 || !outcomes) continue;
+          const negRisk = mkt.negRisk != null ? mkt.negRisk : true;
+
+          // Parse the temperature from the question
+          // "Will the highest temperature in X be 22°C on ..." → 22
+          // "Will the highest temperature in X be 23°C or higher..." → 23+
+          // "Will the highest temperature in X be 13°C or below..." → 13-
+          const exactMatch = q.match(/be\s+(\d+)°C\s+on/);
+          const orHigherMatch = q.match(/be\s+(\d+)°C\s+or\s+high/i);
+          const orBelowMatch = q.match(/be\s+(\d+)°C\s+or\s+below/i);
+
+          let winIdx = -1;
+
+          if (orBelowMatch) {
+            const threshold = parseInt(orBelowMatch[1]);
+            // "X°C or below" — if observed max > threshold, NO is guaranteed
+            if (maxTemp > threshold) {
+              winIdx = outcomes.findIndex(o => o.toLowerCase() === 'no');
+              if (winIdx < 0) winIdx = 1;
+            }
+          } else if (orHigherMatch) {
+            const threshold = parseInt(orHigherMatch[1]);
+            // "X°C or higher" — if observed max >= threshold, YES is guaranteed
+            // But only if day is essentially over (after 6 PM local)
+            if (maxTemp >= threshold) {
+              winIdx = outcomes.findIndex(o => o.toLowerCase() === 'yes');
+              if (winIdx < 0) winIdx = 0;
+            }
+            // If max < threshold AND day is over, NO is guaranteed
+            if (maxTemp < threshold && localHour >= 20) {
+              winIdx = outcomes.findIndex(o => o.toLowerCase() === 'no');
+              if (winIdx < 0) winIdx = 1;
+            }
+          } else if (exactMatch) {
+            const threshold = parseInt(exactMatch[1]);
+            // "Will highest be X°C" — exact match
+            // If observed max already > threshold, NO is guaranteed (max exceeded X)
+            if (maxTemp > threshold) {
+              winIdx = outcomes.findIndex(o => o.toLowerCase() === 'no');
+              if (winIdx < 0) winIdx = 1;
+            }
+            // If day is over and max == threshold, YES is guaranteed
+            if (maxTemp === threshold && localHour >= 20) {
+              winIdx = outcomes.findIndex(o => o.toLowerCase() === 'yes');
+              if (winIdx < 0) winIdx = 0;
+            }
+            // If day is over and max != threshold, NO is guaranteed
+            if (maxTemp !== threshold && localHour >= 20) {
+              winIdx = outcomes.findIndex(o => o.toLowerCase() === 'no');
+              if (winIdx < 0) winIdx = 1;
+            }
+          }
+
+          if (winIdx < 0) continue;
+          weatherFired.add(condId);
+          const winToken = tokens[winIdx];
+          const winLabel = outcomes[winIdx];
+
+          console.log(`[weather] ${city} ${maxTemp}°C → ${q.slice(0, 45)} → ${winLabel}`);
+          try {
+            const result = await placeLive99Order(winToken, 10, negRisk, `[weather] ${city} ${winLabel} 10sh`);
+            liveEventTracker.log.unshift({ ts: Date.now(), event: event.title, market: q.slice(0, 50), side: winLabel, price: '99.9¢', status: result?.status });
+            if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
+          } catch (err) {
+            console.error(`[weather] Error ${city}:`, err.message?.slice(0, 60));
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[weather] Scan error:', e.message?.slice(0, 100));
+    }
+}
+function scheduleWeatherLoop() {
+  // Wait until next :01, :16, :31, or :46 (1 min after weather data updates)
+  const _nm = new Date().getMinutes();
+  const _targets = [1, 16, 31, 46];
+  let _wait = _targets.find(t => t > _nm);
+  if (!_wait) _wait = 61;
+  const _delay = Math.max(((_wait - _nm) * 60 - new Date().getSeconds()) * 1000, 10000);
+  console.log(`[weather] Next scan in ${Math.round(_delay/60000)}min`);
+  setTimeout(async () => {
+    await runWeatherScan();
+    scheduleWeatherLoop();
+  }, _delay);
+}
+// Weather scanner — disabled temporarily, was spamming dead orderbooks
+// setTimeout(async () => {
+//   console.log('[weather] Starting weather scanner...');
+//   await runWeatherScan();
+//   scheduleWeatherLoop();
+// }, 15000);
 
 // Scan for decided markets (99%+) and place 99.9¢ bids
 const decidedScanner = { enabled: false, placed: new Set(), log: [] };
