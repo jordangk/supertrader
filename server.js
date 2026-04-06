@@ -6577,9 +6577,11 @@ setInterval(async () => {
           console.error(`[esports] Error O/U ${line} ${winLabel}:`, err.message?.slice(0, 60));
         }
 
-        // ── Map/Game Winners: buy winner on completed maps ──
-        // Series score s1+s2 = total maps played. Maps 1..N are decided.
-        const mapsPlayed = s1 + s2;
+      } // end O/U for loop
+
+      // ── Map/Game Winners: buy winner on completed maps ──
+      // Series score s1+s2 = total maps played. Maps 1..N are decided.
+      const mapsPlayed = s1 + s2;
         for (const m of data.markets) {
           const q = m.question || '';
           const ql = q.toLowerCase();
@@ -6741,7 +6743,6 @@ setInterval(async () => {
           }
         }
       }
-    }
 
     // ── Soccer: "Both Teams to Score: Yes" when both teams have scored ──
     for (const [slug, data] of liveEventTracker.knownLive) {
