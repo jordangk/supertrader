@@ -59,25 +59,30 @@ async function initClobClient() {
     console.log('[CLOB] Wallet address:', wallet.address);
     console.log('[CLOB] Signature type:', SIGNATURE_TYPE, '(POLY_GNOSIS_SAFE), funder:', FUNDER_ADDRESS);
 
-    // Derive API credentials (try derive first, fall back to create)
-    const tempClient = new ClobClient(
-      'https://clob.polymarket.com',
-      CHAIN_ID,
-      wallet,
-    );
+    // Use env CLOB credentials if available, otherwise derive
     let creds;
-    try {
-      creds = await tempClient.deriveApiKey();
-      console.log('[CLOB] API key derived:', creds.key);
-    } catch (e1) {
-      console.log('[CLOB] deriveApiKey failed, trying createApiKey...');
+    if (process.env.CLOB_API_KEY && process.env.CLOB_SECRET && process.env.CLOB_PASSPHRASE) {
+      creds = { key: process.env.CLOB_API_KEY, secret: process.env.CLOB_SECRET, passphrase: process.env.CLOB_PASSPHRASE };
+      console.log('[CLOB] Using env API key:', creds.key);
+    } else {
+      const tempClient = new ClobClient(
+        'https://clob.polymarket.com',
+        CHAIN_ID,
+        wallet,
+      );
       try {
-        creds = await tempClient.createApiKey();
-        console.log('[CLOB] API key created:', creds.key);
-      } catch (e2) {
-        console.log('[CLOB] createApiKey also failed, trying createOrDeriveApiKey...');
-        creds = await tempClient.createOrDeriveApiKey();
-        console.log('[CLOB] API key via createOrDerive:', creds.key);
+        creds = await tempClient.deriveApiKey();
+        console.log('[CLOB] API key derived:', creds.key);
+      } catch (e1) {
+        console.log('[CLOB] deriveApiKey failed, trying createApiKey...');
+        try {
+          creds = await tempClient.createApiKey();
+          console.log('[CLOB] API key created:', creds.key);
+        } catch (e2) {
+          console.log('[CLOB] createApiKey also failed, trying createOrDeriveApiKey...');
+          creds = await tempClient.createOrDeriveApiKey();
+          console.log('[CLOB] API key via createOrDerive:', creds.key);
+        }
       }
     }
 
@@ -2387,11 +2392,115 @@ function schedule5mEvent() {
   btc5mEventTimer = setTimeout(() => { refresh5mEvent(); schedule5mEvent(); }, delay);
 }
 
-// Server-side Auto-99: fires in last 5s if winning side > 90¢ and been > 80¢ for 1 min
-const auto99State = { enabled: false, firedSlug: null, priceLog: [] };
+// Multi-coin 5m tracker — all coins share the same logic
+const EXTRA_5M_COINS = ['eth', 'sol', 'xrp'];
+const extra5m = {}; // coin → { event, state, priceLog }
+
+for (const coin of EXTRA_5M_COINS) {
+  extra5m[coin] = {
+    event: null,
+    state: { eventSlug: null, tokenUp: null, tokenDown: null, upPrice: null, downPrice: null, endTime: null, title: null, tickSize: '0.01', negRisk: false },
+    priceLog: [],
+    firedSlug: null,
+  };
+}
+
+async function refreshExtra5mEvent(coin) {
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const slot = Math.floor(now / 300) * 300;
+    const slug = `${coin}-updown-5m-${slot}`;
+    const res = await fetch(`https://gamma-api.polymarket.com/events?slug=${slug}`);
+    const data = await res.json();
+    const event = Array.isArray(data) ? data[0] : data;
+    if (!event?.markets?.[0]) return;
+    const market = event.markets[0];
+    const tokens = typeof market.clobTokenIds === 'string' ? JSON.parse(market.clobTokenIds) : market.clobTokenIds;
+    const outcomes = typeof market.outcomes === 'string' ? JSON.parse(market.outcomes) : market.outcomes;
+    const upIdx = outcomes?.findIndex(o => o.toLowerCase().includes('up')) ?? 0;
+    const downIdx = upIdx === 0 ? 1 : 0;
+    extra5m[coin].event = { ...event, tokenUp: tokens[upIdx], tokenDown: tokens[downIdx], tickSize: market.minimumTickSize || '0.01', negRisk: market.negRisk || false, endDate: event.endDate };
+    extra5m[coin].state = { eventSlug: slug, tokenUp: tokens[upIdx], tokenDown: tokens[downIdx], upPrice: null, downPrice: null, endTime: event.endDate, title: event.title, tickSize: market.minimumTickSize || '0.01', negRisk: market.negRisk || false };
+    extra5m[coin].priceLog = [];
+    console.log(`[${coin.toUpperCase()}-5M] ${event.title}`);
+    const [upP, downP] = await Promise.all([fetchClobPrice(tokens[upIdx]), fetchClobPrice(tokens[downIdx])]).catch(() => [null, null]);
+    if (upP != null) extra5m[coin].state.upPrice = upP;
+    if (downP != null) extra5m[coin].state.downPrice = downP;
+  } catch {}
+}
+
+// Price poll all extra coins every 3s
+setInterval(async () => {
+  for (const coin of EXTRA_5M_COINS) {
+    const s = extra5m[coin].state;
+    if (!s.tokenUp) continue;
+    try {
+      const [upP, downP] = await Promise.all([fetchClobPrice(s.tokenUp), fetchClobPrice(s.tokenDown)]);
+      if (upP != null) s.upPrice = upP;
+      if (downP != null) s.downPrice = downP;
+    } catch {}
+  }
+}, 3000);
+
+// Schedule all extra coins
+function scheduleExtra5m() {
+  const now = Date.now();
+  const nextSlot = (Math.floor(Math.floor(now/1000) / 300) + 1) * 300;
+  const delay = (nextSlot * 1000) - now + 3000;
+  setTimeout(async () => {
+    for (const coin of EXTRA_5M_COINS) {
+      await refreshExtra5mEvent(coin);
+      await new Promise(r => setTimeout(r, 300));
+    }
+    scheduleExtra5m();
+  }, delay);
+}
+
+// API for each coin
+for (const coin of EXTRA_5M_COINS) {
+  app.get(`/api/${coin}5m/event`, (req, res) => res.json({ ...extra5m[coin].state, btcCurrent: liveState.binanceBtc }));
+  app.get(`/api/${coin}5m/price-history`, (req, res) => res.json({ snapshots: [], slug: req.query.slug }));
+  app.post(`/api/${coin}5m/buy`, async (req, res) => {
+    const { side, shares: reqShares, limitPrice, orderType } = req.body;
+    const e = extra5m[coin];
+    if (!e.event) return res.status(400).json({ error: `No active ${coin} 5m event` });
+    if (!['up', 'down'].includes(side) || !clobClient) return res.status(400).json({ error: 'Invalid' });
+    const tokenId = side === 'up' ? e.state.tokenUp : e.state.tokenDown;
+    if (!tokenId) return res.status(400).json({ error: 'No token' });
+    const shares = Math.max(1, Math.round(parseFloat(reqShares || 5)));
+    const price = limitPrice ? Math.max(0.01, Math.min(parseFloat(limitPrice), 0.99)) : Math.max(0.01, Math.min(side === 'up' ? e.state.upPrice : e.state.downPrice, 0.99));
+    res.json({ success: true, price, shares, status: 'sending' });
+    (async () => {
+      try {
+        const signed = await clobClient.createOrder({ tokenID: tokenId, price, size: shares, side: 'BUY' }, { tickSize: String(e.event.tickSize || '0.01'), negRisk: e.event.negRisk || false });
+        await clobClient.postOrder(signed, orderType || 'GTC');
+      } catch (err) { console.error(`[${coin}-5m] buy error:`, err.message?.slice(0, 60)); }
+    })();
+  });
+  app.post(`/api/${coin}5m/limit99`, async (req, res) => {
+    const e = extra5m[coin];
+    if (!e.event || !clobClient) return res.status(400).json({ error: 'No active event' });
+    const winSide = (e.state.upPrice || 0) >= (e.state.downPrice || 0) ? 'up' : 'down';
+    const tokenId = winSide === 'up' ? e.state.tokenUp : e.state.tokenDown;
+    if (!tokenId) return res.status(400).json({ error: 'No token' });
+    res.json({ success: true, side: winSide, price: 0.99, shares: 5 });
+    (async () => {
+      try {
+        const signed = await clobClient.createOrder({ tokenID: tokenId, price: 0.99, size: 5, side: 'BUY' }, { tickSize: String(e.event.tickSize || '0.01'), negRisk: e.event.negRisk || false });
+        await clobClient.postOrder(signed, 'GTC');
+      } catch (err) { console.error(`[${coin}-5m 99] error:`, err.message?.slice(0, 60)); }
+    })();
+  });
+  app.post(`/api/${coin}5m/auto99/toggle`, (req, res) => res.json({ enabled: auto99State.enabled }));
+  app.get(`/api/${coin}5m/auto99/status`, (req, res) => res.json({ enabled: auto99State.enabled, logSize: extra5m[coin].priceLog.length }));
+}
+
+
+// Server-side Auto-99: winning side >96¢ for 10s with no side switch → burst orders in last 1s
+const auto99State = { enabled: false, firedSlug: null, priceLog: [], firing: false };
 app.post('/api/btc5m/auto99/toggle', (req, res) => {
   auto99State.enabled = !auto99State.enabled;
-  if (!auto99State.enabled) { auto99State.firedSlug = null; auto99State.priceLog = []; }
+  if (!auto99State.enabled) { auto99State.firedSlug = null; auto99State.priceLog = []; auto99State.firing = false; }
   console.log(`[auto-99] ${auto99State.enabled ? 'ENABLED' : 'DISABLED'}`);
   res.json({ enabled: auto99State.enabled });
 });
@@ -2399,59 +2508,150 @@ app.get('/api/btc5m/auto99/status', (req, res) => {
   res.json({ enabled: auto99State.enabled, firedSlug: auto99State.firedSlug, logSize: auto99State.priceLog.length });
 });
 
-setInterval(async () => {
-  if (!auto99State.enabled) return;
-  if (!btc5mState.eventSlug || !btc5mEvent?.endDate) return;
-  // No firedSlug guard — fires every second when conditions met
-
-  const up = btc5mState.upPrice;
-  const down = btc5mState.downPrice;
-  if (!up || !down) return;
-
-  const winningSide = up > down ? 'up' : 'down';
-  const winningPrice = Math.max(up, down);
-  const now = Date.now();
-
-  // Log price
-  auto99State.priceLog.push({ t: now, price: winningPrice, side: winningSide });
-  auto99State.priceLog = auto99State.priceLog.filter(p => now - p.t < 90000);
-
-  // Reset on new event
-  if (auto99State.priceLog.length > 0 && auto99State.priceLog[0].t > now - 2000) {
-    // Fresh event — wait for data to accumulate
-  }
-
-  // Fire every second in last 4 seconds IF: >80¢ for past 15s AND current >90¢
-  const secsLeft = Math.max(0, (new Date(btc5mEvent.endDate).getTime() - now) / 1000);
-  if (secsLeft > 4 || secsLeft < 0) return;
-
-  // Current must be > 90¢
-  if (winningPrice < 0.90) return;
-
-  // Must have been > 80¢ for the past 15 seconds, same side
-  const last15s = auto99State.priceLog.filter(p => now - p.t < 15000);
-  if (last15s.length < 5) return; // need enough data
-  if (!last15s.every(p => p.price >= 0.80 && p.side === winningSide)) return;
-
-  // FIRE
-  auto99State.firedSlug = btc5mState.eventSlug;
-  console.log(`[auto-99] FIRING: ${winningSide} @ 99¢ (price ${(winningPrice*100).toFixed(0)}¢, ${secsLeft.toFixed(1)}s left)`);
-
+// Shared helper: place an order for a coin. Try 99.9¢ first, fall back to 99¢.
+async function placeAuto99Order(coin, side, state, event) {
+  if (!clobClient) return;
+  const tokenId = side === 'up' ? state.tokenUp : state.tokenDown;
+  if (!tokenId) return;
+  const negRisk = event.negRisk || false;
+  let result;
   try {
-    const tokenId = winningSide === 'up' ? btc5mState.tokenUp : btc5mState.tokenDown;
-    if (!tokenId || !clobClient) return;
-    const tick = btc5mEvent.tickSize || '0.01';
-    const signed = await clobClient.createOrder(
-      { tokenID: tokenId, price: 0.99, size: 5, side: 'BUY' },
-      { tickSize: String(tick), negRisk: btc5mEvent.negRisk || false },
-    );
-    const result = await clobClient.postOrder(signed, 'GTC');
-    console.log(`[auto-99] PLACED: ${winningSide} 5sh @ 99¢ — id:${result?.orderID?.slice(0,8)} status:${result?.status}`);
-    broadcast({ type: 'auto_99', side: winningSide, status: result?.status, orderId: result?.orderID });
-  } catch (e) {
-    console.error('[auto-99] Error:', e.message?.slice(0, 100));
+    const signed = await clobClient.createOrder({ tokenID: tokenId, price: 0.999, size: 5, side: 'BUY' }, { tickSize: '0.001', negRisk });
+    result = await clobClient.postOrder(signed, 'GTC');
+  } catch {
+    const signed2 = await clobClient.createOrder({ tokenID: tokenId, price: 0.99, size: 5, side: 'BUY' }, { tickSize: String(event.tickSize || '0.01'), negRisk });
+    result = await clobClient.postOrder(signed2, 'GTC');
   }
-}, 1000);
+  console.log(`[${coin}-auto-99] PLACED: ${side} 5sh → ${result?.status} id:${result?.orderID?.slice(0,8)}`);
+  return result;
+}
+
+// Check if a coin's price log qualifies: winning side >96¢ for 10s, no side switch
+function check99Eligible(priceLog) {
+  const now = Date.now();
+  const last10s = priceLog.filter(p => now - p.t < 10000);
+  if (last10s.length < 3) return null; // need at least 3 data points in 10s
+  const side = last10s[0].side;
+  if (!last10s.every(p => p.side === side && p.winner > 0.96)) return null;
+  return side;
+}
+
+// Burst-fire orders every 200ms for a coin during the last ~1s
+function startBurstFire(coin, state, event, priceLog, firedKey) {
+  let orderCount = 0;
+  const maxOrders = 5; // ~1s at 200ms intervals
+
+  function fireNext() {
+    if (!auto99State.enabled) return;
+    const now = Date.now();
+    const endMs = new Date(event.endDate).getTime();
+    const secsLeft = (endMs - now) / 1000;
+    if (secsLeft <= 0 || orderCount >= maxOrders) return;
+
+    // Re-check price is still >96¢
+    const up = state.upPrice, down = state.downPrice;
+    if (up == null || down == null) return;
+    const winPrice = Math.max(up, down);
+    if (winPrice <= 0.96) {
+      console.log(`[${coin}-auto-99] ABORT burst: winner dropped to ${(winPrice*100).toFixed(0)}¢`);
+      return;
+    }
+
+    const side = up > down ? 'up' : 'down';
+    // Verify side hasn't flipped
+    const eligibleSide = check99Eligible(priceLog);
+    if (!eligibleSide || eligibleSide !== side) {
+      console.log(`[${coin}-auto-99] ABORT burst: side switched`);
+      return;
+    }
+
+    orderCount++;
+    console.log(`[${coin}-auto-99] BURST ${orderCount}/${maxOrders}: ${side} @ 99¢ (${secsLeft.toFixed(1)}s left, winner ${(winPrice*100).toFixed(0)}¢)`);
+    placeAuto99Order(coin, side, state, event).catch(e => console.error(`[${coin}-auto-99] burst error:`, e.message?.slice(0, 80)));
+
+    setTimeout(fireNext, 200);
+  }
+
+  fireNext();
+}
+
+// Price logging — every 1s for BTC
+function schedule99Tick() {
+  setTimeout(async () => {
+    try {
+      if (!auto99State.enabled) { schedule99Tick(); return; }
+      if (!btc5mState.eventSlug || !btc5mEvent?.endDate) { schedule99Tick(); return; }
+
+      const up = btc5mState.upPrice, down = btc5mState.downPrice;
+      if (up == null || down == null) { schedule99Tick(); return; }
+
+      const winningSide = up > down ? 'up' : 'down';
+      const winningPrice = Math.max(up, down);
+      const now = Date.now();
+
+      // Log sane prices only
+      if (up + down < 1.5) {
+        auto99State.priceLog.push({ t: now, winner: winningPrice, side: winningSide });
+      }
+      auto99State.priceLog = auto99State.priceLog.filter(p => now - p.t < 30000);
+
+      const secsLeft = Math.max(0, (new Date(btc5mEvent.endDate).getTime() - now) / 1000);
+
+      // When we hit ~1s left, check eligibility and start burst
+      if (secsLeft <= 1.6 && secsLeft > 0.2 && auto99State.firedSlug !== btc5mState.eventSlug) {
+        const eligibleSide = check99Eligible(auto99State.priceLog);
+        if (eligibleSide) {
+          auto99State.firedSlug = btc5mState.eventSlug;
+          console.log(`[btc-auto-99] ELIGIBLE: ${eligibleSide} >96¢ for 10s — starting burst`);
+          startBurstFire('btc', btc5mState, btc5mEvent, auto99State.priceLog, 'firedSlug');
+        }
+      }
+    } catch (e) { console.error('[auto-99] tick error:', e.message); }
+    schedule99Tick();
+  }, 1000);
+}
+schedule99Tick();
+
+// Auto-99 for extra coins — same logic, sequential setTimeout
+function scheduleExtra99Tick() {
+  setTimeout(async () => {
+    try {
+      if (!auto99State.enabled || !clobClient) { scheduleExtra99Tick(); return; }
+
+      const now = Date.now();
+      for (const coin of EXTRA_5M_COINS) {
+        const e = extra5m[coin];
+        if (!e.state.eventSlug || !e.event?.endDate) continue;
+
+        const up = e.state.upPrice, down = e.state.downPrice;
+        if (up == null || down == null) continue;
+
+        const winningSide = up > down ? 'up' : 'down';
+        const winningPrice = Math.max(up, down);
+
+        // Log sane prices
+        if (up + down < 1.5) {
+          e.priceLog.push({ t: now, winner: winningPrice, side: winningSide });
+        }
+        e.priceLog = e.priceLog.filter(p => now - p.t < 30000);
+
+        const secsLeft = Math.max(0, (new Date(e.event.endDate).getTime() - now) / 1000);
+
+        // When ~1s left, check and burst
+        if (secsLeft <= 1.6 && secsLeft > 0.2 && e.firedSlug !== e.state.eventSlug) {
+          const eligibleSide = check99Eligible(e.priceLog);
+          if (eligibleSide) {
+            e.firedSlug = e.state.eventSlug;
+            console.log(`[${coin}-auto-99] ELIGIBLE: ${eligibleSide} >96¢ for 10s — starting burst`);
+            startBurstFire(coin, e.state, e.event, e.priceLog, 'firedSlug');
+          }
+        }
+      }
+    } catch (e) { console.error('[extra-auto-99] tick error:', e.message); }
+    scheduleExtra99Tick();
+  }, 1000);
+}
+scheduleExtra99Tick();
 
 // BTC 5m snapshots — capture every 5s
 function push5mSnapshot() {
@@ -5753,8 +5953,209 @@ app.get('/api/ending-soon', async (req, res) => {
   }
 });
 
+// Check USDC balance — cache for 30s to avoid spamming RPC
+let _balanceCache = { bal: 0, ts: 0 };
+async function getUsdcBalance() {
+  const now = Date.now();
+  if (now - _balanceCache.ts < 30000) return _balanceCache.bal;
+  try {
+    const { JsonRpcProvider } = await import('@ethersproject/providers');
+    const { Contract } = await import('@ethersproject/contracts');
+    const provider = new JsonRpcProvider(`https://polygon-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_KEY || '8kruQGYamUT6J4Ib0aMfw'}`);
+    const usdc = new Contract('0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174', ['function balanceOf(address) view returns (uint256)'], provider);
+    const bal = await usdc.balanceOf(process.env.FUNDER_ADDRESS);
+    _balanceCache = { bal: Number(bal) / 1e6, ts: now };
+    return _balanceCache.bal;
+  } catch { return _balanceCache.bal; }
+}
+
+// Helper: place 99.9¢ order (try 0.001 tick, fall back to 0.01)
+async function placeLive99Order(tokenId, size, negRisk, label) {
+  // Balance gate — don't place if wallet has less than $10
+  const bal = await getUsdcBalance();
+  if (bal < 10) {
+    console.log(`${label} → SKIP (balance $${bal.toFixed(2)} < $10)`);
+    return null;
+  }
+
+  let result;
+  try {
+    const signed = await clobClient.createOrder({ tokenID: tokenId, price: 0.999, size, side: 'BUY' }, { tickSize: '0.001', negRisk });
+    result = await clobClient.postOrder(signed, 'GTC');
+  } catch {
+    const signed2 = await clobClient.createOrder({ tokenID: tokenId, price: 0.99, size, side: 'BUY' }, { tickSize: '0.01', negRisk });
+    result = await clobClient.postOrder(signed2, 'GTC');
+  }
+  console.log(`${label} → ${result?.status} id:${result?.orderID?.slice(0,8)}`);
+  return result;
+}
+
+// Helper: check exact score markets for a soccer game and buy NO on impossible scores
+async function checkExactScores(slug, title, score, firedSet) {
+  if (!clobClient) return;
+  const parts = String(score).split('-');
+  const nums = parts.map(p => parseInt(p.trim())).filter(n => !isNaN(n));
+  if (nums.length !== 2) return;
+  // Skip esports (pipes in score) and 0-0 (nothing impossible yet)
+  if (String(score).includes('|')) return;
+  const homeScore = nums[0], awayScore = nums[1];
+  if (homeScore + awayScore === 0) return;
+
+  const esSlug = slug + '-exact-score';
+  try {
+    const esRes = await fetch(`https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(esSlug)}`);
+    const esData = await esRes.json();
+    const esEvent = Array.isArray(esData) ? esData[0] : esData;
+    if (!esEvent?.markets?.length) return;
+
+    for (const m of esEvent.markets) {
+      const q = m.question || '';
+      const condId = m.conditionId;
+      if (!condId || firedSet.has(condId)) continue;
+
+      const scoreMatch = q.match(/(\d+)\s*-\s*(\d+)/);
+      if (!scoreMatch) continue; // skip "Any Other Score"
+      const mHome = parseInt(scoreMatch[1]), mAway = parseInt(scoreMatch[2]);
+
+      // Impossible if current home > market home OR current away > market away
+      if (homeScore <= mHome && awayScore <= mAway) continue;
+
+      firedSet.add(condId);
+
+      const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
+      if (!tokens || tokens.length < 2) continue;
+      const noToken = tokens[1]; // NO is index 1
+      const negRisk = m.negRisk != null ? m.negRisk : true;
+
+      // Check both sides — YES + NO ask should be <= 103¢, skip if inflated or no liquidity
+      const yesToken = tokens[0];
+      try {
+        const [yesRes, noRes] = await Promise.all([
+          fetch('https://clob.polymarket.com/price?token_id=' + yesToken + '&side=sell'),
+          fetch('https://clob.polymarket.com/price?token_id=' + noToken + '&side=sell'),
+        ]);
+        const yesData = await yesRes.json();
+        const noData = await noRes.json();
+        const yesAsk = yesData?.price ? parseFloat(yesData.price) : null;
+        const noAsk = noData?.price ? parseFloat(noData.price) : null;
+        if (yesAsk == null || noAsk == null) {
+          console.log(`[exact-score] SKIP ${mHome}-${mAway}: no price data (no liquidity)`);
+          firedSet.delete(condId);
+          continue;
+        }
+        const total = yesAsk + noAsk;
+        if (total > 1.03) {
+          console.log(`[exact-score] SKIP ${mHome}-${mAway}: YES ${(yesAsk*100).toFixed(0)}¢ + NO ${(noAsk*100).toFixed(0)}¢ = ${(total*100).toFixed(0)}¢ > 103¢`);
+          firedSet.delete(condId);
+          continue;
+        }
+      } catch {
+        firedSet.delete(condId);
+        continue;
+      }
+
+      console.log(`[exact-score] ${title.slice(0,30)} score ${score} → ${mHome}-${mAway} IMPOSSIBLE → BUY NO`);
+      try {
+        const result = await placeLive99Order(noToken, 10, negRisk, `[exact-score] NO on ${mHome}-${mAway} 10sh`);
+        liveEventTracker.log.unshift({ ts: Date.now(), event: title, score, market: `Exact ${mHome}-${mAway} NO`, side: 'NO', price: '99.9¢', status: result?.status });
+        if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
+      } catch (err) {
+        console.error(`[exact-score] Error ${mHome}-${mAway}:`, err.message?.slice(0, 60));
+      }
+    }
+  } catch (err) {
+    console.error(`[exact-score] Fetch error for ${esSlug}:`, err.message?.slice(0, 60));
+  }
+}
+
+// Helper: buy winners on exact score event when game ends
+async function buyExactScoreOnEnd(slug, title, finalScore) {
+  if (!clobClient) return;
+  const esSlug = slug + '-exact-score';
+  try {
+    const esRes = await fetch(`https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(esSlug)}`);
+    const esData = await esRes.json();
+    const esEvent = Array.isArray(esData) ? esData[0] : esData;
+    if (!esEvent?.markets?.length) return;
+
+    console.log(`[exact-score] END: ${title} final ${finalScore} — ${esEvent.markets.length} exact score markets`);
+
+    for (const m of esEvent.markets) {
+      if (m.closed) continue;
+      const q = m.question || '';
+      const prices = m.outcomePrices ? (typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices) : null;
+      const tokens = m.clobTokenIds ? (typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds) : null;
+      if (!prices || !tokens || prices.length < 2) continue;
+
+      const p0 = parseFloat(prices[0]), p1 = parseFloat(prices[1]);
+      const winIdx = p0 >= p1 ? 0 : 1;
+      const winPrice = Math.max(p0, p1);
+      const losePrice = Math.min(p0, p1);
+      const winToken = tokens[winIdx];
+      const negRisk = m.negRisk != null ? m.negRisk : true;
+
+      if (!winToken || winPrice < 0.90 || losePrice > 0.15) continue;
+
+      // Verify BOTH sides from CLOB — sum must be <= 103¢
+      try {
+        const [r0, r1] = await Promise.all([
+          fetch('https://clob.polymarket.com/price?token_id=' + tokens[0] + '&side=sell'),
+          fetch('https://clob.polymarket.com/price?token_id=' + tokens[1] + '&side=sell'),
+        ]);
+        const d0 = await r0.json(), d1 = await r1.json();
+        const a0 = d0?.price ? parseFloat(d0.price) : null;
+        const a1 = d1?.price ? parseFloat(d1.price) : null;
+        if (a0 == null || a1 == null) { console.log(`[exact-score] END SKIP ${q.slice(0,40)}: no price`); continue; }
+        if (a0 + a1 > 1.03) { console.log(`[exact-score] END SKIP ${q.slice(0,40)}: ${(a0*100).toFixed(0)}+${(a1*100).toFixed(0)}=${((a0+a1)*100).toFixed(0)}¢ > 103`); continue; }
+        const winAsk = winIdx === 0 ? a0 : a1;
+        // Place limit at 99.9¢ even if ask is 100¢ — someone might sell into our bid
+        // Trust Gamma — place limit regardless of current ask
+      } catch { continue; }
+
+      const winLabel = winIdx === 0 ? 'YES' : 'NO';
+      console.log(`[exact-score] END: ${q.slice(0,40)} → BUY ${winLabel} (${(winPrice*100).toFixed(0)}¢)`);
+      try {
+        const result = await placeLive99Order(winToken, 10, negRisk, `[exact-score] END ${winLabel} on ${q.slice(0,30)} 10sh`);
+        liveEventTracker.log.unshift({ ts: Date.now(), event: title, score: finalScore, market: q.slice(0, 50), side: winLabel, price: '99.9¢', status: result?.status });
+        if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
+      } catch (err) {
+        console.error(`[exact-score] END Error ${q.slice(0,30)}:`, err.message?.slice(0, 60));
+      }
+    }
+  } catch (err) {
+    console.error(`[exact-score] END fetch error for ${esSlug}:`, err.message?.slice(0, 60));
+  }
+}
+
 // Auto-99 for live sports events: when a match ends, buy winner at 99¢
-const liveEventTracker = { enabled: false, knownLive: new Map(), fired: new Set(), log: [] };
+const LIVE_EVENTS_FILE = new URL('./.live-events.json', import.meta.url).pathname;
+
+function saveLiveEvents(knownLive, fired) {
+  try {
+    const data = {
+      knownLive: Object.fromEntries([...knownLive].map(([k, v]) => [k, { title: v.title, score: v.score, period: v.period, htScore: v.htScore || null, _htFired: v._htFired || false, _lastPeriod: v._lastPeriod || '' }])),
+      fired: [...fired],
+    };
+    fs.writeFileSync(LIVE_EVENTS_FILE, JSON.stringify(data));
+  } catch {}
+}
+
+function loadLiveEvents() {
+  try {
+    if (!fs.existsSync(LIVE_EVENTS_FILE)) return { knownLive: new Map(), fired: new Set() };
+    const data = JSON.parse(fs.readFileSync(LIVE_EVENTS_FILE, 'utf8'));
+    const knownLive = new Map();
+    for (const [slug, v] of Object.entries(data.knownLive || {})) {
+      knownLive.set(slug, { title: v.title, score: v.score, period: v.period, markets: [], ouFired: new Set(), exactScoreFired: new Set(), htScore: v.htScore || null, _htFired: v._htFired || false, _lastPeriod: v._lastPeriod || '' });
+    }
+    const fired = new Set(data.fired || []);
+    console.log(`[live-99] Restored ${knownLive.size} tracked events, ${fired.size} fired from disk`);
+    return { knownLive, fired };
+  } catch { return { knownLive: new Map(), fired: new Set() }; }
+}
+
+const restored = loadLiveEvents();
+const liveEventTracker = { enabled: true, knownLive: restored.knownLive, fired: restored.fired, log: [] };
 
 app.post('/api/live99/toggle', (req, res) => {
   liveEventTracker.enabled = !liveEventTracker.enabled;
@@ -5801,65 +6202,565 @@ setInterval(async () => {
         tracked.period = e.period;
         tracked.markets = e.markets || tracked.markets;
 
-        // Score changed → check O/U markets
-        if (e.score && e.score !== oldScore && clobClient) {
-          // Parse total score: "3-2" → 5, "32-48" → 80
-          const parts = String(e.score).split(/[-,]/);
-          const nums = parts.map(p => parseInt(p.trim())).filter(n => !isNaN(n));
-          const totalScore = nums.length >= 2 ? nums[0] + nums[1] : null;
+        // Capture halftime score when period is HT
+        if (e.period === 'HT' && !tracked.htScore) {
+          tracked.htScore = e.score;
+          console.log(`[live-ht] ${e.title} HALFTIME score: ${e.score}`);
+        }
 
-          if (totalScore != null) {
+        // ── NBA/NHL 1H markets: fire when period changes to Q3/2H/3P (halftime over) ──
+        const oldPeriod = tracked._lastPeriod || '';
+        tracked._lastPeriod = e.period;
+        const htJustEnded = (
+          (oldPeriod === 'HT' && e.period !== 'HT') ||
+          (oldPeriod === 'Q2' && (e.period === 'Q3' || e.period === 'HT')) ||
+          (oldPeriod === '1H' && (e.period === '2H' || e.period === 'HT'))
+        );
+        if (htJustEnded && !tracked._htFired && clobClient) {
+          tracked._htFired = true;
+          const htScore = tracked.htScore || e.score;
+          const htParts = String(htScore).split('-').map(p => parseInt(p.trim())).filter(n => !isNaN(n));
+          if (htParts.length === 2) {
+            const homeHT = htParts[0], awayHT = htParts[1], totalHT = homeHT + awayHT;
+            console.log(`[live-ht] ${e.title} HT ended: ${htScore} (total ${totalHT}) — scanning 1H markets`);
+
             for (const m of (e.markets || [])) {
-              const q = (m.question || '').toLowerCase();
-              // Match O/U markets: "O/U 4.5", "O/U 5.5", "Totals O/U"
-              const ouMatch = q.match(/o\/u\s*([\d.]+)/);
-              if (!ouMatch) continue;
-              const line = parseFloat(ouMatch[1]);
-              const condId = m.conditionId;
-              if (!condId || tracked.ouFired.has(condId)) continue;
+              const q = (m.question || '');
+              const ql = q.toLowerCase();
+              // Only 1H markets
+              if (!ql.includes('1h ') && !ql.includes('1h:')) continue;
+              const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
+              const outcomes = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes;
+              const negRisk = m.negRisk != null ? m.negRisk : true;
+              if (!tokens || tokens.length < 2 || !outcomes) continue;
 
-              // Total already over the line → buy Over
-              if (totalScore > line) {
-                tracked.ouFired.add(condId);
-                const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
-                const outcomes = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes;
-                if (!tokens || tokens.length < 2) continue;
-                // Over is usually index 0
-                const overIdx = outcomes ? outcomes.findIndex(o => o.toLowerCase().includes('over')) : 0;
-                const overToken = tokens[overIdx >= 0 ? overIdx : 0];
-                const overLabel = outcomes ? outcomes[overIdx >= 0 ? overIdx : 0] : 'Over';
-                const negRisk = m.negRisk != null ? m.negRisk : true;
+              let winIdx = -1;
 
-                console.log(`[live-ou] SCORE ${e.score} (total ${totalScore}) > O/U ${line} → BUY ${overLabel} | ${e.title}`);
+              if (ql.includes('moneyline')) {
+                // 1H Moneyline — home won if homeHT > awayHT
+                winIdx = homeHT > awayHT ? 0 : homeHT < awayHT ? 1 : -1;
+              // SKIP spreads — team name matching is too fragile, could buy losing side
+              } else if (ql.includes('o/u')) {
+                // 1H O/U — check total against line
+                const ouMatch = ql.match(/o\/u\s*([\d.]+)/);
+                if (ouMatch) {
+                  const line = parseFloat(ouMatch[1]);
+                  if (totalHT > line) winIdx = outcomes.findIndex(o => o.toLowerCase().includes('over'));
+                  else if (totalHT < line) winIdx = outcomes.findIndex(o => o.toLowerCase().includes('under'));
+                  if (winIdx < 0 && totalHT > line) winIdx = 0;
+                  if (winIdx < 0 && totalHT < line) winIdx = 1;
+                }
+              }
 
-                // Try 99.9¢, if rejected try 99¢, then stop
-                (async () => {
-                  try {
-                    let result;
-                    try {
-                      const signed = await clobClient.createOrder({ tokenID: overToken, price: 0.999, size: 20, side: 'BUY' }, { tickSize: '0.001', negRisk });
-                      result = await clobClient.postOrder(signed, 'GTC');
-                    } catch {
-                      try {
-                        const signed2 = await clobClient.createOrder({ tokenID: overToken, price: 0.99, size: 20, side: 'BUY' }, { tickSize: '0.01', negRisk });
-                        result = await clobClient.postOrder(signed2, 'GTC');
-                      } catch {
-                        const signed3 = await clobClient.createOrder({ tokenID: overToken, price: 0.99, size: 20, side: 'BUY' }, { tickSize: '0.01', negRisk: !negRisk });
-                        result = await clobClient.postOrder(signed3, 'GTC');
-                      }
-                    }
-                    console.log(`[live-ou] ${e.title?.slice(0,25)} | O/U ${line} | ${overLabel} 20sh → ${result?.status}`);
-                    liveEventTracker.log.unshift({ ts: Date.now(), event: e.title, score: e.score, market: `O/U ${line}`, side: overLabel, price: '99.9¢', status: result?.status });
-                    if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
-                  } catch (err) {
-                    console.error(`[live-ou] Error O/U ${line}:`, err.message?.slice(0, 60));
-                  }
-                })();
+              if (winIdx < 0) continue;
+              const winToken = tokens[winIdx];
+              const winLabel = outcomes[winIdx];
+
+              // Price check: both sides, sum <= 103¢
+              try {
+                const [r0, r1] = await Promise.all([
+                  fetch('https://clob.polymarket.com/price?token_id=' + tokens[0] + '&side=sell'),
+                  fetch('https://clob.polymarket.com/price?token_id=' + tokens[1] + '&side=sell'),
+                ]);
+                const d0 = await r0.json(), d1 = await r1.json();
+                const a0 = d0?.price ? parseFloat(d0.price) : null;
+                const a1 = d1?.price ? parseFloat(d1.price) : null;
+                if (a0 == null || a1 == null) { console.log(`[live-ht] SKIP ${q.slice(0,40)}: no price`); continue; }
+                if (a0 + a1 > 1.03) { console.log(`[live-ht] SKIP ${q.slice(0,40)}: ${(a0*100).toFixed(0)}+${(a1*100).toFixed(0)}=${((a0+a1)*100).toFixed(0)}¢ > 103`); continue; }
+              } catch { continue; }
+
+              console.log(`[live-ht] ${e.title.slice(0,25)} | ${q.slice(0,40)} → BUY ${winLabel}`);
+              try {
+                const result = await placeLive99Order(winToken, 10, negRisk, `[live-ht] ${winLabel} on ${q.slice(0,30)} 10sh`);
+                liveEventTracker.log.unshift({ ts: Date.now(), event: e.title, score: htScore, market: q.slice(0, 50), side: winLabel, price: '99.9¢', status: result?.status });
+                if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
+              } catch (err) {
+                console.error(`[live-ht] Error ${q.slice(0,30)}:`, err.message?.slice(0, 60));
+              }
+            }
+          }
+        }
+
+        // ── Game Total O/U: when score crosses line, Over is guaranteed ──
+        // STRICT: only "Team vs Team: O/U X.5" — NO player props, NO halves, NO quarters
+        const ouParts = String(e.score || '').split(/[-]/).map(p => parseInt(p.trim())).filter(n => !isNaN(n));
+        const ouTotal = ouParts.length >= 2 ? ouParts[0] + ouParts[1] : null;
+        if (e.score && !String(e.score).includes('|') && ouTotal != null && ouTotal > 0 && clobClient) {
+          for (const m of (e.markets || [])) {
+            const q = (m.question || '');
+            const ql = q.toLowerCase();
+            if (!ql.includes('o/u')) continue;
+            // SKIP player props and per-period
+            if (ql.includes('points') || ql.includes('rebounds') || ql.includes('assists')) continue;
+            if (ql.includes('kills') || ql.includes('map ') || ql.includes('game ')) continue;
+            if (ql.includes('total set') || ql.includes('total games')) continue;
+            if (ql.includes('1h ') || ql.includes('2h ')) continue;
+            if (ql.includes('set ')) continue;
+            const ouMatch = ql.match(/o\/u\s*([\d.]+)/);
+            if (!ouMatch) continue;
+            const line = parseFloat(ouMatch[1]);
+            if (line < 3.5) continue;
+            const condId = m.conditionId;
+            if (!tracked.ouFired) tracked.ouFired = new Set();
+            if (!condId || tracked.ouFired.has(condId)) continue;
+
+            if (ouTotal > line) {
+              tracked.ouFired.add(condId);
+              const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
+              const outcomes = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes;
+              if (!tokens || tokens.length < 2) continue;
+              const overIdx = outcomes ? outcomes.findIndex(o => o.toLowerCase().includes('over')) : 0;
+              const overToken = tokens[overIdx >= 0 ? overIdx : 0];
+              const overLabel = outcomes ? outcomes[overIdx >= 0 ? overIdx : 0] : 'Over';
+              const negRisk = m.negRisk != null ? m.negRisk : true;
+
+              // Price check: both sides sum <= 103¢
+              try {
+                const [r0, r1] = await Promise.all([
+                  fetch('https://clob.polymarket.com/price?token_id=' + tokens[0] + '&side=sell'),
+                  fetch('https://clob.polymarket.com/price?token_id=' + tokens[1] + '&side=sell'),
+                ]);
+                const d0 = await r0.json(), d1 = await r1.json();
+                const a0 = d0?.price ? parseFloat(d0.price) : null;
+                const a1 = d1?.price ? parseFloat(d1.price) : null;
+                if (a0 == null || a1 == null) { console.log(`[live-ou] SKIP O/U ${line}: no price | ${e.title}`); continue; }
+                if (a0 + a1 > 1.03) { console.log(`[live-ou] SKIP O/U ${line}: ${(a0*100).toFixed(0)}+${(a1*100).toFixed(0)}=${((a0+a1)*100).toFixed(0)}¢ > 103 | ${e.title}`); continue; }
+              } catch { continue; }
+
+              console.log(`[live-ou] SCORE ${e.score} (total ${ouTotal}) > O/U ${line} → BUY ${overLabel} | ${e.title}`);
+              try {
+                const result = await placeLive99Order(overToken, 10, negRisk, `[live-ou] ${overLabel} O/U ${line} 10sh`);
+                liveEventTracker.log.unshift({ ts: Date.now(), event: e.title, score: e.score, market: `O/U ${line}`, side: overLabel, price: '99.9¢', status: result?.status });
+                if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
+              } catch (err) {
+                console.error(`[live-ou] Error O/U ${line}:`, err.message?.slice(0, 60));
               }
             }
           }
         }
       }
+    }
+
+    // ── Tennis: guaranteed bets based on set/game math ──
+    for (const [slug, data] of liveEventTracker.knownLive) {
+      if (!data.score || !String(data.score).includes(',')) continue; // tennis has commas in score
+      if (!data.markets?.length || !clobClient) continue;
+      if (!data._tennisFired) data._tennisFired = new Set();
+
+      const scoreStr = String(data.score);
+      // Parse "1-6, 6-3, 0-1" → sets = [[1,6],[6,3],[0,1]]
+      const sets = scoreStr.split(',').map(s => {
+        // Handle tiebreak: "7-6(7-4)" → [7,6]
+        const clean = s.replace(/\(.*\)/, '').trim();
+        const parts = clean.split('-').map(n => parseInt(n.trim()));
+        return parts.length === 2 && !isNaN(parts[0]) && !isNaN(parts[1]) ? parts : null;
+      }).filter(Boolean);
+
+      if (sets.length === 0) continue;
+
+      // Count completed sets (a set is complete if either side has 6+ and leads by 2, or 7-6)
+      const completedSets = [];
+      let currentSet = null;
+      for (const [a, b] of sets) {
+        const isComplete = (a >= 6 || b >= 6) && (Math.abs(a - b) >= 2 || (a === 7 && b === 6) || (a === 6 && b === 7));
+        if (isComplete) completedSets.push([a, b]);
+        else currentSet = [a, b];
+      }
+
+      // Total completed games
+      const completedGames = completedSets.reduce((sum, [a, b]) => sum + a + b, 0);
+      const currentSetGames = currentSet ? currentSet[0] + currentSet[1] : 0;
+
+      // Minimum remaining games in current set
+      let minRemainingInSet = 0;
+      if (currentSet) {
+        const [a, b] = currentSet;
+        const leader = Math.max(a, b);
+        minRemainingInSet = Math.max(0, 6 - leader);
+        // If both at 5+, need at least 2 more (to get to 7-5 or tiebreak)
+        if (a >= 5 && b >= 5) minRemainingInSet = Math.max(minRemainingInSet, 2);
+      }
+
+      const minTotalGames = completedGames + currentSetGames + minRemainingInSet;
+      const totalSetsPlayed = sets.length;
+
+      // Sets won by each side (player 1 = top, player 2 = bottom)
+      let p1SetsWon = 0, p2SetsWon = 0;
+      for (const [a, b] of completedSets) {
+        if (a > b) p1SetsWon++; else p2SetsWon++;
+      }
+
+      // Set 1 data
+      const set1 = sets.length >= 1 ? sets[0] : null;
+      const set1Complete = set1 && completedSets.length >= 1;
+      const set1Games = set1 ? set1[0] + set1[1] : 0;
+
+      for (const m of data.markets) {
+        const q = m.question || '';
+        const ql = q.toLowerCase();
+        const condId = m.conditionId;
+        if (!condId || data._tennisFired.has(condId)) continue;
+
+        const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
+        const outcomes = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes;
+        if (!tokens || tokens.length < 2 || !outcomes) continue;
+        const negRisk = m.negRisk != null ? m.negRisk : true;
+
+        let winIdx = -1;
+
+        // Total Sets O/U 2.5 — if in 3rd set or later, Over is guaranteed
+        if (ql.includes('total sets') && ql.includes('o/u') && ql.includes('2.5')) {
+          if (totalSetsPlayed >= 3) {
+            winIdx = outcomes.findIndex(o => o.toLowerCase().includes('over'));
+            if (winIdx < 0) winIdx = 0;
+          }
+        }
+        // Set 1 Winner — decided once set 1 is complete
+        else if (ql.includes('set 1 winner') || (ql.includes('set 1') && !ql.includes('o/u') && !ql.includes('game'))) {
+          // skip — hard to map player names to outcome indices reliably
+        }
+        // Set 1 Games O/U — decided once set 1 complete
+        else if (ql.includes('set 1') && ql.includes('o/u') && set1Complete) {
+          const ouMatch = ql.match(/o\/u\s*([\d.]+)/);
+          if (ouMatch) {
+            const line = parseFloat(ouMatch[1]);
+            if (set1Games > line) {
+              winIdx = outcomes.findIndex(o => o.toLowerCase().includes('over'));
+              if (winIdx < 0) winIdx = 0;
+            } else if (set1Games < line) {
+              winIdx = outcomes.findIndex(o => o.toLowerCase().includes('under'));
+              if (winIdx < 0) winIdx = 1;
+            }
+          }
+        }
+        // Match O/U total games — use minimum guaranteed total
+        else if (ql.includes('match') && ql.includes('o/u')) {
+          const ouMatch = ql.match(/o\/u\s*([\d.]+)/);
+          if (ouMatch) {
+            const line = parseFloat(ouMatch[1]);
+            if (minTotalGames > line) {
+              winIdx = outcomes.findIndex(o => o.toLowerCase().includes('over'));
+              if (winIdx < 0) winIdx = 0;
+            }
+          }
+        }
+
+        if (winIdx < 0) continue;
+        data._tennisFired.add(condId);
+
+        const winToken = tokens[winIdx];
+        const winLabel = outcomes[winIdx];
+
+        // Price check: both sides sum <= 103¢
+        try {
+          const [r0, r1] = await Promise.all([
+            fetch('https://clob.polymarket.com/price?token_id=' + tokens[0] + '&side=sell'),
+            fetch('https://clob.polymarket.com/price?token_id=' + tokens[1] + '&side=sell'),
+          ]);
+          const d0 = await r0.json(), d1 = await r1.json();
+          const a0 = d0?.price ? parseFloat(d0.price) : null;
+          const a1 = d1?.price ? parseFloat(d1.price) : null;
+          if (a0 == null || a1 == null) { data._tennisFired.delete(condId); continue; }
+          if (a0 + a1 > 1.03) {
+            console.log(`[tennis] SKIP ${q.slice(0,40)}: ${(a0*100).toFixed(0)}+${(a1*100).toFixed(0)}=${((a0+a1)*100).toFixed(0)}¢ > 103`);
+            data._tennisFired.delete(condId);
+            continue;
+          }
+        } catch { data._tennisFired.delete(condId); continue; }
+
+        console.log(`[tennis] ${data.title.slice(0,30)} | ${q.slice(0,40)} → ${winLabel} (minGames=${minTotalGames}, sets=${totalSetsPlayed})`);
+        try {
+          const result = await placeLive99Order(winToken, 10, negRisk, `[tennis] ${winLabel} on ${q.slice(0,30)} 10sh`);
+          liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: q.slice(0, 50), side: winLabel, price: '99.9¢', status: result?.status });
+          if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
+        } catch (err) {
+          console.error(`[tennis] Error ${q.slice(0,30)}:`, err.message?.slice(0, 60));
+        }
+      }
+    }
+
+    // ── Esports BO3/BO5: Games Total O/U when series score guarantees more games ──
+    for (const [slug, data] of liveEventTracker.knownLive) {
+      if (!data.score || !String(data.score).includes('|') || !String(data.score).includes('Bo')) continue;
+      if (!data.markets?.length || !clobClient) continue;
+      if (!data._esportsFired) data._esportsFired = new Set();
+
+      const scoreParts = String(data.score).split('|');
+      const seriesStr = scoreParts.length >= 2 ? scoreParts[1].trim() : '';
+      const boStr = scoreParts.find(p => p.trim().startsWith('Bo')) || '';
+      const boMatch = boStr.match(/Bo(\d+)/);
+      if (!boMatch) continue;
+      const bestOf = parseInt(boMatch[1]);
+      const seriesParts = seriesStr.split('-').map(n => parseInt(n.trim())).filter(n => !isNaN(n));
+      if (seriesParts.length !== 2) continue;
+
+      const [s1, s2] = seriesParts;
+      const totalGamesPlayed = s1 + s2;
+      const winsNeeded = Math.ceil(bestOf / 2); // BO3=2, BO5=3
+
+      for (const m of data.markets) {
+        const ql = (m.question || '').toLowerCase();
+        if (!ql.includes('games total') || !ql.includes('o/u')) continue;
+        const condId = m.conditionId;
+        if (!condId || data._esportsFired.has(condId)) continue;
+
+        const ouMatch = ql.match(/o\/u\s*([\d.]+)/);
+        if (!ouMatch) continue;
+        const line = parseFloat(ouMatch[1]);
+
+        // Minimum total games: current + minimum remaining
+        // If neither team has won yet, min remaining = winsNeeded - max(s1,s2)
+        // But for O/U Over, we need totalGamesPlayed + minRemaining > line
+        // If s1 == s2 (tied), there MUST be at least 1 more game
+        // Min remaining = winsNeeded - Math.max(s1, s2)
+        const minRemaining = Math.max(0, winsNeeded - Math.max(s1, s2));
+        const minTotalGames = totalGamesPlayed + minRemaining;
+
+        const seriesOver = s1 >= winsNeeded || s2 >= winsNeeded;
+        const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
+        const outcomes = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes;
+        if (!tokens || tokens.length < 2) continue;
+        const negRisk = m.negRisk != null ? m.negRisk : true;
+
+        let winIdx = -1, winLabel = '';
+        // Over: minimum total games already exceeds line
+        if (minTotalGames > line) {
+          winIdx = outcomes ? outcomes.findIndex(o => o.toLowerCase().includes('over')) : 0;
+          if (winIdx < 0) winIdx = 0;
+          winLabel = outcomes?.[winIdx] || 'Over';
+        }
+        // Under: series is over and total maps played is below line
+        else if (seriesOver && totalGamesPlayed < line) {
+          winIdx = outcomes ? outcomes.findIndex(o => o.toLowerCase().includes('under')) : 1;
+          if (winIdx < 0) winIdx = 1;
+          winLabel = outcomes?.[winIdx] || 'Under';
+        }
+
+        if (winIdx < 0) continue;
+        data._esportsFired.add(condId);
+        const winToken = tokens[winIdx];
+
+        // No price check — mathematically verified from series score, just place limit
+        console.log(`[esports] ${data.title.slice(0,30)} ${s1}-${s2} Bo${bestOf} → O/U ${line} ${winLabel} (${totalGamesPlayed} maps, min ${minTotalGames})`);
+        try {
+          const result = await placeLive99Order(winToken, 10, negRisk, `[esports] ${winLabel} O/U ${line} 10sh`);
+          liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: `Games O/U ${line} ${winLabel}`, side: winLabel, price: '99.9¢', status: result?.status });
+          if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
+        } catch (err) {
+          console.error(`[esports] Error O/U ${line} ${winLabel}:`, err.message?.slice(0, 60));
+        }
+
+        // ── Map/Game Winners: buy winner on completed maps ──
+        // Series score s1+s2 = total maps played. Maps 1..N are decided.
+        const mapsPlayed = s1 + s2;
+        for (const m of data.markets) {
+          const q = m.question || '';
+          const ql = q.toLowerCase();
+          // Match "Map X Winner" or "Game X Winner"
+          const mapMatch = ql.match(/(?:map|game)\s*(\d+)\s*winner/);
+          if (!mapMatch) continue;
+          const mapNum = parseInt(mapMatch[1]);
+          if (mapNum > mapsPlayed) continue; // map not finished yet
+
+          const condId = m.conditionId;
+          if (!condId || data._esportsFired.has(condId)) continue;
+
+          // Use Gamma prices to determine winner
+          const prices = m.outcomePrices ? (typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices) : null;
+          const tokens = m.clobTokenIds ? (typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds) : null;
+          const outcomes = m.outcomes ? (typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes) : null;
+          if (!prices || !tokens || prices.length < 2 || !outcomes) continue;
+
+          const p0 = parseFloat(prices[0]), p1 = parseFloat(prices[1]);
+          if (Math.max(p0, p1) < 0.90) continue; // not clear enough
+          const winIdx = p0 >= p1 ? 0 : 1;
+          const winToken = tokens[winIdx];
+          const winLabel = outcomes[winIdx];
+          const negRisk = m.negRisk != null ? m.negRisk : true;
+
+          data._esportsFired.add(condId);
+
+          // No CLOB price check — map is completed, Gamma confirms winner, just place limit
+          console.log(`[esports] ${data.title.slice(0,30)} Map ${mapNum} Winner → ${winLabel} (Gamma ${(Math.max(p0,p1)*100).toFixed(0)}%)`);
+          try {
+            const result = await placeLive99Order(winToken, 10, negRisk, `[esports] ${winLabel} Map ${mapNum} 10sh`);
+            liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: `Map ${mapNum} Winner`, side: winLabel, price: '99.9¢', status: result?.status });
+            if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
+          } catch (err) {
+            console.error(`[esports] Error Map ${mapNum}:`, err.message?.slice(0, 60));
+          }
+        }
+
+        // ── Esports Map Handicap: if series lead >= handicap, it's guaranteed ──
+        // e.g., 2-0 in BO3 → Team (-1.5) is guaranteed (lead of 2 > 1.5)
+        for (const m of data.markets) {
+          const q = m.question || '';
+          const ql = q.toLowerCase();
+          if (!ql.includes('handicap')) continue;
+          const condId = m.conditionId;
+          if (!condId || data._esportsFired.has(condId)) continue;
+
+          const hcMatch = ql.match(/\(([+-]?\d+\.?\d*)\)/);
+          if (!hcMatch) continue;
+          const spread = parseFloat(hcMatch[1]); // e.g., -1.5
+          if (spread >= 0) continue; // only negative handicaps (the favored side)
+
+          const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
+          const outcomes = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes;
+          if (!tokens || tokens.length < 2 || !outcomes) continue;
+
+          // Figure out which team has the handicap — outcomes[0] is the handicap team
+          // Check if that team's series lead covers the spread
+          // outcomes[0] is listed first in the handicap market title
+          const lead1 = s1 - s2; // team1 lead
+          const lead2 = s2 - s1; // team2 lead
+          // The handicap team needs: their actual lead + spread > 0
+          // We check with Gamma prices since we can't reliably map team names
+          const prices = m.outcomePrices ? (typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices) : null;
+          if (!prices) continue;
+          const p0 = parseFloat(prices[0]), p1 = parseFloat(prices[1]);
+          if (Math.max(p0, p1) < 0.90) continue; // not clear enough
+          const winIdx = p0 >= p1 ? 0 : 1;
+          const winToken = tokens[winIdx];
+          const winLabel = outcomes[winIdx];
+          const negRisk = m.negRisk != null ? m.negRisk : true;
+
+          // Verify: the actual lead must mathematically cover the spread
+          // If it's BO3 and score is 2-0, lead=2, spread=-1.5 → 2+(-1.5)=0.5 > 0 → covered
+          const maxLead = Math.max(lead1, lead2);
+          if (maxLead + spread <= 0) continue; // spread not covered yet
+
+          data._esportsFired.add(condId);
+
+          // Price check
+          try {
+            const [r0, r1] = await Promise.all([
+              fetch('https://clob.polymarket.com/price?token_id=' + tokens[0] + '&side=sell'),
+              fetch('https://clob.polymarket.com/price?token_id=' + tokens[1] + '&side=sell'),
+            ]);
+            const d0 = await r0.json(), d1 = await r1.json();
+            const a0 = d0?.price ? parseFloat(d0.price) : null;
+            const a1 = d1?.price ? parseFloat(d1.price) : null;
+            if (a0 == null || a1 == null) { data._esportsFired.delete(condId); continue; }
+            if (a0 + a1 > 1.03) { data._esportsFired.delete(condId); continue; }
+          } catch { data._esportsFired.delete(condId); continue; }
+
+          console.log(`[esports] ${data.title.slice(0,30)} ${s1}-${s2} Handicap ${spread} → ${winLabel}`);
+          try {
+            const result = await placeLive99Order(winToken, 10, negRisk, `[esports] ${winLabel} HC ${spread} 10sh`);
+            liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: q.slice(0, 50), side: winLabel, price: '99.9¢', status: result?.status });
+            if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
+          } catch (err) {
+            console.error(`[esports] Error HC ${spread}:`, err.message?.slice(0, 60));
+          }
+        }
+      }
+    }
+
+    // ── Soccer: "Both Teams to Score: Yes" when both teams have scored ──
+    for (const [slug, data] of liveEventTracker.knownLive) {
+      if (!data.score || String(data.score).includes('|') || String(data.score).includes(',')) continue;
+      const parts = String(data.score).split('-').map(p => parseInt(p.trim())).filter(n => !isNaN(n));
+      if (parts.length !== 2) continue;
+      const [home, away] = parts;
+      if (home === 0 || away === 0) continue; // both must have scored
+      if (!data._bttsFired) data._bttsFired = false;
+      if (data._bttsFired) continue;
+
+      for (const m of (data.markets || [])) {
+        const ql = (m.question || '').toLowerCase();
+        if (!ql.includes('both teams') || !ql.includes('score')) continue;
+        const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
+        const outcomes = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes;
+        if (!tokens || tokens.length < 2 || !outcomes) continue;
+
+        // "Yes" = both teams scored = guaranteed
+        const yesIdx = outcomes.findIndex(o => o.toLowerCase() === 'yes');
+        if (yesIdx < 0) continue;
+        const yesToken = tokens[yesIdx];
+        const negRisk = m.negRisk != null ? m.negRisk : true;
+
+        // Price check
+        try {
+          const [r0, r1] = await Promise.all([
+            fetch('https://clob.polymarket.com/price?token_id=' + tokens[0] + '&side=sell'),
+            fetch('https://clob.polymarket.com/price?token_id=' + tokens[1] + '&side=sell'),
+          ]);
+          const d0 = await r0.json(), d1 = await r1.json();
+          const a0 = d0?.price ? parseFloat(d0.price) : null;
+          const a1 = d1?.price ? parseFloat(d1.price) : null;
+          if (a0 == null || a1 == null) continue;
+          if (a0 + a1 > 1.03) continue;
+        } catch { continue; }
+
+        data._bttsFired = true;
+        console.log(`[soccer] ${data.title.slice(0,30)} ${data.score} → Both Teams to Score: YES`);
+        try {
+          const result = await placeLive99Order(yesToken, 10, negRisk, `[soccer] BTTS Yes 10sh`);
+          liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: 'Both Teams to Score', side: 'Yes', price: '99.9¢', status: result?.status });
+          if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
+        } catch (err) {
+          console.error(`[soccer] BTTS error:`, err.message?.slice(0, 60));
+        }
+        break;
+      }
+    }
+
+    // ── MLB: "Run in first inning: Yes" when score > 0 in 1st inning ──
+    for (const [slug, data] of liveEventTracker.knownLive) {
+      if (!data.score || String(data.score).includes('|') || String(data.score).includes(',')) continue;
+      const period = (data.period || '').toLowerCase();
+      if (!period.includes('1st')) continue; // must still be in 1st inning
+      const parts = String(data.score).split('-').map(p => parseInt(p.trim())).filter(n => !isNaN(n));
+      if (parts.length !== 2 || parts[0] + parts[1] === 0) continue;
+      if (!data._firstInningFired) data._firstInningFired = false;
+      if (data._firstInningFired) continue;
+
+      for (const m of (data.markets || [])) {
+        const ql = (m.question || '').toLowerCase();
+        if (!ql.includes('run') || !ql.includes('first inning')) continue;
+        const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
+        const outcomes = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes;
+        if (!tokens || tokens.length < 2 || !outcomes) continue;
+
+        const yesIdx = outcomes.findIndex(o => o.toLowerCase().includes('yes') || o.toLowerCase().includes('run'));
+        if (yesIdx < 0) continue;
+        const yesToken = tokens[yesIdx];
+        const negRisk = m.negRisk != null ? m.negRisk : true;
+
+        // Price check
+        try {
+          const [r0, r1] = await Promise.all([
+            fetch('https://clob.polymarket.com/price?token_id=' + tokens[0] + '&side=sell'),
+            fetch('https://clob.polymarket.com/price?token_id=' + tokens[1] + '&side=sell'),
+          ]);
+          const d0 = await r0.json(), d1 = await r1.json();
+          const a0 = d0?.price ? parseFloat(d0.price) : null;
+          const a1 = d1?.price ? parseFloat(d1.price) : null;
+          if (a0 == null || a1 == null) continue;
+          if (a0 + a1 > 1.03) continue;
+        } catch { continue; }
+
+        data._firstInningFired = true;
+        console.log(`[mlb] ${data.title.slice(0,30)} ${data.score} in ${data.period} → First inning run: YES`);
+        try {
+          const result = await placeLive99Order(yesToken, 10, negRisk, `[mlb] 1st inning run Yes 10sh`);
+          liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: 'First inning run', side: 'Yes', price: '99.9¢', status: result?.status });
+          if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
+        } catch (err) {
+          console.error(`[mlb] 1st inning error:`, err.message?.slice(0, 60));
+        }
+        break;
+      }
+    }
+
+    // ── Exact Score: check ALL tracked soccer games on every poll ──
+    for (const [slug, data] of liveEventTracker.knownLive) {
+      if (!data.score || String(data.score).includes('|')) continue; // skip esports
+      const scoreParts = String(data.score).split('-').map(p => parseInt(p.trim())).filter(n => !isNaN(n));
+      if (scoreParts.length !== 2 || scoreParts[0] + scoreParts[1] === 0) continue; // skip 0-0
+      if (!data.exactScoreFired) data.exactScoreFired = new Set();
+      checkExactScores(slug, data.title, data.score, data.exactScoreFired);
     }
 
     // Check for events that WERE live but are NO LONGER in the live list
@@ -5910,20 +6811,29 @@ setInterval(async () => {
           continue;
         }
 
-        // Verify price from CLOB book before placing
+        // Verify BOTH sides from CLOB — sum must be <= 103¢
         try {
-          const bookRes = await fetch('https://clob.polymarket.com/price?token_id=' + winToken + '&side=sell');
-          const bookData = await bookRes.json();
-          const clobAsk = bookData?.price ? parseFloat(bookData.price) : null;
-          if (clobAsk != null && clobAsk < 0.90) {
-            console.log(`[live-99] SKIP ${m.question?.slice(0,30)}: CLOB ask=${(clobAsk*100).toFixed(0)}¢ too low`);
+          const [r0, r1] = await Promise.all([
+            fetch('https://clob.polymarket.com/price?token_id=' + tokens[0] + '&side=sell'),
+            fetch('https://clob.polymarket.com/price?token_id=' + tokens[1] + '&side=sell'),
+          ]);
+          const d0 = await r0.json(), d1 = await r1.json();
+          const a0 = d0?.price ? parseFloat(d0.price) : null;
+          const a1 = d1?.price ? parseFloat(d1.price) : null;
+          if (a0 == null || a1 == null) {
+            console.log(`[live-99] SKIP ${m.question?.slice(0,30)}: no price data`);
             continue;
           }
-        } catch {}
+          if (a0 + a1 > 1.03) {
+            console.log(`[live-99] SKIP ${m.question?.slice(0,30)}: ${(a0*100).toFixed(0)}+${(a1*100).toFixed(0)}=${((a0+a1)*100).toFixed(0)}¢ > 103`);
+            continue;
+          }
+          // Trust Gamma — place limit regardless of current ask
+        } catch { continue; }
 
         // Try 99.9¢ first (0.001 tick), fall back to 99¢ (0.01 tick)
         const negRisk = m.negRisk != null ? m.negRisk : true;
-        const orderSize = 20; // 20 shares per market
+        const orderSize = 10; // 10 shares per market
 
         try {
           let result = null;
@@ -5934,19 +6844,11 @@ setInterval(async () => {
             );
             result = await clobClient.postOrder(signed, 'GTC');
           } catch {
-            try {
-              const signed2 = await clobClient.createOrder(
-                { tokenID: winToken, price: 0.99, size: orderSize, side: 'BUY' },
-                { tickSize: '0.01', negRisk },
-              );
-              result = await clobClient.postOrder(signed2, 'GTC');
-            } catch {
-              const signed3 = await clobClient.createOrder(
-                { tokenID: winToken, price: 0.99, size: orderSize, side: 'BUY' },
-                { tickSize: '0.01', negRisk: !negRisk },
-              );
-              result = await clobClient.postOrder(signed3, 'GTC');
-            }
+            const signed2 = await clobClient.createOrder(
+              { tokenID: winToken, price: 0.99, size: orderSize, side: 'BUY' },
+              { tickSize: '0.01', negRisk },
+            );
+            result = await clobClient.postOrder(signed2, 'GTC');
           }
           placed++;
           const logEntry = {
@@ -5967,6 +6869,11 @@ setInterval(async () => {
         }
       }
       console.log(`[live-99] ${data.title}: placed ${placed} orders across ${freshMarkets.length} markets`);
+
+      // Also buy on exact score event if it's a soccer game
+      if (data.score && !String(data.score).includes('|')) {
+        await buyExactScoreOnEnd(slug, data.title, data.score);
+      }
     }
 
     // Clean up old fired slugs (keep last 200)
@@ -5974,6 +6881,9 @@ setInterval(async () => {
       const arr = [...liveEventTracker.fired];
       liveEventTracker.fired = new Set(arr.slice(-100));
     }
+
+    // Persist to disk every poll
+    saveLiveEvents(liveEventTracker.knownLive, liveEventTracker.fired);
   } catch (e) {
     // silent — don't spam logs on API errors
   }
@@ -5992,14 +6902,22 @@ app.get('/api/decided99/status', (req, res) => {
   res.json({ enabled: decidedScanner.enabled, placed: decidedScanner.placed.size, log: decidedScanner.log.slice(0, 20) });
 });
 
-// Scan every 10s for decided markets
+// Scan every 10s for decided markets + markets ending within 2 days
 setInterval(async () => {
   if (!decidedScanner.enabled || !clobClient) return;
 
   try {
-    const r = await fetch('https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=200&order=volume&ascending=false');
-    const markets = await r.json();
-    if (!Array.isArray(markets)) return;
+    const twoDays = new Date(Date.now() + 2 * 86400000).toISOString().slice(0, 10);
+    const today = new Date().toISOString().slice(0, 10);
+    const [decidedRes, endingSoonRes, recentRes] = await Promise.all([
+      fetch('https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=200&order=volume&ascending=false').then(r => r.json()).catch(() => []),
+      fetch(`https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=200&end_date_min=${today}T00:00:00Z&end_date_max=${twoDays}T23:59:59Z`).then(r => r.json()).catch(() => []),
+      fetch('https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=200&order=endDate&ascending=true').then(r => r.json()).catch(() => []),
+    ]);
+    const allMarkets = [...(Array.isArray(decidedRes) ? decidedRes : []), ...(Array.isArray(endingSoonRes) ? endingSoonRes : []), ...(Array.isArray(recentRes) ? recentRes : [])];
+    // Dedupe by conditionId
+    const seen = new Set();
+    const markets = allMarkets.filter(m => { if (!m.conditionId || seen.has(m.conditionId)) return false; seen.add(m.conditionId); return true; });
 
     for (const m of markets) {
       const condId = m.conditionId;
@@ -6018,9 +6936,43 @@ setInterval(async () => {
       // Bid when winner hits 99.9%
       if (winPrice < 0.999 || losePrice > 0.05) continue;
 
+      // Skip Yes/No markets where "No" is winning — these are multi-choice garbage
+      // (e.g. "Will Jalen Duren lead rebounds?" No @ 99.9% — meaningless)
+      const winIdx2 = p0 >= p1 ? 0 : 1;
+      const outcomes2 = m.outcomes ? (typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes) : null;
+      if (outcomes2 && outcomes2.length === 2) {
+        const winOutcome = (outcomes2[winIdx2] || '').toLowerCase();
+        if (winOutcome === 'no') continue; // "No" winning = multi-choice, skip
+      }
+
       // Skip crypto up/down
       const q = (m.question || '').toLowerCase();
       if (q.includes('up or down') || q.includes('updown')) continue;
+
+      // Only bid on markets that opened/started/end within 24h
+      const endTime = m.endDate ? new Date(m.endDate).getTime() : 0;
+      const startTime = m.startDate ? new Date(m.startDate).getTime() : 0;
+      const createdTime = m.createdAt ? new Date(m.createdAt).getTime() : 0;
+      const now = Date.now();
+      const endsWithin24h = endTime > now && endTime < now + 24 * 3600000;
+      const startedWithin24h = startTime > now - 24 * 3600000;
+      const createdWithin24h = createdTime > now - 24 * 3600000;
+      // Must end within 24h OR be a live sport (started within 24h)
+      if (!endsWithin24h && !startedWithin24h) continue;
+      // Skip ended markets
+      if (endTime < now && !startedWithin24h) continue;
+
+      // Verify CLOB ask > 97¢ before placing
+      try {
+        const winToken2 = tokens[p0 >= p1 ? 0 : 1];
+        if (winToken2) {
+          const pr = await fetch('https://clob.polymarket.com/price?token_id=' + winToken2 + '&side=sell');
+          const pd = await pr.json();
+          const ask = pd?.price ? parseFloat(pd.price) : null;
+          if (ask != null && ask < 0.97) continue;
+        }
+      } catch {}
+      await new Promise(r => setTimeout(r, 100));
 
       const winIdx = p0 >= p1 ? 0 : 1;
       const winToken = tokens[winIdx];
@@ -6034,20 +6986,20 @@ setInterval(async () => {
         let result = null;
         try {
           const signed = await clobClient.createOrder(
-            { tokenID: winToken, price: 0.999, size: 5, side: 'BUY' },
+            { tokenID: winToken, price: 0.999, size: 10, side: 'BUY' },
             { tickSize: '0.001', negRisk },
           );
           result = await clobClient.postOrder(signed, 'GTC');
         } catch {
           try {
             const signed2 = await clobClient.createOrder(
-              { tokenID: winToken, price: 0.99, size: 5, side: 'BUY' },
+              { tokenID: winToken, price: 0.99, size: 10, side: 'BUY' },
               { tickSize: '0.01', negRisk },
             );
             result = await clobClient.postOrder(signed2, 'GTC');
           } catch {
             const signed3 = await clobClient.createOrder(
-              { tokenID: winToken, price: 0.99, size: 5, side: 'BUY' },
+              { tokenID: winToken, price: 0.99, size: 10, side: 'BUY' },
               { tickSize: '0.01', negRisk: false },
             );
             result = await clobClient.postOrder(signed3, 'GTC');
@@ -6074,20 +7026,20 @@ async function place99x5(tokenId, negRisk) {
       let result = null;
       try {
         const signed = await clobClient.createOrder(
-          { tokenID: tokenId, price: 0.999, size: 5, side: 'BUY' },
+          { tokenID: tokenId, price: 0.999, size: 10, side: 'BUY' },
           { tickSize: '0.001', negRisk },
         );
         result = await clobClient.postOrder(signed, 'GTC');
       } catch {
         try {
           const signed2 = await clobClient.createOrder(
-            { tokenID: tokenId, price: 0.99, size: 5, side: 'BUY' },
+            { tokenID: tokenId, price: 0.99, size: 10, side: 'BUY' },
             { tickSize: '0.01', negRisk },
           );
           result = await clobClient.postOrder(signed2, 'GTC');
         } catch {
           const signed3 = await clobClient.createOrder(
-            { tokenID: tokenId, price: 0.99, size: 5, side: 'BUY' },
+            { tokenID: tokenId, price: 0.99, size: 10, side: 'BUY' },
             { tickSize: '0.01', negRisk: !negRisk },
           );
           result = await clobClient.postOrder(signed3, 'GTC');
@@ -8039,6 +8991,11 @@ server.listen(PORT, async () => {
   scheduleNextEvent();
   scheduleEthEvent();
   schedule5mEvent();
+  for (const coin of EXTRA_5M_COINS) {
+    await refreshExtra5mEvent(coin);
+    await new Promise(r => setTimeout(r, 300));
+  }
+  scheduleExtra5m();
   const splitReady = !!FUNDER_ADDRESS && !!process.env.PRIVATE_KEY;
   const scriptExists = fs.existsSync(SPLIT_SCRIPT);
   console.log(`[SPLIT] autoSplit=${autoSplit.enabled ? 'ON' : 'OFF'}, amount=$${autoSplit.amount}, ready=${splitReady}, script=${scriptExists}`);

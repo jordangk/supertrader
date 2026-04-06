@@ -15,11 +15,17 @@ import { defaultAbiCoder } from '@ethersproject/abi';
 const POLYGON_RPC = `https://polygon-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_KEY || '8kruQGYamUT6J4Ib0aMfw'}`;
 const CONDITIONAL_TOKENS = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
 const USDC = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+const WCOL = '0x3A3BD7bb9528E159577F7C2e685CC81A765002E2'; // Wrapped collateral for negRisk
 const ZERO_ADDR = '0x0000000000000000000000000000000000000000';
 const ZERO_BYTES32 = '0x0000000000000000000000000000000000000000000000000000000000000000';
 
 const CTF_IFACE = new Interface([
   'function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint[] indexSets)',
+]);
+
+const WCOL_IFACE = new Interface([
+  'function unwrap(address to, uint256 amount)',
+  'function balanceOf(address) view returns (uint256)',
 ]);
 
 const SAFE_ABI = [
@@ -75,6 +81,8 @@ async function execViaSafe(to, data) {
 /**
  * Check and redeem resolved positions
  */
+const redeemedSet = new Set(); // track already-redeemed conditionIds
+
 async function checkAndRedeem() {
   try {
     const addr = FUNDER.toLowerCase();
@@ -88,7 +96,7 @@ async function checkAndRedeem() {
     // Group by conditionId (avoid duplicate redeems)
     const seen = new Set();
     const unique = redeemable.filter(p => {
-      if (seen.has(p.conditionId)) return false;
+      if (seen.has(p.conditionId) || redeemedSet.has(p.conditionId)) return false;
       seen.add(p.conditionId);
       return true;
     });
@@ -97,43 +105,50 @@ async function checkAndRedeem() {
 
     for (const pos of unique) {
       try {
-        // Encode redeemPositions call
+        // Both negRisk and non-negRisk use CT.redeemPositions
+        // negRisk uses WCOL as collateral, non-negRisk uses USDC
+        const collateral = pos.negativeRisk ? WCOL : USDC;
         const data = CTF_IFACE.encodeFunctionData('redeemPositions', [
-          USDC,
+          collateral,
           ZERO_BYTES32,
           pos.conditionId,
-          [1, 2], // indexSets for 2-outcome markets
+          [1, 2],
         ]);
 
-        console.log(`[auto-redeem] Redeeming "${pos.title?.slice(0, 50)}" (${pos.outcome} ${pos.size?.toFixed(1)} shares)`);
+        console.log(`[auto-redeem] Redeeming "${pos.title?.slice(0, 50)}" (${pos.outcome} ${pos.size?.toFixed(1)} shares, negRisk: ${!!pos.negativeRisk})`);
 
         const tx = await execViaSafe(CONDITIONAL_TOKENS, data);
         console.log(`[auto-redeem] TX: ${tx.hash}`);
         const receipt = await tx.wait();
         console.log(`[auto-redeem] Redeemed! Block ${receipt.blockNumber}`);
+        redeemedSet.add(pos.conditionId);
       } catch (e) {
         const msg = e.message?.slice(0, 250) || String(e);
         if (msg.includes('reverted') || msg.includes('already')) {
           console.log(`[auto-redeem] Skip "${pos.title?.slice(0, 30)}": already redeemed`);
+          redeemedSet.add(pos.conditionId);
         } else if (msg.includes('insufficient funds')) {
           // Try with explicit nonce and higher gas
           try {
             const nonce2 = await provider.getTransactionCount(wallet.address, 'pending');
             const gp = await provider.getGasPrice();
             console.log(`[auto-redeem] Retrying with nonce=${nonce2} gasPrice=${gp.toString()}`);
-            const data2 = CTF_IFACE.encodeFunctionData('redeemPositions', [USDC, ZERO_BYTES32, pos.conditionId, [1, 2]]);
+            const collateral2 = pos.negativeRisk ? WCOL : USDC;
+            const data2 = CTF_IFACE.encodeFunctionData('redeemPositions', [collateral2, ZERO_BYTES32, pos.conditionId, [1, 2]]);
+            const target2 = CONDITIONAL_TOKENS;
             const nonce3 = await safe.nonce();
-            const txHash2 = await safe.getTransactionHash(CONDITIONAL_TOKENS, 0, data2, 0, 0, 0, 0, ZERO_ADDR, ZERO_ADDR, nonce3);
+            const txHash2 = await safe.getTransactionHash(target2, 0, data2, 0, 0, 0, 0, ZERO_ADDR, ZERO_ADDR, nonce3);
             const sig2 = await wallet.signMessage(arrayify(txHash2));
             const sigBytes2 = arrayify(sig2);
             sigBytes2[64] += 4;
             const tx2 = await safe.execTransaction(
-              CONDITIONAL_TOKENS, 0, data2, 0, 0, 0, 0, ZERO_ADDR, ZERO_ADDR, hexlify(sigBytes2),
+              target2, 0, data2, 0, 0, 0, 0, ZERO_ADDR, ZERO_ADDR, hexlify(sigBytes2),
               { gasLimit: 500000, gasPrice: gp.mul(2), nonce: nonce2 }
             );
             console.log(`[auto-redeem] Retry TX: ${tx2.hash}`);
             const receipt2 = await tx2.wait();
             console.log(`[auto-redeem] Retry redeemed! Block ${receipt2.blockNumber}`);
+            redeemedSet.add(pos.conditionId);
           } catch (e2) {
             console.error(`[auto-redeem] Retry also failed "${pos.title?.slice(0, 30)}":`, e2.message?.slice(0, 150));
           }
@@ -143,8 +158,21 @@ async function checkAndRedeem() {
       }
     }
 
-    // DISABLED — was killing snipe limit orders on Poly
-    // Stale order cleanup moved to snipe manager instead
+    // Unwrap any WCOL to USDC (from negRisk redeems)
+    try {
+      const wcolContract = new Contract(WCOL, ['function balanceOf(address) view returns (uint256)'], provider);
+      const wcolBal = await wcolContract.balanceOf(FUNDER);
+      if (wcolBal.gt(0)) {
+        console.log(`[auto-redeem] Unwrapping ${(wcolBal / 1e6).toFixed(2)} WCOL → USDC`);
+        const unwrapData = WCOL_IFACE.encodeFunctionData('unwrap', [FUNDER, wcolBal]);
+        const unwrapTx = await execViaSafe(WCOL, unwrapData);
+        console.log(`[auto-redeem] Unwrap TX: ${unwrapTx.hash}`);
+        await unwrapTx.wait();
+        console.log(`[auto-redeem] WCOL unwrapped to USDC`);
+      }
+    } catch (ue) {
+      console.error('[auto-redeem] Unwrap error:', ue.message?.slice(0, 100));
+    }
   } catch (e) {
     console.error('[auto-redeem] Error:', e.message?.slice(0, 100));
   }
