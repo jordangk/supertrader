@@ -3383,6 +3383,26 @@ async function refreshEvent(clientBtcOpen) {
       inMemoryShares = { up: 0, down: 0 };
     }
     console.log('[EVENT] new active event:', event.slug);
+
+    // ── Place 99.9¢ limit on the winner of the just-ended event ──
+    if (liveState.tokenUp && liveState.tokenDown && clobClient) {
+      const oldUp = liveState.upPrice, oldDown = liveState.downPrice;
+      if (oldUp != null && oldDown != null) {
+        const winSide = oldUp > oldDown ? 'up' : 'down';
+        const winToken = winSide === 'up' ? liveState.tokenUp : liveState.tokenDown;
+        const oldSlug = liveState.eventSlug;
+        console.log(`[btc15m-99] Event ended: ${oldSlug} | ${winSide} won (up=${(oldUp*100).toFixed(0)}¢ down=${(oldDown*100).toFixed(0)}¢) — placing 99.9¢ limit`);
+        (async () => {
+          try {
+            const negRisk = activeEvent?.negRisk || false;
+            const result = await placeLive99Order(winToken, 5, negRisk, `[btc15m-99] ${winSide} 5sh`);
+          } catch (e) {
+            console.error('[btc15m-99] Error:', e.message?.slice(0, 60));
+          }
+        })();
+      }
+    }
+
     // Clear stop-loss on event change — shouldn't carry to new events
     if (stopLossState) {
       console.log('[SL] Clearing stop-loss on event change');
@@ -5953,6 +5973,21 @@ app.get('/api/ending-soon', async (req, res) => {
   }
 });
 
+// Gamma health check — verify API is responding with fresh data
+let _gammaHealth = { ok: false, ts: 0 };
+async function isGammaAlive() {
+  const now = Date.now();
+  if (now - _gammaHealth.ts < 15000) return _gammaHealth.ok; // cache 15s
+  try {
+    const r = await fetch('https://gamma-api.polymarket.com/events?limit=1&active=true', { signal: AbortSignal.timeout(5000) });
+    const d = await r.json();
+    _gammaHealth = { ok: Array.isArray(d) && d.length > 0, ts: now };
+  } catch {
+    _gammaHealth = { ok: false, ts: now };
+  }
+  return _gammaHealth.ok;
+}
+
 // Check USDC balance — cache for 30s to avoid spamming RPC
 let _balanceCache = { bal: 0, ts: 0 };
 async function getUsdcBalance() {
@@ -5971,6 +6006,11 @@ async function getUsdcBalance() {
 
 // Helper: place 99.9¢ order (try 0.001 tick, fall back to 0.01)
 async function placeLive99Order(tokenId, size, negRisk, label) {
+  // Gamma health check
+  if (!await isGammaAlive()) {
+    console.log(`${label} → SKIP (Gamma API down)`);
+    return null;
+  }
   // Balance gate — don't place if wallet has less than $10
   const bal = await getUsdcBalance();
   if (bal < 10) {
@@ -5986,8 +6026,13 @@ async function placeLive99Order(tokenId, size, negRisk, label) {
     const signed = await clobClient.createOrder({ tokenID: tokenId, price: 0.999, size, side: 'BUY', expiration }, { tickSize: '0.001', negRisk });
     result = await clobClient.postOrder(signed, 'GTD');
   } catch {
-    const signed2 = await clobClient.createOrder({ tokenID: tokenId, price: 0.99, size, side: 'BUY', expiration }, { tickSize: '0.01', negRisk });
-    result = await clobClient.postOrder(signed2, 'GTD');
+    try {
+      const signed2 = await clobClient.createOrder({ tokenID: tokenId, price: 0.99, size, side: 'BUY', expiration }, { tickSize: '0.01', negRisk });
+      result = await clobClient.postOrder(signed2, 'GTD');
+    } catch (e2) {
+      console.log(`${label} → FAILED: ${e2?.response?.data?.error?.slice(0,60) || e2.message?.slice(0,60)}`);
+      return null;
+    }
   }
   console.log(`${label} → ${result?.status} id:${result?.orderID?.slice(0,8)}`);
   return result;
@@ -6136,7 +6181,7 @@ const LIVE_EVENTS_FILE = new URL('./.live-events.json', import.meta.url).pathnam
 function saveLiveEvents(knownLive, fired) {
   try {
     const data = {
-      knownLive: Object.fromEntries([...knownLive].map(([k, v]) => [k, { title: v.title, score: v.score, period: v.period, htScore: v.htScore || null, _htFired: v._htFired || false, _lastPeriod: v._lastPeriod || '' }])),
+      knownLive: Object.fromEntries([...knownLive].map(([k, v]) => [k, { title: v.title, score: v.score, period: v.period, htScore: v.htScore || null, _htFired: v._htFired || false, _lastPeriod: v._lastPeriod || '', _esportsFired: v._esportsFired ? [...v._esportsFired] : [], _tennisFired: v._tennisFired ? [...v._tennisFired] : [], _bttsFired: v._bttsFired || false, ouFired: v.ouFired ? [...v.ouFired] : [], exactScoreFired: v.exactScoreFired ? [...v.exactScoreFired] : [] }])),
       fired: [...fired],
     };
     fs.writeFileSync(LIVE_EVENTS_FILE, JSON.stringify(data));
@@ -6149,7 +6194,7 @@ function loadLiveEvents() {
     const data = JSON.parse(fs.readFileSync(LIVE_EVENTS_FILE, 'utf8'));
     const knownLive = new Map();
     for (const [slug, v] of Object.entries(data.knownLive || {})) {
-      knownLive.set(slug, { title: v.title, score: v.score, period: v.period, markets: [], ouFired: new Set(), exactScoreFired: new Set(), htScore: v.htScore || null, _htFired: v._htFired || false, _lastPeriod: v._lastPeriod || '' });
+      knownLive.set(slug, { title: v.title, score: v.score, period: v.period, markets: [], ouFired: new Set(v.ouFired || []), exactScoreFired: new Set(v.exactScoreFired || []), htScore: v.htScore || null, _htFired: v._htFired || false, _lastPeriod: v._lastPeriod || '', _esportsFired: new Set(v._esportsFired || []), _tennisFired: new Set(v._tennisFired || []), _bttsFired: v._bttsFired || false });
     }
     const fired = new Set(data.fired || []);
     console.log(`[live-99] Restored ${knownLive.size} tracked events, ${fired.size} fired from disk`);
@@ -6500,6 +6545,8 @@ setInterval(async () => {
     for (const [slug, data] of liveEventTracker.knownLive) {
       if (!data.score || !String(data.score).includes('|') || !String(data.score).includes('Bo')) continue;
       if (!clobClient) continue;
+      // Skip Overwatch O/U — plays all maps regardless of series result
+      const _isOW = slug.includes('ow-') || data.title?.toLowerCase().includes('overwatch');
       // Fetch markets if not loaded yet
       if (!data.markets?.length) {
         try {
@@ -6528,6 +6575,7 @@ setInterval(async () => {
       for (const m of data.markets) {
         const ql = (m.question || '').toLowerCase();
         if (!ql.includes('games total') || !ql.includes('o/u')) continue;
+        if (_isOW) continue; // Skip O/U for Overwatch
         const condId = m.conditionId;
         if (!condId || data._esportsFired.has(condId)) continue;
 
@@ -6556,18 +6604,23 @@ setInterval(async () => {
           if (winIdx < 0) winIdx = 0;
           winLabel = outcomes?.[winIdx] || 'Over';
         }
-        // Under: series is over and total maps played is below line
-        else if (seriesOver && totalGamesPlayed < line) {
-          winIdx = outcomes ? outcomes.findIndex(o => o.toLowerCase().includes('under')) : 1;
-          if (winIdx < 0) winIdx = 1;
-          winLabel = outcomes?.[winIdx] || 'Under';
-        }
+        // Under DISABLED — some tournaments play all maps regardless of series result
+        // (e.g., Overwatch OCS uses map differential, plays all 3 maps even at 2-0)
 
         if (winIdx < 0) continue;
+
+        // Verify Gamma price agrees — winning side must be > 95¢
+        const prices = m.outcomePrices ? (typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices) : null;
+        if (prices) {
+          const gammaWinPrice = parseFloat(prices[winIdx]);
+          if (gammaWinPrice < 0.97) {
+            console.log(`[esports] SKIP O/U ${line}: Gamma ${(gammaWinPrice*100).toFixed(0)}¢ < 97¢ | ${data.title.slice(0,30)}`);
+            continue;
+          }
+        }
+
         data._esportsFired.add(condId);
         const winToken = tokens[winIdx];
-
-        // No price check — mathematically verified from series score, just place limit
         console.log(`[esports] ${data.title.slice(0,30)} ${s1}-${s2} Bo${bestOf} → O/U ${line} ${winLabel} (${totalGamesPlayed} maps, min ${minTotalGames})`);
         try {
           const result = await placeLive99Order(winToken, 10, negRisk, `[esports] ${winLabel} O/U ${line} 10sh`);
@@ -6626,7 +6679,7 @@ setInterval(async () => {
           const q = m.question || '';
           const ql = q.toLowerCase();
           // Match "Game X:" or "Game X " at the start, or "in Game X"
-          const gameMatch = ql.match(/(?:^game\s*(\d+)|in\s+game\s+(\d+))/);
+          const gameMatch = ql.match(/(?:^(?:game|map)\s*(\d+)|in\s+(?:game|map)\s+(\d+))/);
           if (!gameMatch) continue;
           const gameNum = parseInt(gameMatch[1] || gameMatch[2]);
           if (gameNum > mapsPlayed) continue; // game not finished
@@ -6644,7 +6697,7 @@ setInterval(async () => {
           const p0 = parseFloat(prices[0]), p1 = parseFloat(prices[1]);
           if (Math.max(p0, p1) < 0.90) continue; // not decided enough
           const mktVol = parseFloat(m.volume || 0);
-          if (mktVol < 50) continue; // skip no-volume markets
+          if (mktVol < 25) continue; // skip no-volume markets
 
           const winIdx = p0 >= p1 ? 0 : 1;
           const winToken = tokens[winIdx];
@@ -6855,14 +6908,42 @@ setInterval(async () => {
       if (currentLive.has(slug)) continue; // still live
       if (liveEventTracker.fired.has(slug)) continue; // already fired
 
-      // This event just ended! Re-fetch fresh data and fire 99¢ on ALL markets
+      // Event disappeared from live list — verify it ACTUALLY ended (not API blip)
+      console.log(`[live-99] ${data.title} dropped from live API — waiting 15s to verify...`);
+
+      // Wait 15 seconds, then re-check
+      await new Promise(r => setTimeout(r, 15000));
+
+      // Re-fetch the live list to confirm it's still gone
+      let stillGone = true;
+      try {
+        const verifyR = await fetch('https://gamma-api.polymarket.com/events?active=true&closed=false&live=true&limit=100');
+        const verifyEvents = await verifyR.json();
+        if (Array.isArray(verifyEvents) && verifyEvents.some(e => e.slug === slug)) {
+          stillGone = false;
+        }
+      } catch {}
+
+      if (!stillGone) {
+        console.log(`[live-99] FALSE ALARM: ${data.title} is back on live API — NOT ended`);
+        continue; // Don't fire, don't mark as fired
+      }
+
+      // Also verify via direct event fetch that it's actually ended
+      try {
+        const directR = await fetch(`https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(slug)}`);
+        const directData = await directR.json();
+        const directEvent = Array.isArray(directData) ? directData[0] : directData;
+        if (directEvent?.live === true) {
+          console.log(`[live-99] FALSE ALARM: ${data.title} still live on direct fetch — NOT ended`);
+          continue;
+        }
+      } catch {}
+
       liveEventTracker.fired.add(slug);
       liveEventTracker.knownLive.delete(slug);
 
-      console.log(`[live-99] EVENT ENDED: ${data.title} (${data.score}) — waiting 10s for prices to settle`);
-
-      // Wait 10 seconds for prices to settle before placing orders
-      await new Promise(r => setTimeout(r, 10000));
+      console.log(`[live-99] CONFIRMED ENDED: ${data.title} (${data.score}) — placing orders`);
 
       // Re-fetch event to get latest prices for all markets
       let freshMarkets = data.markets || [];
@@ -6924,6 +7005,11 @@ setInterval(async () => {
             console.log(`[live-99] SKIP ${m.question?.slice(0,30)}: ${(a0*100).toFixed(0)}+${(a1*100).toFixed(0)}=${(clobSum*100).toFixed(0)}¢ > 103, ask ${(winAsk*100).toFixed(0)}¢ vol $${mktVol.toFixed(0)}`);
             continue;
           }
+          // Never buy if CLOB ask for our side is under 50¢ — Gamma is stale
+          if (winAsk < 0.50) {
+            console.log(`[live-99] SKIP ${m.question?.slice(0,30)}: CLOB ask ${(winAsk*100).toFixed(0)}¢ < 50¢ — wrong side`);
+            continue;
+          }
           orderSize = clobSum > 1.03 ? 5 : 10; // Smaller size for less certain markets
         } catch { continue; }
 
@@ -6983,7 +7069,7 @@ setInterval(async () => {
   } catch (e) {
     // silent — don't spam logs on API errors
   }
-}, 3000);
+}, 1000);
 
 // ── Startup scan: catch recently ended events we missed during restarts ──
 setTimeout(async () => {
@@ -7061,17 +7147,109 @@ setTimeout(async () => {
   }
 }, 10000); // Run 10s after startup
 
+// ── BTC Hourly Event Scanner ──
+// When hourly BTC event expires, place 99.9¢ limit on the winner
+const btcHourlyState = { currentSlug: null, firedSlugs: new Set() };
+
+function getBtcHourlySlug() {
+  // Format: bitcoin-up-or-down-april-6-2026-9am-et
+  const now = new Date();
+  const et = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const months = ['january','february','march','april','may','june','july','august','september','october','november','december'];
+  const month = months[et.getMonth()];
+  const day = et.getDate();
+  const year = et.getFullYear();
+  let hour = et.getHours();
+  const ampm = hour >= 12 ? 'pm' : 'am';
+  if (hour === 0) hour = 12;
+  else if (hour > 12) hour -= 12;
+  return `bitcoin-up-or-down-${month}-${day}-${year}-${hour}${ampm}-et`;
+}
+
+function scheduleBtcHourlyScan() {
+  setTimeout(async () => {
+    try {
+      if (!clobClient) { scheduleBtcHourlyScan(); return; }
+
+      const currentSlug = getBtcHourlySlug();
+
+      // Detect event change — previous slug just ended
+      if (btcHourlyState.currentSlug && btcHourlyState.currentSlug !== currentSlug && !btcHourlyState.firedSlugs.has(btcHourlyState.currentSlug)) {
+        const oldSlug = btcHourlyState.currentSlug;
+        btcHourlyState.firedSlugs.add(oldSlug);
+
+        // Fetch the ended event to get winner
+        try {
+          const r = await fetch(`https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(oldSlug)}`);
+          const data = await r.json();
+          const e = Array.isArray(data) ? data[0] : data;
+          if (e?.markets?.length) {
+            const m = e.markets[0];
+            const prices = typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices;
+            const outcomes = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes;
+            const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
+            if (prices && tokens && prices.length >= 2) {
+              const p0 = parseFloat(prices[0]), p1 = parseFloat(prices[1]);
+              const winIdx = p0 >= p1 ? 0 : 1;
+              const winLabel = outcomes?.[winIdx] || (winIdx === 0 ? 'Up' : 'Down');
+              const winToken = tokens[winIdx];
+              const negRisk = m.negRisk != null ? m.negRisk : false;
+
+              console.log(`[btc1h-99] Event ended: ${oldSlug} | ${winLabel} won (${(Math.max(p0,p1)*100).toFixed(0)}¢) — placing 99.9¢ limit`);
+              try {
+                await placeLive99Order(winToken, 5, negRisk, `[btc1h-99] ${winLabel} 5sh`);
+              } catch (err) {
+                console.error('[btc1h-99] Error:', err.message?.slice(0, 60));
+              }
+            }
+          }
+        } catch {}
+      }
+
+      btcHourlyState.currentSlug = currentSlug;
+    } catch (e) {
+      console.error('[btc1h] Error:', e.message?.slice(0, 60));
+    }
+    scheduleBtcHourlyScan();
+  }, 30000); // Check every 30s
+}
+// Start after 20s
+setTimeout(() => {
+  btcHourlyState.currentSlug = getBtcHourlySlug();
+  console.log(`[btc1h] Tracking hourly BTC: ${btcHourlyState.currentSlug}`);
+  scheduleBtcHourlyScan();
+}, 20000);
+
 // ── Weather Temperature Scanner ──
 // Every hour, check actual observed temps and buy on decided weather markets
+// Weather cities — only those with Wunderground resolution source on Poly
+// Station codes from Poly event resolutionSource URLs
 const WEATHER_CITIES = {
+  wellington: { station: 'NZWN:9:NZ', tz: 'Pacific/Auckland' },
   tokyo: { station: 'RJTT:9:JP', tz: 'Asia/Tokyo' },
+  seoul: { station: 'RKSI:9:KR', tz: 'Asia/Seoul' },
+  shanghai: { station: 'ZSPD:9:CN', tz: 'Asia/Shanghai' },
+  beijing: { station: 'ZBAA:9:CN', tz: 'Asia/Shanghai' },
+  taipei: { station: 'RCSS:9:TW', tz: 'Asia/Taipei' },
   singapore: { station: 'WSSS:9:SG', tz: 'Asia/Singapore' },
-  // wellington: { station: 'NZWN:9:NZ', tz: 'Pacific/Auckland' },
-  // paris: { station: 'LFPG:9:FR', tz: 'Europe/Paris' },
-  // miami: { station: 'KMIA:9:US', tz: 'America/New_York' },
-  // seoul: { station: 'RKSS:9:KR', tz: 'Asia/Seoul' },
+  'kuala-lumpur': { station: 'WMKK:9:MY', tz: 'Asia/Kuala_Lumpur' },
+  jakarta: { station: 'WIHH:9:ID', tz: 'Asia/Jakarta' },
+  paris: { station: 'LFPG:9:FR', tz: 'Europe/Paris' },
+  london: { station: 'EGLC:9:GB', tz: 'Europe/London' },
+  miami: { station: 'KMIA:9:US', tz: 'America/New_York' },
+  chicago: { station: 'KORD:9:US', tz: 'America/Chicago' },
+  'los-angeles': { station: 'KLAX:9:US', tz: 'America/Los_Angeles' },
 };
-const weatherFired = new Set(); // track conditionIds we've already placed on
+// Persist weather fired conditionIds to survive restarts
+const WEATHER_FIRED_FILE = new URL('./.weather-fired.json', import.meta.url).pathname;
+let weatherFired;
+try {
+  weatherFired = new Set(JSON.parse(fs.readFileSync(WEATHER_FIRED_FILE, 'utf8')));
+  console.log(`[weather] Restored ${weatherFired.size} fired conditionIds`);
+} catch { weatherFired = new Set(); }
+function saveWeatherFired() {
+  try { fs.writeFileSync(WEATHER_FIRED_FILE, JSON.stringify([...weatherFired])); } catch {}
+}
 
 async function getObservedMaxTemp(station, dateStr) {
   try {
@@ -7186,6 +7364,7 @@ async function runWeatherScan() {
 
           if (winIdx < 0) continue;
           weatherFired.add(condId);
+          saveWeatherFired();
           const winToken = tokens[winIdx];
           const winLabel = outcomes[winIdx];
 
@@ -7216,12 +7395,11 @@ function scheduleWeatherLoop() {
     scheduleWeatherLoop();
   }, _delay);
 }
-// Weather scanner — disabled temporarily, was spamming dead orderbooks
-// setTimeout(async () => {
-//   console.log('[weather] Starting weather scanner...');
-//   await runWeatherScan();
-//   scheduleWeatherLoop();
-// }, 15000);
+setTimeout(async () => {
+  console.log('[weather] Starting weather scanner...');
+  await runWeatherScan();
+  scheduleWeatherLoop();
+}, 15000);
 
 // Scan for decided markets (99%+) and place 99.9¢ bids
 const decidedScanner = { enabled: false, placed: new Set(), log: [] };
