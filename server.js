@@ -3389,17 +3389,22 @@ async function refreshEvent(clientBtcOpen) {
       const oldUp = liveState.upPrice, oldDown = liveState.downPrice;
       if (oldUp != null && oldDown != null) {
         const winSide = oldUp > oldDown ? 'up' : 'down';
+        const winPrice = Math.max(oldUp, oldDown);
+        if (winPrice < 0.90) {
+          console.log(`[btc15m-99] SKIP ${liveState.eventSlug}: winner only ${(winPrice*100).toFixed(0)}¢ — not decided`);
+        } else {
         const winToken = winSide === 'up' ? liveState.tokenUp : liveState.tokenDown;
         const oldSlug = liveState.eventSlug;
         console.log(`[btc15m-99] Event ended: ${oldSlug} | ${winSide} won (up=${(oldUp*100).toFixed(0)}¢ down=${(oldDown*100).toFixed(0)}¢) — placing 99.9¢ limit`);
         (async () => {
           try {
             const negRisk = activeEvent?.negRisk || false;
-            const result = await placeLive99Order(winToken, 5, negRisk, `[btc15m-99] ${winSide} 5sh`);
+            const result = await placeLive99Order(winToken, 20, negRisk, `[btc15m-99] ${winSide} 5sh`);
           } catch (e) {
             console.error('[btc15m-99] Error:', e.message?.slice(0, 60));
           }
         })();
+        }
       }
     }
 
@@ -6104,7 +6109,7 @@ async function checkExactScores(slug, title, score, firedSet) {
 
       console.log(`[exact-score] ${title.slice(0,30)} score ${score} → ${mHome}-${mAway} IMPOSSIBLE → BUY NO`);
       try {
-        const result = await placeLive99Order(noToken, 10, negRisk, `[exact-score] NO on ${mHome}-${mAway} 10sh`);
+        const result = await placeLive99Order(noToken, 20, negRisk, `[exact-score] NO on ${mHome}-${mAway} 10sh`);
         liveEventTracker.log.unshift({ ts: Date.now(), event: title, score, market: `Exact ${mHome}-${mAway} NO`, side: 'NO', price: '99.9¢', status: result?.status });
         if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
       } catch (err) {
@@ -6163,7 +6168,7 @@ async function buyExactScoreOnEnd(slug, title, finalScore) {
       const winLabel = winIdx === 0 ? 'YES' : 'NO';
       console.log(`[exact-score] END: ${q.slice(0,40)} → BUY ${winLabel} (${(winPrice*100).toFixed(0)}¢)`);
       try {
-        const result = await placeLive99Order(winToken, 10, negRisk, `[exact-score] END ${winLabel} on ${q.slice(0,30)} 10sh`);
+        const result = await placeLive99Order(winToken, 20, negRisk, `[exact-score] END ${winLabel} on ${q.slice(0,30)} 10sh`);
         liveEventTracker.log.unshift({ ts: Date.now(), event: title, score: finalScore, market: q.slice(0, 50), side: winLabel, price: '99.9¢', status: result?.status });
         if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
       } catch (err) {
@@ -6220,9 +6225,11 @@ app.get('/api/live99/status', (req, res) => {
   });
 });
 
-// Poll live events every 3 seconds
-setInterval(async () => {
-  if (!liveEventTracker.enabled || !clobClient) return;
+// Poll live events — sequential setTimeout chain (not setInterval to avoid overlap)
+function scheduleLivePoll() {
+setTimeout(async () => {
+  try {
+  if (!liveEventTracker.enabled || !clobClient) { scheduleLivePoll(); return; }
 
   try {
     const r = await fetch('https://gamma-api.polymarket.com/events?active=true&closed=false&live=true&limit=100');
@@ -6319,7 +6326,7 @@ setInterval(async () => {
 
               console.log(`[live-ht] ${e.title.slice(0,25)} | ${q.slice(0,40)} → BUY ${winLabel}`);
               try {
-                const result = await placeLive99Order(winToken, 10, negRisk, `[live-ht] ${winLabel} on ${q.slice(0,30)} 10sh`);
+                const result = await placeLive99Order(winToken, 20, negRisk, `[live-ht] ${winLabel} on ${q.slice(0,30)} 10sh`);
                 liveEventTracker.log.unshift({ ts: Date.now(), event: e.title, score: htScore, market: q.slice(0, 50), side: winLabel, price: '99.9¢', status: result?.status });
                 if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
               } catch (err) {
@@ -6330,6 +6337,71 @@ setInterval(async () => {
         }
 
       }
+    }
+
+    // ── ESPN Score Updater: fetch fresh MLB/NBA/NHL scores every 3s ──
+    if (!global._espnLastPoll) global._espnLastPoll = 0;
+    if (Date.now() - global._espnLastPoll > 3000) {
+      global._espnLastPoll = Date.now();
+      try {
+        for (const league of ['baseball/mlb', 'basketball/nba', 'hockey/nhl', 'soccer/eng.1', 'soccer/esp.1', 'soccer/ger.1', 'soccer/ita.1', 'soccer/fra.1', 'soccer/usa.1', 'soccer/nor.1']) {
+          const espnR = await fetch(`https://site.api.espn.com/apis/site/v2/sports/${league}/scoreboard`, { signal: AbortSignal.timeout(3000) });
+          const espnData = await espnR.json();
+          for (const ev of (espnData.events || [])) {
+            const comp = ev.competitions?.[0];
+            if (!comp?.competitors?.length) continue;
+            // Only in-progress games
+            if (comp.status?.type?.description !== 'In Progress') continue;
+            // Date check: game must be today
+            const gameDate = ev.date?.slice(0, 10);
+            const today = new Date().toISOString().slice(0, 10);
+            if (gameDate && gameDate !== today) continue;
+
+            const t0 = comp.competitors[0], t1 = comp.competitors[1];
+            const s0 = parseInt(t0.score || 0), s1 = parseInt(t1.score || 0);
+            const espnDetail = comp.status?.type?.shortDetail || '';
+
+            // Get all name variants for BOTH teams
+            const team0Names = [t0.team?.displayName?.toLowerCase(), t0.team?.shortDisplayName?.toLowerCase(), t0.team?.abbreviation?.toLowerCase()].filter(Boolean);
+            const team1Names = [t1.team?.displayName?.toLowerCase(), t1.team?.shortDisplayName?.toLowerCase(), t1.team?.abbreviation?.toLowerCase()].filter(Boolean);
+
+            for (const [slug, data] of liveEventTracker.knownLive) {
+              const title = (data.title || '').toLowerCase();
+              // BOTH teams must match — not just one
+              const team0Match = team0Names.some(n => n.length > 2 && title.includes(n));
+              const team1Match = team1Names.some(n => n.length > 2 && title.includes(n));
+              if (!team0Match || !team1Match) continue;
+
+              const oldScore = data.score || '0-0';
+              const oldParts = oldScore.split('-').map(Number).filter(n => !isNaN(n));
+              const oldTotal = oldParts.length >= 2 ? oldParts[0] + oldParts[1] : 0;
+              const espnTotal = s0 + s1;
+
+              // Only update if ESPN total is HIGHER (score can only go up)
+              if (espnTotal <= oldTotal) break;
+
+              // Map to Poly home-away format
+              const homeScore = parseInt(t0.homeAway === 'home' ? t0.score : t1.score) || 0;
+              const awayScore = parseInt(t0.homeAway === 'away' ? t0.score : t1.score) || 0;
+              data.score = `${homeScore}-${awayScore}`;
+              data.period = espnDetail;
+
+              // Re-fetch markets
+              if (!data.markets?.length) {
+                try {
+                  const mr = await fetch(`https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(slug)}`);
+                  const md = await mr.json();
+                  const me = Array.isArray(md) ? md[0] : md;
+                  if (me?.markets?.length) data.markets = me.markets;
+                } catch {}
+              }
+
+              console.log(`[espn] ${data.title?.slice(0,30)} total: ${oldTotal} → ${espnTotal} (${data.score}) ${espnDetail}`);
+              break;
+            }
+          }
+        }
+      } catch {}
     }
 
     // ── Game Total O/U: check ALL tracked non-esports games on every poll ──
@@ -6393,7 +6465,7 @@ setInterval(async () => {
 
           console.log(`[live-ou] SCORE ${data.score} (total ${ouTotal}) > O/U ${line} → BUY ${overLabel} | ${data.title}`);
           try {
-            const result = await placeLive99Order(overToken, 10, negRisk, `[live-ou] ${overLabel} O/U ${line} 10sh`);
+            const result = await placeLive99Order(overToken, 20, negRisk, `[live-ou] ${overLabel} O/U ${line} 10sh`);
             liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: `O/U ${line}`, side: overLabel, price: '99.9¢', status: result?.status });
             if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
           } catch (err) {
@@ -6532,7 +6604,7 @@ setInterval(async () => {
 
         console.log(`[tennis] ${data.title.slice(0,30)} | ${q.slice(0,40)} → ${winLabel} (minGames=${minTotalGames}, sets=${totalSetsPlayed})`);
         try {
-          const result = await placeLive99Order(winToken, 10, negRisk, `[tennis] ${winLabel} on ${q.slice(0,30)} 10sh`);
+          const result = await placeLive99Order(winToken, 20, negRisk, `[tennis] ${winLabel} on ${q.slice(0,30)} 10sh`);
           liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: q.slice(0, 50), side: winLabel, price: '99.9¢', status: result?.status });
           if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
         } catch (err) {
@@ -6623,7 +6695,7 @@ setInterval(async () => {
         const winToken = tokens[winIdx];
         console.log(`[esports] ${data.title.slice(0,30)} ${s1}-${s2} Bo${bestOf} → O/U ${line} ${winLabel} (${totalGamesPlayed} maps, min ${minTotalGames})`);
         try {
-          const result = await placeLive99Order(winToken, 10, negRisk, `[esports] ${winLabel} O/U ${line} 10sh`);
+          const result = await placeLive99Order(winToken, 20, negRisk, `[esports] ${winLabel} O/U ${line} 10sh`);
           liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: `Games O/U ${line} ${winLabel}`, side: winLabel, price: '99.9¢', status: result?.status });
           if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
         } catch (err) {
@@ -6665,7 +6737,7 @@ setInterval(async () => {
           // No CLOB price check — map is completed, Gamma confirms winner, just place limit
           console.log(`[esports] ${data.title.slice(0,30)} Map ${mapNum} Winner → ${winLabel} (Gamma ${(Math.max(p0,p1)*100).toFixed(0)}%)`);
           try {
-            const result = await placeLive99Order(winToken, 10, negRisk, `[esports] ${winLabel} Map ${mapNum} 10sh`);
+            const result = await placeLive99Order(winToken, 20, negRisk, `[esports] ${winLabel} Map ${mapNum} 10sh`);
             liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: `Map ${mapNum} Winner`, side: winLabel, price: '99.9¢', status: result?.status });
             if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
           } catch (err) {
@@ -6721,7 +6793,7 @@ setInterval(async () => {
           } catch { continue; }
 
           data._esportsFired.add(condId);
-          const shares = 10;
+          const shares = 20;
           console.log(`[esports] ${data.title.slice(0,25)} Game ${gameNum}: ${q.slice(0,35)} → ${winLabel} ($${mktVol.toFixed(0)} vol)`);
           try {
             const result = await placeLive99Order(winToken, shares, negRisk, `[esports] ${winLabel} ${q.slice(0,25)} ${shares}sh`);
@@ -6788,7 +6860,7 @@ setInterval(async () => {
 
           console.log(`[esports] ${data.title.slice(0,30)} ${s1}-${s2} Handicap ${spread} → ${winLabel}`);
           try {
-            const result = await placeLive99Order(winToken, 10, negRisk, `[esports] ${winLabel} HC ${spread} 10sh`);
+            const result = await placeLive99Order(winToken, 20, negRisk, `[esports] ${winLabel} HC ${spread} 10sh`);
             liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: q.slice(0, 50), side: winLabel, price: '99.9¢', status: result?.status });
             if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
           } catch (err) {
@@ -6836,7 +6908,7 @@ setInterval(async () => {
         data._bttsFired = true;
         console.log(`[soccer] ${data.title.slice(0,30)} ${data.score} → Both Teams to Score: YES`);
         try {
-          const result = await placeLive99Order(yesToken, 10, negRisk, `[soccer] BTTS Yes 10sh`);
+          const result = await placeLive99Order(yesToken, 20, negRisk, `[soccer] BTTS Yes 10sh`);
           liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: 'Both Teams to Score', side: 'Yes', price: '99.9¢', status: result?.status });
           if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
         } catch (err) {
@@ -6884,7 +6956,7 @@ setInterval(async () => {
         data._firstInningFired = true;
         console.log(`[mlb] ${data.title.slice(0,30)} ${data.score} in ${data.period} → First inning run: YES`);
         try {
-          const result = await placeLive99Order(yesToken, 10, negRisk, `[mlb] 1st inning run Yes 10sh`);
+          const result = await placeLive99Order(yesToken, 20, negRisk, `[mlb] 1st inning run Yes 10sh`);
           liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: 'First inning run', side: 'Yes', price: '99.9¢', status: result?.status });
           if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
         } catch (err) {
@@ -6908,6 +6980,10 @@ setInterval(async () => {
       if (currentLive.has(slug)) continue; // still live
       if (liveEventTracker.fired.has(slug)) continue; // already fired
 
+      // Mark as fired IMMEDIATELY to prevent duplicate triggers from parallel poll cycles
+      liveEventTracker.fired.add(slug);
+      liveEventTracker.knownLive.delete(slug);
+
       // Event disappeared from live list — verify it ACTUALLY ended (not API blip)
       console.log(`[live-99] ${data.title} dropped from live API — waiting 15s to verify...`);
 
@@ -6926,7 +7002,9 @@ setInterval(async () => {
 
       if (!stillGone) {
         console.log(`[live-99] FALSE ALARM: ${data.title} is back on live API — NOT ended`);
-        continue; // Don't fire, don't mark as fired
+        liveEventTracker.fired.delete(slug);
+        liveEventTracker.knownLive.set(slug, data); // restore tracking
+        continue;
       }
 
       // Also verify via direct event fetch that it's actually ended
@@ -6936,12 +7014,11 @@ setInterval(async () => {
         const directEvent = Array.isArray(directData) ? directData[0] : directData;
         if (directEvent?.live === true) {
           console.log(`[live-99] FALSE ALARM: ${data.title} still live on direct fetch — NOT ended`);
+          liveEventTracker.fired.delete(slug);
+          liveEventTracker.knownLive.set(slug, data);
           continue;
         }
       } catch {}
-
-      liveEventTracker.fired.add(slug);
-      liveEventTracker.knownLive.delete(slug);
 
       console.log(`[live-99] CONFIRMED ENDED: ${data.title} (${data.score}) — placing orders`);
 
@@ -6979,7 +7056,7 @@ setInterval(async () => {
           continue;
         }
 
-        let orderSize = 10;
+        let orderSize = 20;
         // Verify BOTH sides from CLOB — sum must be <= 103¢
         try {
           const [r0, r1] = await Promise.all([
@@ -7067,9 +7144,15 @@ setInterval(async () => {
     // Persist to disk every poll
     saveLiveEvents(liveEventTracker.knownLive, liveEventTracker.fired);
   } catch (e) {
-    // silent — don't spam logs on API errors
+    console.error('[poll] Error:', e.message?.slice(0, 100));
   }
-}, 1000);
+  } catch (outerE) {
+    console.error('[poll] Outer error:', outerE.message?.slice(0, 100));
+  }
+  scheduleLivePoll();
+}, 3000); // 3s between polls to avoid overlap
+}
+scheduleLivePoll();
 
 // ── Startup scan: catch recently ended events we missed during restarts ──
 setTimeout(async () => {
@@ -7136,7 +7219,7 @@ setTimeout(async () => {
         } catch { continue; }
 
         try {
-          const result = await placeLive99Order(winToken, 10, negRisk, `[startup-scan] ${winOutcome} on ${m.question?.slice(0,30)} 10sh`);
+          const result = await placeLive99Order(winToken, 20, negRisk, `[startup-scan] ${winOutcome} on ${m.question?.slice(0,30)} 10sh`);
           if (result) placed++;
         } catch {}
       }
@@ -7191,16 +7274,21 @@ function scheduleBtcHourlyScan() {
             if (prices && tokens && prices.length >= 2) {
               const p0 = parseFloat(prices[0]), p1 = parseFloat(prices[1]);
               const winIdx = p0 >= p1 ? 0 : 1;
+              const winPrice = Math.max(p0, p1);
+              if (winPrice < 0.90) {
+                console.log(`[btc1h-99] SKIP ${oldSlug}: winner only ${(winPrice*100).toFixed(0)}¢ — not decided`);
+              } else {
               const winLabel = outcomes?.[winIdx] || (winIdx === 0 ? 'Up' : 'Down');
               const winToken = tokens[winIdx];
               const negRisk = m.negRisk != null ? m.negRisk : false;
 
-              console.log(`[btc1h-99] Event ended: ${oldSlug} | ${winLabel} won (${(Math.max(p0,p1)*100).toFixed(0)}¢) — placing 99.9¢ limit`);
+              console.log(`[btc1h-99] Event ended: ${oldSlug} | ${winLabel} won (${(winPrice*100).toFixed(0)}¢) — placing 99.9¢ limit`);
               try {
-                await placeLive99Order(winToken, 5, negRisk, `[btc1h-99] ${winLabel} 5sh`);
+                await placeLive99Order(winToken, 20, negRisk, `[btc1h-99] ${winLabel} 5sh`);
               } catch (err) {
                 console.error('[btc1h-99] Error:', err.message?.slice(0, 60));
               }
+              } // close else (winPrice >= 0.90)
             }
           }
         } catch {}
@@ -7370,7 +7458,7 @@ async function runWeatherScan() {
 
           console.log(`[weather] ${city} ${maxTemp}°C → ${q.slice(0, 45)} → ${winLabel}`);
           try {
-            const result = await placeLive99Order(winToken, 10, negRisk, `[weather] ${city} ${winLabel} 10sh`);
+            const result = await placeLive99Order(winToken, 20, negRisk, `[weather] ${city} ${winLabel} 10sh`);
             liveEventTracker.log.unshift({ ts: Date.now(), event: event.title, market: q.slice(0, 50), side: winLabel, price: '99.9¢', status: result?.status });
             if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
           } catch (err) {
