@@ -7381,16 +7381,16 @@ function scheduleWeatherPreMarket() {
         const coords = WEATHER_COORDS[city];
         if (!coords) continue;
 
-        // Get tomorrow's date in this city's timezone
+        // Get day-after-tomorrow's date in this city's timezone (skip a day)
         const now = new Date();
-        const tomorrow = new Date(now.getTime() + 86400000);
-        const tomorrowLocal = new Date(tomorrow.toLocaleString('en-US', { timeZone: info.tz }));
+        const dayAfter = new Date(now.getTime() + 2 * 86400000);
+        const tomorrowLocal = new Date(dayAfter.toLocaleString('en-US', { timeZone: info.tz }));
         const localNow = new Date(now.toLocaleString('en-US', { timeZone: info.tz }));
         const localHour = localNow.getHours();
         const localMin = localNow.getMinutes();
 
-        // Only fire at 23:30 local (30 min before new day)
-        if (localHour !== 23 || localMin < 25 || localMin > 35) continue;
+        // Fire at 23:49 local (~10 min before new day markets open)
+        if (localHour !== 23 || localMin < 45 || localMin > 55) continue;
 
         const monthNames = ['january','february','march','april','may','june','july','august','september','october','november','december'];
         const tDate = tomorrowLocal;
@@ -7401,12 +7401,12 @@ function scheduleWeatherPreMarket() {
 
         // Get forecast for tomorrow
         try {
-          const fcastR = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${coords.lat}&longitude=${coords.lon}&daily=temperature_2m_max&timezone=${encodeURIComponent(info.tz)}&forecast_days=2`);
+          const fcastR = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${coords.lat}&longitude=${coords.lon}&daily=temperature_2m_max&timezone=${encodeURIComponent(info.tz)}&forecast_days=3`);
           const fcastData = await fcastR.json();
           const maxTemps = fcastData.daily?.temperature_2m_max || [];
-          if (maxTemps.length < 2) continue;
+          if (maxTemps.length < 3) continue;
 
-          const forecastMax = maxTemps[1]; // tomorrow's forecast
+          const forecastMax = maxTemps[2]; // day-after-tomorrow's forecast
           const safeFloor = Math.floor(forecastMax - 3); // conservative: 3°C below forecast
 
           console.log(`[weather-pre] ${city} tomorrow forecast: ${forecastMax}°C | safe floor: ${safeFloor}°C | placing NO below ${safeFloor}°C`);

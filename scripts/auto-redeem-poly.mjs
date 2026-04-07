@@ -18,6 +18,11 @@ const USDC = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
 const WCOL = '0x3A3BD7bb9528E159577F7C2e685CC81A765002E2'; // Wrapped collateral for negRisk
 const ZERO_ADDR = '0x0000000000000000000000000000000000000000';
 const ZERO_BYTES32 = '0x0000000000000000000000000000000000000000000000000000000000000000';
+const MULTISEND = '0xA238CBeb142c10Ef7Ad8442C6D1f9E89e07e7761';
+
+const MULTISEND_IFACE = new Interface([
+  'function multiSend(bytes transactions)',
+]);
 
 const CTF_IFACE = new Interface([
   'function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint[] indexSets)',
@@ -38,6 +43,49 @@ const provider = new JsonRpcProvider(POLYGON_RPC);
 const wallet = new Wallet(process.env.PRIVATE_KEY, provider);
 const FUNDER = process.env.FUNDER_ADDRESS;
 const safe = new Contract(FUNDER, SAFE_ABI, wallet);
+
+/**
+ * Encode a single call for MultiSend: operation(1) + to(20) + value(32) + dataLen(32) + data
+ */
+function encodeMultiSendCall(to, data) {
+  const op = '00'; // CALL
+  const addr = to.replace('0x', '').toLowerCase().padStart(40, '0');
+  const value = '0'.repeat(64); // 0 value
+  const dataBytes = data.replace('0x', '');
+  const dataLen = (dataBytes.length / 2).toString(16).padStart(64, '0');
+  return op + addr + value + dataLen + dataBytes;
+}
+
+/**
+ * Execute multiple calls in one Safe tx via MultiSend (saves gas)
+ */
+async function execBatchViaSafe(calls) {
+  // calls = [{ to, data }, ...]
+  if (calls.length === 0) return null;
+  if (calls.length === 1) return execViaSafe(calls[0].to, calls[0].data);
+
+  // Encode all calls for MultiSend
+  const packed = '0x' + calls.map(c => encodeMultiSendCall(c.to, c.data)).join('');
+  const multiSendData = MULTISEND_IFACE.encodeFunctionData('multiSend', [packed]);
+
+  // Execute via Safe with operation=1 (DELEGATECALL to MultiSend)
+  const nonce = await safe.nonce();
+  const txHash = await safe.getTransactionHash(
+    MULTISEND, 0, multiSendData, 1, // operation=1 = DELEGATECALL
+    0, 0, 0, ZERO_ADDR, ZERO_ADDR, nonce,
+  );
+  const sig = await wallet.signMessage(arrayify(txHash));
+  const sigBytes = arrayify(sig);
+  sigBytes[64] += 4;
+  const gasPrice = await provider.getGasPrice();
+
+  const tx = await safe.execTransaction(
+    MULTISEND, 0, multiSendData, 1, // DELEGATECALL
+    0, 0, 0, ZERO_ADDR, ZERO_ADDR, hexlify(sigBytes),
+    { gasLimit: 500000 + calls.length * 100000, gasPrice: 30000000000n }
+  );
+  return tx;
+}
 
 /**
  * Execute a transaction through the Gnosis Safe proxy
@@ -65,14 +113,13 @@ async function execViaSafe(to, data) {
   const sigBytes = arrayify(sig);
   sigBytes[64] += 4;
 
-  // Use legacy gas pricing (more reliable on Polygon)
-  const gasPrice = await provider.getGasPrice();
+  // Fixed 30 gwei gas price (cheap, Polygon always confirms)
 
   const tx = await safe.execTransaction(
     to, 0, data, 0, 0, 0, 0, ZERO_ADDR, ZERO_ADDR, hexlify(sigBytes),
     {
       gasLimit: 500000,
-      gasPrice: gasPrice.mul(2),
+      gasPrice: 30000000000n,
     }
   );
   return tx;
@@ -102,58 +149,49 @@ async function checkAndRedeem() {
     });
 
     console.log(`[auto-redeem] ${unique.length} positions to redeem`);
+    if (!unique.length) return;
 
+    // Build batch of redeem calls
+    const calls = [];
     for (const pos of unique) {
-      try {
-        // Both negRisk and non-negRisk use CT.redeemPositions
-        // negRisk uses WCOL as collateral, non-negRisk uses USDC
-        const collateral = pos.negativeRisk ? WCOL : USDC;
-        const data = CTF_IFACE.encodeFunctionData('redeemPositions', [
-          collateral,
-          ZERO_BYTES32,
-          pos.conditionId,
-          [1, 2],
-        ]);
+      const collateral = pos.negativeRisk ? WCOL : USDC;
+      const data = CTF_IFACE.encodeFunctionData('redeemPositions', [
+        collateral, ZERO_BYTES32, pos.conditionId, [1, 2],
+      ]);
+      calls.push({ to: CONDITIONAL_TOKENS, data });
+      console.log(`[auto-redeem] Batch: "${pos.title?.slice(0, 45)}" (${pos.outcome} ${pos.size?.toFixed(1)}sh, negRisk: ${!!pos.negativeRisk})`);
+    }
 
-        console.log(`[auto-redeem] Redeeming "${pos.title?.slice(0, 50)}" (${pos.outcome} ${pos.size?.toFixed(1)} shares, negRisk: ${!!pos.negativeRisk})`);
-
-        const tx = await execViaSafe(CONDITIONAL_TOKENS, data);
-        console.log(`[auto-redeem] TX: ${tx.hash}`);
-        const receipt = await tx.wait();
-        console.log(`[auto-redeem] Redeemed! Block ${receipt.blockNumber}`);
-        redeemedSet.add(pos.conditionId);
-      } catch (e) {
-        const msg = e.message?.slice(0, 250) || String(e);
-        if (msg.includes('reverted') || msg.includes('already')) {
-          console.log(`[auto-redeem] Skip "${pos.title?.slice(0, 30)}": already redeemed`);
+    // Execute all redeems in one Safe transaction via MultiSend
+    try {
+      console.log(`[auto-redeem] Sending batch of ${calls.length} redeems...`);
+      const tx = await execBatchViaSafe(calls);
+      console.log(`[auto-redeem] Batch TX: ${tx.hash}`);
+      const receipt = await tx.wait();
+      console.log(`[auto-redeem] Batch redeemed! Block ${receipt.blockNumber} (${calls.length} positions, gas: ${receipt.gasUsed.toString()})`);
+      unique.forEach(p => redeemedSet.add(p.conditionId));
+    } catch (e) {
+      const msg = e.message?.slice(0, 250) || String(e);
+      console.error(`[auto-redeem] Batch failed:`, msg.slice(0, 150));
+      // Fall back to one-by-one if batch fails
+      console.log(`[auto-redeem] Falling back to individual redeems...`);
+      for (const pos of unique) {
+        try {
+          const collateral = pos.negativeRisk ? WCOL : USDC;
+          const data = CTF_IFACE.encodeFunctionData('redeemPositions', [
+            collateral, ZERO_BYTES32, pos.conditionId, [1, 2],
+          ]);
+          const tx = await execViaSafe(CONDITIONAL_TOKENS, data);
+          console.log(`[auto-redeem] TX: ${tx.hash}`);
+          const receipt = await tx.wait();
+          console.log(`[auto-redeem] Redeemed! Block ${receipt.blockNumber}`);
           redeemedSet.add(pos.conditionId);
-        } else if (msg.includes('insufficient funds')) {
-          // Try with explicit nonce and higher gas
-          try {
-            const nonce2 = await provider.getTransactionCount(wallet.address, 'pending');
-            const gp = await provider.getGasPrice();
-            console.log(`[auto-redeem] Retrying with nonce=${nonce2} gasPrice=${gp.toString()}`);
-            const collateral2 = pos.negativeRisk ? WCOL : USDC;
-            const data2 = CTF_IFACE.encodeFunctionData('redeemPositions', [collateral2, ZERO_BYTES32, pos.conditionId, [1, 2]]);
-            const target2 = CONDITIONAL_TOKENS;
-            const nonce3 = await safe.nonce();
-            const txHash2 = await safe.getTransactionHash(target2, 0, data2, 0, 0, 0, 0, ZERO_ADDR, ZERO_ADDR, nonce3);
-            const sig2 = await wallet.signMessage(arrayify(txHash2));
-            const sigBytes2 = arrayify(sig2);
-            sigBytes2[64] += 4;
-            const tx2 = await safe.execTransaction(
-              target2, 0, data2, 0, 0, 0, 0, ZERO_ADDR, ZERO_ADDR, hexlify(sigBytes2),
-              { gasLimit: 500000, gasPrice: gp.mul(2), nonce: nonce2 }
-            );
-            console.log(`[auto-redeem] Retry TX: ${tx2.hash}`);
-            const receipt2 = await tx2.wait();
-            console.log(`[auto-redeem] Retry redeemed! Block ${receipt2.blockNumber}`);
+        } catch (e2) {
+          const msg2 = e2.message?.slice(0, 150) || '';
+          if (msg2.includes('reverted') || msg2.includes('already')) {
             redeemedSet.add(pos.conditionId);
-          } catch (e2) {
-            console.error(`[auto-redeem] Retry also failed "${pos.title?.slice(0, 30)}":`, e2.message?.slice(0, 150));
           }
-        } else {
-          console.error(`[auto-redeem] Error "${pos.title?.slice(0, 30)}":`, msg);
+          console.error(`[auto-redeem] Error "${pos.title?.slice(0, 30)}":`, msg2);
         }
       }
     }
