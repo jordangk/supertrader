@@ -3399,7 +3399,7 @@ async function refreshEvent(clientBtcOpen) {
         (async () => {
           try {
             const negRisk = activeEvent?.negRisk || false;
-            const result = await placeLive99Order(winToken, 20, negRisk, `[btc15m-99] ${winSide} 5sh`);
+            const result = await placeLive99Order(winToken, 30, negRisk, `[btc15m-99] ${winSide} 5sh`);
           } catch (e) {
             console.error('[btc15m-99] Error:', e.message?.slice(0, 60));
           }
@@ -6109,7 +6109,7 @@ async function checkExactScores(slug, title, score, firedSet) {
 
       console.log(`[exact-score] ${title.slice(0,30)} score ${score} → ${mHome}-${mAway} IMPOSSIBLE → BUY NO`);
       try {
-        const result = await placeLive99Order(noToken, 20, negRisk, `[exact-score] NO on ${mHome}-${mAway} 10sh`);
+        const result = await placeLive99Order(noToken, 30, negRisk, `[exact-score] NO on ${mHome}-${mAway} 10sh`);
         liveEventTracker.log.unshift({ ts: Date.now(), event: title, score, market: `Exact ${mHome}-${mAway} NO`, side: 'NO', price: '99.9¢', status: result?.status });
         if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
       } catch (err) {
@@ -6168,7 +6168,7 @@ async function buyExactScoreOnEnd(slug, title, finalScore) {
       const winLabel = winIdx === 0 ? 'YES' : 'NO';
       console.log(`[exact-score] END: ${q.slice(0,40)} → BUY ${winLabel} (${(winPrice*100).toFixed(0)}¢)`);
       try {
-        const result = await placeLive99Order(winToken, 20, negRisk, `[exact-score] END ${winLabel} on ${q.slice(0,30)} 10sh`);
+        const result = await placeLive99Order(winToken, 30, negRisk, `[exact-score] END ${winLabel} on ${q.slice(0,30)} 10sh`);
         liveEventTracker.log.unshift({ ts: Date.now(), event: title, score: finalScore, market: q.slice(0, 50), side: winLabel, price: '99.9¢', status: result?.status });
         if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
       } catch (err) {
@@ -6326,7 +6326,7 @@ setTimeout(async () => {
 
               console.log(`[live-ht] ${e.title.slice(0,25)} | ${q.slice(0,40)} → BUY ${winLabel}`);
               try {
-                const result = await placeLive99Order(winToken, 20, negRisk, `[live-ht] ${winLabel} on ${q.slice(0,30)} 10sh`);
+                const result = await placeLive99Order(winToken, 30, negRisk, `[live-ht] ${winLabel} on ${q.slice(0,30)} 10sh`);
                 liveEventTracker.log.unshift({ ts: Date.now(), event: e.title, score: htScore, market: q.slice(0, 50), side: winLabel, price: '99.9¢', status: result?.status });
                 if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
               } catch (err) {
@@ -6465,7 +6465,7 @@ setTimeout(async () => {
 
           console.log(`[live-ou] SCORE ${data.score} (total ${ouTotal}) > O/U ${line} → BUY ${overLabel} | ${data.title}`);
           try {
-            const result = await placeLive99Order(overToken, 20, negRisk, `[live-ou] ${overLabel} O/U ${line} 10sh`);
+            const result = await placeLive99Order(overToken, 30, negRisk, `[live-ou] ${overLabel} O/U ${line} 10sh`);
             liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: `O/U ${line}`, side: overLabel, price: '99.9¢', status: result?.status });
             if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
           } catch (err) {
@@ -6604,7 +6604,7 @@ setTimeout(async () => {
 
         console.log(`[tennis] ${data.title.slice(0,30)} | ${q.slice(0,40)} → ${winLabel} (minGames=${minTotalGames}, sets=${totalSetsPlayed})`);
         try {
-          const result = await placeLive99Order(winToken, 20, negRisk, `[tennis] ${winLabel} on ${q.slice(0,30)} 10sh`);
+          const result = await placeLive99Order(winToken, 30, negRisk, `[tennis] ${winLabel} on ${q.slice(0,30)} 10sh`);
           liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: q.slice(0, 50), side: winLabel, price: '99.9¢', status: result?.status });
           if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
         } catch (err) {
@@ -6695,7 +6695,7 @@ setTimeout(async () => {
         const winToken = tokens[winIdx];
         console.log(`[esports] ${data.title.slice(0,30)} ${s1}-${s2} Bo${bestOf} → O/U ${line} ${winLabel} (${totalGamesPlayed} maps, min ${minTotalGames})`);
         try {
-          const result = await placeLive99Order(winToken, 20, negRisk, `[esports] ${winLabel} O/U ${line} 10sh`);
+          const result = await placeLive99Order(winToken, 30, negRisk, `[esports] ${winLabel} O/U ${line} 10sh`);
           liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: `Games O/U ${line} ${winLabel}`, side: winLabel, price: '99.9¢', status: result?.status });
           if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
         } catch (err) {
@@ -6737,7 +6737,7 @@ setTimeout(async () => {
           // No CLOB price check — map is completed, Gamma confirms winner, just place limit
           console.log(`[esports] ${data.title.slice(0,30)} Map ${mapNum} Winner → ${winLabel} (Gamma ${(Math.max(p0,p1)*100).toFixed(0)}%)`);
           try {
-            const result = await placeLive99Order(winToken, 20, negRisk, `[esports] ${winLabel} Map ${mapNum} 10sh`);
+            const result = await placeLive99Order(winToken, 30, negRisk, `[esports] ${winLabel} Map ${mapNum} 10sh`);
             liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: `Map ${mapNum} Winner`, side: winLabel, price: '99.9¢', status: result?.status });
             if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
           } catch (err) {
@@ -6793,7 +6793,7 @@ setTimeout(async () => {
           } catch { continue; }
 
           data._esportsFired.add(condId);
-          const shares = 20;
+          const shares = 30;
           console.log(`[esports] ${data.title.slice(0,25)} Game ${gameNum}: ${q.slice(0,35)} → ${winLabel} ($${mktVol.toFixed(0)} vol)`);
           try {
             const result = await placeLive99Order(winToken, shares, negRisk, `[esports] ${winLabel} ${q.slice(0,25)} ${shares}sh`);
@@ -6861,7 +6861,7 @@ setTimeout(async () => {
 
           console.log(`[esports] ${data.title.slice(0,30)} ${s1}-${s2} Handicap ${spread} → ${winLabel}`);
           try {
-            const result = await placeLive99Order(winToken, 20, negRisk, `[esports] ${winLabel} HC ${spread} 10sh`);
+            const result = await placeLive99Order(winToken, 30, negRisk, `[esports] ${winLabel} HC ${spread} 10sh`);
             liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: q.slice(0, 50), side: winLabel, price: '99.9¢', status: result?.status });
             if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
           } catch (err) {
@@ -6909,7 +6909,7 @@ setTimeout(async () => {
         data._bttsFired = true;
         console.log(`[soccer] ${data.title.slice(0,30)} ${data.score} → Both Teams to Score: YES`);
         try {
-          const result = await placeLive99Order(yesToken, 20, negRisk, `[soccer] BTTS Yes 10sh`);
+          const result = await placeLive99Order(yesToken, 30, negRisk, `[soccer] BTTS Yes 10sh`);
           liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: 'Both Teams to Score', side: 'Yes', price: '99.9¢', status: result?.status });
           if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
         } catch (err) {
@@ -6957,7 +6957,7 @@ setTimeout(async () => {
         data._firstInningFired = true;
         console.log(`[mlb] ${data.title.slice(0,30)} ${data.score} in ${data.period} → First inning run: YES`);
         try {
-          const result = await placeLive99Order(yesToken, 20, negRisk, `[mlb] 1st inning run Yes 10sh`);
+          const result = await placeLive99Order(yesToken, 30, negRisk, `[mlb] 1st inning run Yes 10sh`);
           liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: 'First inning run', side: 'Yes', price: '99.9¢', status: result?.status });
           if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
         } catch (err) {
@@ -7095,7 +7095,7 @@ setTimeout(async () => {
           continue;
         }
 
-        let orderSize = 20;
+        let orderSize = 30;
         // Verify BOTH sides from CLOB — sum must be <= 103¢
         try {
           const [r0, r1] = await Promise.all([
@@ -7259,7 +7259,7 @@ setTimeout(async () => {
         } catch { continue; }
 
         try {
-          const result = await placeLive99Order(winToken, 20, negRisk, `[startup-scan] ${winOutcome} on ${m.question?.slice(0,30)} 10sh`);
+          const result = await placeLive99Order(winToken, 30, negRisk, `[startup-scan] ${winOutcome} on ${m.question?.slice(0,30)} 10sh`);
           if (result) placed++;
         } catch {}
       }
@@ -7324,7 +7324,7 @@ function scheduleBtcHourlyScan() {
 
               console.log(`[btc1h-99] Event ended: ${oldSlug} | ${winLabel} won (${(winPrice*100).toFixed(0)}¢) — placing 99.9¢ limit`);
               try {
-                await placeLive99Order(winToken, 20, negRisk, `[btc1h-99] ${winLabel} 5sh`);
+                await placeLive99Order(winToken, 30, negRisk, `[btc1h-99] ${winLabel} 5sh`);
               } catch (err) {
                 console.error('[btc1h-99] Error:', err.message?.slice(0, 60));
               }
@@ -7459,7 +7459,7 @@ function scheduleWeatherPreMarket() {
             const winLabel = outcomes[winIdx];
             console.log(`[weather-pre] ${city} → ${q.slice(0,40)} → ${winLabel} (floor ${safeFloor}°C)`);
             try {
-              await placeLive99Order(winToken, 20, negRisk, `[weather-pre] ${city} ${winLabel} 20sh`);
+              await placeLive99Order(winToken, 30, negRisk, `[weather-pre] ${city} ${winLabel} 20sh`);
             } catch (err) {
               console.error(`[weather-pre] Error:`, err.message?.slice(0, 60));
             }
@@ -7629,7 +7629,7 @@ async function runWeatherScan() {
 
           console.log(`[weather] ${city} ${maxTemp}°C → ${q.slice(0, 45)} → ${winLabel}`);
           try {
-            const result = await placeLive99Order(winToken, 20, negRisk, `[weather] ${city} ${winLabel} 10sh`);
+            const result = await placeLive99Order(winToken, 30, negRisk, `[weather] ${city} ${winLabel} 10sh`);
             liveEventTracker.log.unshift({ ts: Date.now(), event: event.title, market: q.slice(0, 50), side: winLabel, price: '99.9¢', status: result?.status });
             if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
           } catch (err) {

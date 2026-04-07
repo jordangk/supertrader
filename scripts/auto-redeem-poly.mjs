@@ -82,7 +82,7 @@ async function execBatchViaSafe(calls) {
   const tx = await safe.execTransaction(
     MULTISEND, 0, multiSendData, 1, // DELEGATECALL
     0, 0, 0, ZERO_ADDR, ZERO_ADDR, hexlify(sigBytes),
-    { gasLimit: 500000 + calls.length * 100000, gasPrice: 30000000000n }
+    { gasLimit: 500000 + calls.length * 100000, gasPrice: (await provider.getGasPrice()).mul(110).div(100) }
   );
   return tx;
 }
@@ -119,7 +119,7 @@ async function execViaSafe(to, data) {
     to, 0, data, 0, 0, 0, 0, ZERO_ADDR, ZERO_ADDR, hexlify(sigBytes),
     {
       gasLimit: 500000,
-      gasPrice: 30000000000n,
+      gasPrice: (await provider.getGasPrice()).mul(110).div(100),
     }
   );
   return tx;
@@ -148,18 +148,37 @@ async function checkAndRedeem() {
       return true;
     });
 
-    console.log(`[auto-redeem] ${unique.length} positions to redeem`);
+    // Calculate total redeemable value
+    const totalValue = unique.reduce((sum, p) => sum + parseFloat(p.size || 0), 0);
+    console.log(`[auto-redeem] ${unique.length} positions to redeem ($${totalValue.toFixed(2)} value)`);
     if (!unique.length) return;
 
-    // Build batch of redeem calls
+    // Wait until $400+ in redeemable value to batch efficiently
+    if (totalValue < 400) {
+      console.log(`[auto-redeem] Waiting for $400 threshold ($${totalValue.toFixed(2)}/$400)`);
+      return;
+    }
+
+    // Build batch of redeem calls + WCOL unwrap
     const calls = [];
+    let negRiskTotal = 0;
     for (const pos of unique) {
       const collateral = pos.negativeRisk ? WCOL : USDC;
       const data = CTF_IFACE.encodeFunctionData('redeemPositions', [
         collateral, ZERO_BYTES32, pos.conditionId, [1, 2],
       ]);
       calls.push({ to: CONDITIONAL_TOKENS, data });
+      if (pos.negativeRisk) negRiskTotal += parseFloat(pos.size || 0);
       console.log(`[auto-redeem] Batch: "${pos.title?.slice(0, 45)}" (${pos.outcome} ${pos.size?.toFixed(1)}sh, negRisk: ${!!pos.negativeRisk})`);
+    }
+
+    // Add WCOL unwrap to the batch if any negRisk positions
+    if (negRiskTotal > 0) {
+      // Use a large amount to unwrap everything (actual balance after redeems)
+      const wcolAmount = Math.ceil(negRiskTotal * 1e6).toString();
+      const unwrapData = WCOL_IFACE.encodeFunctionData('unwrap', [FUNDER, wcolAmount]);
+      calls.push({ to: WCOL, data: unwrapData });
+      console.log(`[auto-redeem] Batch: unwrap ~${negRiskTotal.toFixed(1)} WCOL → USDC`);
     }
 
     // Execute all redeems in one Safe transaction via MultiSend
