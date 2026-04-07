@@ -7349,6 +7349,136 @@ setTimeout(() => {
   // scheduleBtcHourlyScan();
 }, 20000);
 
+// ── Weather Pre-Market Forecast Scanner ──
+// 30 min before each city's new day, use forecast to place NO on guaranteed-low temps
+const WEATHER_COORDS = {
+  wellington: { lat: -41.29, lon: 174.78 },
+  tokyo: { lat: 35.68, lon: 139.77 },
+  seoul: { lat: 37.57, lon: 126.98 },
+  shanghai: { lat: 31.23, lon: 121.47 },
+  beijing: { lat: 39.90, lon: 116.40 },
+  taipei: { lat: 25.03, lon: 121.57 },
+  singapore: { lat: 1.35, lon: 103.82 },
+  'kuala-lumpur': { lat: 3.14, lon: 101.69 },
+  jakarta: { lat: -6.21, lon: 106.85 },
+  paris: { lat: 48.86, lon: 2.35 },
+  london: { lat: 51.51, lon: -0.13 },
+  miami: { lat: 25.76, lon: -80.19 },
+  chicago: { lat: 41.88, lon: -87.63 },
+  'los-angeles': { lat: 34.05, lon: -118.24 },
+};
+
+const weatherPreFired = new Set(); // track city+date combos we've already placed pre-market orders on
+
+function scheduleWeatherPreMarket() {
+  setTimeout(async () => {
+    try {
+      if (!clobClient) { scheduleWeatherPreMarket(); return; }
+      const bal = await getUsdcBalance();
+      if (bal < 10) { scheduleWeatherPreMarket(); return; }
+
+      for (const [city, info] of Object.entries(WEATHER_CITIES)) {
+        const coords = WEATHER_COORDS[city];
+        if (!coords) continue;
+
+        // Get tomorrow's date in this city's timezone
+        const now = new Date();
+        const tomorrow = new Date(now.getTime() + 86400000);
+        const tomorrowLocal = new Date(tomorrow.toLocaleString('en-US', { timeZone: info.tz }));
+        const localNow = new Date(now.toLocaleString('en-US', { timeZone: info.tz }));
+        const localHour = localNow.getHours();
+        const localMin = localNow.getMinutes();
+
+        // Only fire at 23:30 local (30 min before new day)
+        if (localHour !== 23 || localMin < 25 || localMin > 35) continue;
+
+        const monthNames = ['january','february','march','april','may','june','july','august','september','october','november','december'];
+        const tDate = tomorrowLocal;
+        const tSlug = `highest-temperature-in-${city}-on-${monthNames[tDate.getMonth()]}-${tDate.getDate()}-${tDate.getFullYear()}`;
+        const preKey = `${city}-${tSlug}`;
+
+        if (weatherPreFired.has(preKey)) continue;
+
+        // Get forecast for tomorrow
+        try {
+          const fcastR = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${coords.lat}&longitude=${coords.lon}&daily=temperature_2m_max&timezone=${encodeURIComponent(info.tz)}&forecast_days=2`);
+          const fcastData = await fcastR.json();
+          const maxTemps = fcastData.daily?.temperature_2m_max || [];
+          if (maxTemps.length < 2) continue;
+
+          const forecastMax = maxTemps[1]; // tomorrow's forecast
+          const safeFloor = Math.floor(forecastMax - 3); // conservative: 3°C below forecast
+
+          console.log(`[weather-pre] ${city} tomorrow forecast: ${forecastMax}°C | safe floor: ${safeFloor}°C | placing NO below ${safeFloor}°C`);
+
+          // Fetch the Poly event for tomorrow
+          const evR = await fetch(`https://gamma-api.polymarket.com/events?slug=${tSlug}`);
+          const evData = await evR.json();
+          const ev = Array.isArray(evData) ? evData[0] : evData;
+          if (!ev?.markets?.length) { console.log(`[weather-pre] ${city}: no markets for ${tSlug}`); continue; }
+
+          weatherPreFired.add(preKey);
+
+          for (const mkt of ev.markets) {
+            const q = mkt.question || '';
+            const condId = mkt.conditionId;
+            if (!condId || weatherFired.has(condId)) continue;
+
+            const tokens = typeof mkt.clobTokenIds === 'string' ? JSON.parse(mkt.clobTokenIds) : mkt.clobTokenIds;
+            const outcomes = typeof mkt.outcomes === 'string' ? JSON.parse(mkt.outcomes) : mkt.outcomes;
+            if (!tokens || tokens.length < 2 || !outcomes) continue;
+            const negRisk = mkt.negRisk != null ? mkt.negRisk : true;
+
+            // Parse temperature from question
+            const exactMatch = q.match(/be\s+(\d+)°C\s+on/);
+            const orBelowMatch = q.match(/be\s+(\d+)°C\s+or\s+below/i);
+
+            let winIdx = -1;
+
+            if (orBelowMatch) {
+              const threshold = parseInt(orBelowMatch[1]);
+              // "X°C or below" — if safe floor > threshold, NO is guaranteed
+              if (safeFloor > threshold) {
+                winIdx = outcomes.findIndex(o => o.toLowerCase() === 'no');
+                if (winIdx < 0) winIdx = 1;
+              }
+            } else if (exactMatch) {
+              const threshold = parseInt(exactMatch[1]);
+              // "Will highest be X°C?" — if safe floor > threshold, NO is guaranteed
+              if (safeFloor > threshold) {
+                winIdx = outcomes.findIndex(o => o.toLowerCase() === 'no');
+                if (winIdx < 0) winIdx = 1;
+              }
+            }
+
+            if (winIdx < 0) continue;
+            weatherFired.add(condId);
+            saveWeatherFired();
+
+            const winToken = tokens[winIdx];
+            const winLabel = outcomes[winIdx];
+            console.log(`[weather-pre] ${city} → ${q.slice(0,40)} → ${winLabel} (floor ${safeFloor}°C)`);
+            try {
+              await placeLive99Order(winToken, 20, negRisk, `[weather-pre] ${city} ${winLabel} 20sh`);
+            } catch (err) {
+              console.error(`[weather-pre] Error:`, err.message?.slice(0, 60));
+            }
+          }
+        } catch (e) {
+          console.error(`[weather-pre] ${city} forecast error:`, e.message?.slice(0, 60));
+        }
+      }
+    } catch (e) {
+      console.error('[weather-pre] Error:', e.message?.slice(0, 60));
+    }
+    scheduleWeatherPreMarket();
+  }, 60000); // Check every minute
+}
+setTimeout(() => {
+  console.log('[weather-pre] Pre-market forecast scanner started');
+  scheduleWeatherPreMarket();
+}, 25000);
+
 // ── Weather Temperature Scanner ──
 // Every hour, check actual observed temps and buy on decided weather markets
 // Weather cities — only those with Wunderground resolution source on Poly
