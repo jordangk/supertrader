@@ -3384,8 +3384,8 @@ async function refreshEvent(clientBtcOpen) {
     }
     console.log('[EVENT] new active event:', event.slug);
 
-    // ── Place 99.9¢ limit on the winner of the just-ended event ──
-    if (liveState.tokenUp && liveState.tokenDown && clobClient) {
+    // ── BTC 15m auto-99 DISABLED ──
+    if (false && liveState.tokenUp && liveState.tokenDown && clobClient) {
       const oldUp = liveState.upPrice, oldDown = liveState.downPrice;
       if (oldUp != null && oldDown != null) {
         const winSide = oldUp > oldDown ? 'up' : 'down';
@@ -6377,8 +6377,8 @@ setTimeout(async () => {
               const oldTotal = oldParts.length >= 2 ? oldParts[0] + oldParts[1] : 0;
               const espnTotal = s0 + s1;
 
-              // Only update if ESPN total is HIGHER (score can only go up)
-              if (espnTotal <= oldTotal) break;
+              // Skip if same total (no change)
+              if (espnTotal === oldTotal) break;
 
               // Map to Poly home-away format
               const homeScore = parseInt(t0.homeAway === 'home' ? t0.score : t1.score) || 0;
@@ -6804,7 +6804,8 @@ setTimeout(async () => {
           }
         }
 
-        // ── Esports Map Handicap: if series lead >= handicap, it's guaranteed ──
+        // ── Esports Map Handicap: DISABLED — not 100% certain (some tournaments play all maps) ──
+        if (false)
         // e.g., 2-0 in BO3 → Team (-1.5) is guaranteed (lead of 2 > 1.5)
         for (const m of data.markets) {
           const q = m.question || '';
@@ -7020,6 +7021,42 @@ setTimeout(async () => {
         }
       } catch {}
 
+      // Also verify via ESPN — if ESPN still shows In Progress, don't fire
+      let espnSaysLive = false;
+      try {
+        const titleLower = (data.title || '').toLowerCase();
+        for (const league of ['baseball/mlb', 'basketball/nba', 'hockey/nhl', 'soccer/eng.1', 'soccer/esp.1', 'soccer/ger.1', 'soccer/ita.1', 'soccer/fra.1', 'soccer/usa.1', 'soccer/nor.1']) {
+          if (espnSaysLive) break;
+          const espnR = await fetch(`https://site.api.espn.com/apis/site/v2/sports/${league}/scoreboard`, { signal: AbortSignal.timeout(3000) });
+          const espnData = await espnR.json();
+          for (const ev of (espnData.events || [])) {
+            const comp = ev.competitions?.[0];
+            if (!comp?.competitors?.length) continue;
+            const t0 = comp.competitors[0], t1 = comp.competitors[1];
+            const team0Names = [t0.team?.displayName?.toLowerCase(), t0.team?.shortDisplayName?.toLowerCase()].filter(Boolean);
+            const team1Names = [t1.team?.displayName?.toLowerCase(), t1.team?.shortDisplayName?.toLowerCase()].filter(Boolean);
+            const team0Match = team0Names.some(n => n.length > 2 && titleLower.includes(n));
+            const team1Match = team1Names.some(n => n.length > 2 && titleLower.includes(n));
+            if (team0Match && team1Match) {
+              const espnStatus = comp.status?.type?.description || '';
+              if (espnStatus === 'In Progress') {
+                espnSaysLive = true;
+              } else {
+                console.log(`[live-99] ESPN confirms: ${data.title} status=${espnStatus}`);
+              }
+              break;
+            }
+          }
+        }
+      } catch {}
+
+      if (espnSaysLive) {
+        console.log(`[live-99] FALSE ALARM: ${data.title} still In Progress on ESPN — NOT ended`);
+        liveEventTracker.fired.delete(slug);
+        liveEventTracker.knownLive.set(slug, data);
+        continue;
+      }
+
       console.log(`[live-99] CONFIRMED ENDED: ${data.title} (${data.score}) — placing orders`);
 
       // Re-fetch event to get latest prices for all markets
@@ -7051,8 +7088,10 @@ setTimeout(async () => {
         const winToken = tokens[winIdx];
         const winOutcome = outcomes ? outcomes[winIdx] : winIdx === 0 ? 'Yes' : 'No';
 
-        if (!winToken || winPrice < 0.90 || losePrice > 0.15) {
-          console.log(`[live-99] SKIP ${m.question?.slice(0,30)}: winner=${(winPrice*100).toFixed(0)}¢ loser=${(losePrice*100).toFixed(0)}¢ — not clear enough`);
+        const mktVol = parseFloat(m.volume || 0);
+        if (!winToken || winPrice < 0.90 || losePrice > 0.15 || mktVol < 100) {
+          if (winPrice >= 0.90 && mktVol < 100) console.log(`[live-99] SKIP ${m.question?.slice(0,30)}: vol $${mktVol.toFixed(0)} < $100`);
+          else if (winPrice < 0.90) console.log(`[live-99] SKIP ${m.question?.slice(0,30)}: winner=${(winPrice*100).toFixed(0)}¢ < 90¢`);
           continue;
         }
 
@@ -7203,7 +7242,8 @@ setTimeout(async () => {
         const winOutcome = outcomes ? outcomes[winIdx] : winIdx === 0 ? 'Yes' : 'No';
         const negRisk = m.negRisk != null ? m.negRisk : true;
 
-        if (!winToken || winPrice < 0.90 || losePrice > 0.15) continue;
+        const mktVol2 = parseFloat(m.volume || 0);
+        if (!winToken || winPrice < 0.90 || losePrice > 0.15 || mktVol2 < 100) continue;
 
         // Both sides sum check
         try {
@@ -7304,8 +7344,9 @@ function scheduleBtcHourlyScan() {
 // Start after 20s
 setTimeout(() => {
   btcHourlyState.currentSlug = getBtcHourlySlug();
-  console.log(`[btc1h] Tracking hourly BTC: ${btcHourlyState.currentSlug}`);
-  scheduleBtcHourlyScan();
+  // BTC hourly DISABLED
+  // console.log(`[btc1h] Tracking hourly BTC: ${btcHourlyState.currentSlug}`);
+  // scheduleBtcHourlyScan();
 }, 20000);
 
 // ── Weather Temperature Scanner ──
