@@ -154,7 +154,7 @@ async function checkAndRedeem() {
     if (!unique.length) return;
 
     // Wait until $400+ in redeemable value to batch efficiently
-    if (totalValue < 400) {
+    if (totalValue < 50) {
       console.log(`[auto-redeem] Waiting for $400 threshold ($${totalValue.toFixed(2)}/$400)`);
       return;
     }

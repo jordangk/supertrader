@@ -6670,13 +6670,23 @@ setTimeout(async () => {
         const negRisk = m.negRisk != null ? m.negRisk : true;
 
         let winIdx = -1, winLabel = '';
+        
+        // NEW: When Game 3 starts (entering map 3), always buy Under 2.5
+        const enteringGame3 = totalGamesPlayed === 2 && line === 2.5;
+        if (enteringGame3) {
+          // Buy Under 2.5 when starting game 3
+          winIdx = outcomes ? outcomes.findIndex(o => o.toLowerCase().includes('under')) : 1;
+          if (winIdx < 0) winIdx = 1;
+          winLabel = outcomes?.[winIdx] || 'Under';
+          console.log(`[esports] GAME 3 START: Buying Under ${line} on ${data.title.slice(0,30)}`);
+        }
         // Over: minimum total games already exceeds line
-        if (minTotalGames > line) {
+        else if (minTotalGames > line) {
           winIdx = outcomes ? outcomes.findIndex(o => o.toLowerCase().includes('over')) : 0;
           if (winIdx < 0) winIdx = 0;
           winLabel = outcomes?.[winIdx] || 'Over';
         }
-        // Under DISABLED — some tournaments play all maps regardless of series result
+        // Under DISABLED for other cases — some tournaments play all maps regardless of series result
         // (e.g., Overwatch OCS uses map differential, plays all 3 maps even at 2-0)
 
         if (winIdx < 0) continue;
