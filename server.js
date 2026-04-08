@@ -6779,7 +6779,7 @@ setTimeout(async () => {
           const p0 = parseFloat(prices[0]), p1 = parseFloat(prices[1]);
           if (Math.max(p0, p1) < 0.90) continue; // not decided enough
           const mktVol = parseFloat(m.volume || 0);
-          if (mktVol < 25) continue; // skip no-volume markets
+          if (mktVol < 100) continue; // skip low-volume markets
 
           const winIdx = p0 >= p1 ? 0 : 1;
           const winToken = tokens[winIdx];
@@ -7025,6 +7025,13 @@ setTimeout(async () => {
         const directEvent = Array.isArray(directData) ? directData[0] : directData;
         if (directEvent?.live === true) {
           console.log(`[live-99] FALSE ALARM: ${data.title} still live on direct fetch — NOT ended`);
+          liveEventTracker.fired.delete(slug);
+          liveEventTracker.knownLive.set(slug, data);
+          continue;
+        }
+        // CRITICAL: Check if event is actually ended/closed, not just not live
+        if (directEvent && !directEvent.ended && !directEvent.closed && directEvent.active !== false) {
+          console.log(`[live-99] FALSE ALARM: ${data.title} not ended (ended=${directEvent.ended}, closed=${directEvent.closed}, active=${directEvent.active}) — NOT ended`);
           liveEventTracker.fired.delete(slug);
           liveEventTracker.knownLive.set(slug, data);
           continue;
