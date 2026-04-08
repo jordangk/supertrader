@@ -2497,7 +2497,7 @@ for (const coin of EXTRA_5M_COINS) {
 
 
 // Server-side Auto-99: winning side >96¢ for 10s with no side switch → burst orders in last 1s
-const auto99State = { enabled: false, firedSlug: null, priceLog: [], firing: false };
+const auto99State = { enabled: true, firedSlug: null, priceLog: [], firing: false };
 app.post('/api/btc5m/auto99/toggle', (req, res) => {
   auto99State.enabled = !auto99State.enabled;
   if (!auto99State.enabled) { auto99State.firedSlug = null; auto99State.priceLog = []; auto99State.firing = false; }
@@ -3385,7 +3385,7 @@ async function refreshEvent(clientBtcOpen) {
     console.log('[EVENT] new active event:', event.slug);
 
     // ── BTC 15m auto-99 DISABLED ──
-    if (false && liveState.tokenUp && liveState.tokenDown && clobClient) {
+    if (liveState.tokenUp && liveState.tokenDown && clobClient) {
       const oldUp = liveState.upPrice, oldDown = liveState.downPrice;
       if (oldUp != null && oldDown != null) {
         const winSide = oldUp > oldDown ? 'up' : 'down';
@@ -7345,8 +7345,8 @@ function scheduleBtcHourlyScan() {
 setTimeout(() => {
   btcHourlyState.currentSlug = getBtcHourlySlug();
   // BTC hourly DISABLED
-  // console.log(`[btc1h] Tracking hourly BTC: ${btcHourlyState.currentSlug}`);
-  // scheduleBtcHourlyScan();
+  console.log(`[btc1h] Tracking hourly BTC: ${btcHourlyState.currentSlug}`);
+  scheduleBtcHourlyScan();
 }, 20000);
 
 // ── Weather Pre-Market Forecast Scanner ──
