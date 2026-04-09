@@ -7483,7 +7483,7 @@ setTimeout(() => {
 // Every hour: find pricing dips in consecutive >99.5% NO runs
 // A "sandwich" = a NO price dips below both neighbors, all >99.5%
 // If past 9 PM PT, scan tomorrow instead of today
-const SANDWICH_CITIES = ['wellington','tokyo','seoul','shanghai','beijing','taipei','singapore','kuala-lumpur','jakarta','paris','london','miami','chicago','los-angeles','amsterdam','ankara','wuhan','mumbai','delhi','bangkok','sao-paulo','mexico-city','cairo','istanbul','hong-kong','toronto','new-york','berlin','rome','madrid','lisbon'];
+const SANDWICH_CITIES = ['wellington','tokyo','seoul','shanghai','beijing','taipei','singapore','kuala-lumpur','jakarta','paris','london','miami','chicago','los-angeles','amsterdam','ankara','wuhan','mumbai','delhi','bangkok','sao-paulo','mexico-city','cairo','istanbul','hong-kong','toronto','new-york','berlin','rome','madrid','lisbon','milan','warsaw','helsinki','buenos-aires','munich','atlanta','denver','san-francisco','seattle','dallas','houston','austin'];
 const sandwichFired = new Set(); // conditionIds already placed
 
 function scheduleWeatherSandwich() {
