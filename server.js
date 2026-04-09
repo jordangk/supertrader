@@ -2388,8 +2388,39 @@ function schedule5mEvent() {
   const now = Date.now();
   const nowSecs = Math.floor(now / 1000);
   const nextSlot = (Math.floor(nowSecs / 300) + 1) * 300;
-  const delay = (nextSlot * 1000) - now + 3000; // 3s after 5m boundary
-  btc5mEventTimer = setTimeout(() => { refresh5mEvent(); schedule5mEvent(); }, delay);
+  const delay = (nextSlot * 1000) - now; // exactly on the 5m boundary
+  btc5mEventTimer = setTimeout(async () => {
+    // Place 99.9¢ on old event's winner before refreshing
+    if (btc5mState.tokenUp && btc5mState.tokenDown && clobClient) {
+      const oldUp = btc5mState.upPrice, oldDown = btc5mState.downPrice;
+      if (oldUp != null && oldDown != null) {
+        const winPrice = Math.max(oldUp, oldDown);
+        if (winPrice >= 0.90) {
+          const winSide = oldUp > oldDown ? 'up' : 'down';
+          const winToken = winSide === 'up' ? btc5mState.tokenUp : btc5mState.tokenDown;
+          console.log(`[btc5m-99] Event ended: ${btc5mState.eventSlug} | ${winSide} won (${(winPrice*100).toFixed(0)}¢)`);
+          try { await placeLive99Order(winToken, 50, btc5mState.negRisk || false, `[btc5m-99] ${winSide} 50sh`); } catch {}
+        }
+      }
+    }
+    // Also place on extra coins
+    for (const coin of EXTRA_5M_COINS) {
+      const e = extra5m[coin];
+      if (!e?.state?.tokenUp || !e?.state?.tokenDown || !clobClient) continue;
+      const up = e.state.upPrice, down = e.state.downPrice;
+      if (up == null || down == null) continue;
+      const winPrice = Math.max(up, down);
+      if (winPrice < 0.90) continue;
+      const winSide = up > down ? 'up' : 'down';
+      const winToken = winSide === 'up' ? e.state.tokenUp : e.state.tokenDown;
+      console.log(`[${coin}5m-99] Event ended: ${e.state.eventSlug} | ${winSide} won (${(winPrice*100).toFixed(0)}¢)`);
+      try { await placeLive99Order(winToken, 50, e.event?.negRisk || false, `[${coin}5m-99] ${winSide} 50sh`); } catch {}
+    }
+    refresh5mEvent();
+    // Also refresh extra coins
+    for (const coin of EXTRA_5M_COINS) { try { await refreshExtra5mEvent(coin); } catch {} }
+    schedule5mEvent();
+  }, delay);
 }
 
 // Multi-coin 5m tracker — all coins share the same logic
@@ -2486,7 +2517,7 @@ for (const coin of EXTRA_5M_COINS) {
     res.json({ success: true, side: winSide, price: 0.99, shares: 5 });
     (async () => {
       try {
-        const signed = await clobClient.createOrder({ tokenID: tokenId, price: 0.99, size: 5, side: 'BUY' }, { tickSize: String(e.event.tickSize || '0.01'), negRisk: e.event.negRisk || false });
+        const signed = await clobClient.createOrder({ tokenID: tokenId, price: 0.99, size: 50, side: 'BUY' }, { tickSize: String(e.event.tickSize || '0.01'), negRisk: e.event.negRisk || false });
         await clobClient.postOrder(signed, 'GTC');
       } catch (err) { console.error(`[${coin}-5m 99] error:`, err.message?.slice(0, 60)); }
     })();
@@ -2497,7 +2528,7 @@ for (const coin of EXTRA_5M_COINS) {
 
 
 // Server-side Auto-99: winning side >96¢ for 10s with no side switch → burst orders in last 1s
-const auto99State = { enabled: true, firedSlug: null, priceLog: [], firing: false };
+const auto99State = { enabled: false, firedSlug: null, priceLog: [], firing: false }; // Disabled — replaced by post-event 99.9¢ limit
 app.post('/api/btc5m/auto99/toggle', (req, res) => {
   auto99State.enabled = !auto99State.enabled;
   if (!auto99State.enabled) { auto99State.firedSlug = null; auto99State.priceLog = []; auto99State.firing = false; }
@@ -2516,10 +2547,10 @@ async function placeAuto99Order(coin, side, state, event) {
   const negRisk = event.negRisk || false;
   let result;
   try {
-    const signed = await clobClient.createOrder({ tokenID: tokenId, price: 0.999, size: 5, side: 'BUY' }, { tickSize: '0.001', negRisk });
+    const signed = await clobClient.createOrder({ tokenID: tokenId, price: 0.999, size: 50, side: 'BUY' }, { tickSize: '0.001', negRisk });
     result = await clobClient.postOrder(signed, 'GTC');
   } catch {
-    const signed2 = await clobClient.createOrder({ tokenID: tokenId, price: 0.99, size: 5, side: 'BUY' }, { tickSize: String(event.tickSize || '0.01'), negRisk });
+    const signed2 = await clobClient.createOrder({ tokenID: tokenId, price: 0.99, size: 50, side: 'BUY' }, { tickSize: String(event.tickSize || '0.01'), negRisk });
     result = await clobClient.postOrder(signed2, 'GTC');
   }
   console.log(`[${coin}-auto-99] PLACED: ${side} 5sh → ${result?.status} id:${result?.orderID?.slice(0,8)}`);
@@ -7561,6 +7592,75 @@ setTimeout(() => {
   console.log('[panda] PandaScore esports scanner started (4s polling)');
   schedulePandaScan();
 }, 28000);
+
+// ── Bitcoin Above Pre-Expiry Scanner ──
+// 30 min before expiry: cheapest YES at 99.9%+ and cheapest NO at 99.8%+, 10sh each
+const btcAbovePreFired = new Set();
+
+function scheduleBtcAbovePreScan() {
+  setTimeout(async () => {
+    try {
+      if (!clobClient) { scheduleBtcAbovePreScan(); return; }
+
+      const currentSlug = getBtcAboveSlug();
+      if (btcAbovePreFired.has(currentSlug)) { scheduleBtcAbovePreScan(); return; }
+
+      // Check if 30 min before expiry
+      try {
+        const r = await fetch(`https://gamma-api.polymarket.com/events?slug=${currentSlug}`);
+        const data = await r.json();
+        const e = Array.isArray(data) ? data[0] : data;
+        if (!e?.endDate || !e?.markets?.length) { scheduleBtcAbovePreScan(); return; }
+
+        const endMs = new Date(e.endDate).getTime();
+        const minsLeft = (endMs - Date.now()) / 60000;
+
+        if (minsLeft > 30 || minsLeft < 0) { scheduleBtcAbovePreScan(); return; }
+
+        btcAbovePreFired.add(currentSlug);
+
+        // Parse and sort markets by price level
+        const markets = [];
+        for (const m of e.markets) {
+          const prices = typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices;
+          const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
+          const outcomes = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes;
+          if (!prices || !tokens || prices.length < 2) continue;
+          const q = m.question || '';
+          const match = q.match(/above\s+([\d,]+)/);
+          const level = match ? parseInt(match[1].replace(/,/g, '')) : 0;
+          markets.push({
+            level, yesPrice: parseFloat(prices[0]), noPrice: parseFloat(prices[1]),
+            tokens, outcomes, negRisk: m.negRisk ?? false, q,
+          });
+        }
+        markets.sort((a, b) => a.level - b.level);
+
+        // Cheapest YES at 99.9%+ (highest level where YES is decided)
+        const bestYes = markets.filter(m => m.yesPrice >= 0.999).sort((a, b) => b.level - a.level)[0];
+        // Cheapest NO at 99.8%+ (lowest level where NO is decided)
+        const bestNo = markets.filter(m => m.noPrice >= 0.998).sort((a, b) => a.level - b.level)[0];
+
+        if (bestYes) {
+          console.log(`[btc-above-pre] ${currentSlug.slice(-10)} | YES $${bestYes.level} at ${(bestYes.yesPrice*100).toFixed(1)}¢`);
+          try { await placeLive99Order(bestYes.tokens[0], 10, bestYes.negRisk, `[btc-above-pre] YES $${bestYes.level} 10sh`); } catch {}
+        }
+        if (bestNo) {
+          console.log(`[btc-above-pre] ${currentSlug.slice(-10)} | NO $${bestNo.level} at ${(bestNo.noPrice*100).toFixed(1)}¢`);
+          try { await placeLive99Order(bestNo.tokens[1], 10, bestNo.negRisk, `[btc-above-pre] NO $${bestNo.level} 10sh`); } catch {}
+        }
+        if (!bestYes && !bestNo) {
+          console.log(`[btc-above-pre] ${currentSlug.slice(-10)} | No markets at threshold yet`);
+        }
+      } catch {}
+    } catch {}
+    scheduleBtcAbovePreScan();
+  }, 30000); // Check every 30s
+}
+setTimeout(() => {
+  console.log('[btc-above-pre] Pre-expiry scanner started');
+  scheduleBtcAbovePreScan();
+}, 32000);
 
 // ── Bitcoin Above Scanner ──
 // When hourly "Bitcoin above" events expire, place 99.9¢ on all decided markets
