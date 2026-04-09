@@ -97,7 +97,7 @@ async function initClobClient() {
     );
     console.log('[CLOB] Client ready');
     // Start auto-redeem for resolved Polymarket positions (every 60s)
-    startAutoRedeem(60000);
+    // startAutoRedeem(10800000); // DISABLED
   } catch (e) {
     console.error('[CLOB] Failed to init client:', e.message);
   }
@@ -7478,6 +7478,227 @@ setTimeout(() => {
   console.log('[weather-pre] Pre-market forecast scanner started');
   scheduleWeatherPreMarket();
 }, 25000);
+
+// ── Weather Sandwich Scanner ──
+// Every hour: find pricing dips in consecutive >99.5% NO runs
+// A "sandwich" = a NO price dips below both neighbors, all >99.5%
+// If past 9 PM PT, scan tomorrow instead of today
+const SANDWICH_CITIES = ['wellington','tokyo','seoul','shanghai','beijing','taipei','singapore','kuala-lumpur','jakarta','paris','london','miami','chicago','los-angeles','amsterdam','ankara','wuhan','mumbai','delhi','bangkok','sao-paulo','mexico-city','cairo','istanbul','hong-kong','toronto','new-york','berlin','rome','madrid','lisbon'];
+const sandwichFired = new Set(); // conditionIds already placed
+
+function scheduleWeatherSandwich() {
+  setTimeout(async () => {
+    try {
+      if (!clobClient) { scheduleWeatherSandwich(); return; }
+      const bal = await getUsdcBalance();
+      if (bal < 10) { scheduleWeatherSandwich(); return; }
+      if (!await isGammaAlive()) { scheduleWeatherSandwich(); return; }
+
+      // Determine which date to scan: today or tomorrow (if past 9 PM PT)
+      const now = new Date();
+      const ptHour = parseInt(now.toLocaleString('en-US', { timeZone: 'America/Los_Angeles', hour: 'numeric', hour12: false }));
+      const scanDate = ptHour >= 21 ? new Date(now.getTime() + 86400000) : now;
+      const monthNames = ['january','february','march','april','may','june','july','august','september','october','november','december'];
+      const month = monthNames[scanDate.getMonth()];
+      const day = scanDate.getDate();
+      const year = scanDate.getFullYear();
+
+      console.log(`[sandwich] Scanning ${month} ${day} (PT hour: ${ptHour}, ${ptHour >= 21 ? 'tomorrow' : 'today'})`);
+
+      // Get open orders to avoid duplicates
+      let openOrderTokens = new Set();
+      try {
+        const raw = await clobClient.getOpenOrders();
+        for (const o of (raw || [])) {
+          if (o.asset_id) openOrderTokens.add(o.asset_id);
+        }
+      } catch {}
+
+      let placed = 0;
+      const expiration = Math.floor(Date.now() / 1000) + 86400; // 24h expiry
+
+      for (const city of SANDWICH_CITIES) {
+        const slug = `highest-temperature-in-${city}-on-${month}-${day}-${year}`;
+        try {
+          const r = await fetch(`https://gamma-api.polymarket.com/events?slug=${slug}`);
+          const data = await r.json();
+          if (!Array.isArray(data) || !data.length) continue;
+          const e = data[0];
+          if (!e.markets?.length) continue;
+
+          // Parse markets
+          const markets = [];
+          for (const m of e.markets) {
+            const prices = typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices;
+            if (!prices || prices.length < 2) continue;
+            const noPrice = parseFloat(prices[1]);
+            const q = m.question || '';
+            let temp = null, label = '';
+            const belowMatch = q.match(/be\s+(\d+)°C\s+or\s+below/i);
+            const higherMatch = q.match(/be\s+(\d+)°C\s+or\s+high/i);
+            const exactMatch = q.match(/be\s+(\d+)°C\s+on/);
+            if (belowMatch) { temp = parseInt(belowMatch[1]); label = temp + ' or below'; }
+            else if (higherMatch) { temp = parseInt(higherMatch[1]); label = temp + '+ higher'; }
+            else if (exactMatch) { temp = parseInt(exactMatch[1]); label = temp + '°C'; }
+            if (temp == null) continue;
+
+            const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
+            markets.push({ temp, label, noPrice, tokens, negRisk: m.negRisk, conditionId: m.conditionId, vol: parseFloat(m.volume || 0) });
+          }
+
+          markets.sort((a, b) => a.temp - b.temp);
+
+          // Find consecutive run from lowest where NO >= 99.5%
+          const eligible = [];
+          for (const m of markets) {
+            if (m.noPrice >= 0.995) eligible.push(m);
+            else break;
+          }
+          if (eligible.length < 3) continue; // need at least 3 for a sandwich
+
+          // Find dips (sandwiches)
+          for (let i = 1; i < eligible.length - 1; i++) {
+            const prev = eligible[i-1], curr = eligible[i], next = eligible[i+1];
+            if (curr.noPrice < prev.noPrice && curr.noPrice < next.noPrice) {
+              const dip = Math.min(prev.noPrice, next.noPrice) - curr.noPrice;
+              if (dip < 0.0005) continue; // too small
+
+              const noToken = curr.tokens?.[1];
+              if (!noToken) continue;
+              if (sandwichFired.has(curr.conditionId)) continue;
+              if (openOrderTokens.has(noToken)) { console.log(`[sandwich] SKIP ${city} ${curr.label}: already have order`); continue; }
+
+              sandwichFired.add(curr.conditionId);
+              console.log(`[sandwich] ${city} ${curr.label} NO ${(curr.noPrice*100).toFixed(1)}¢ (neighbors: ${(prev.noPrice*100).toFixed(1)}/${(next.noPrice*100).toFixed(1)}¢) dip ${(dip*100).toFixed(1)}¢ | $${curr.vol.toFixed(0)} vol`);
+
+              try {
+                const signed = await clobClient.createOrder({ tokenID: noToken, price: 0.99, size: 30, side: 'BUY', expiration }, { tickSize: '0.01', negRisk: curr.negRisk != null ? curr.negRisk : true });
+                const result = await clobClient.postOrder(signed, 'GTD');
+                console.log(`[sandwich]   → 30sh @ 99¢ ${result?.status || '?'}`);
+                placed++;
+              } catch (e2) {
+                console.log(`[sandwich]   → ERROR: ${(e2?.response?.data?.error || e2.message)?.slice(0, 60)}`);
+              }
+            }
+          }
+        } catch {}
+      }
+      console.log(`[sandwich] Done. Placed ${placed} orders.`);
+    } catch (e) {
+      console.error('[sandwich] Error:', e.message?.slice(0, 100));
+    }
+    scheduleWeatherSandwich();
+  }, global._sandwichFirst ? 3600000 : 5000); // 5s first run, then hourly
+  global._sandwichFirst = true;
+}
+setTimeout(() => {
+  console.log('[sandwich] Weather sandwich scanner started');
+  scheduleWeatherSandwich();
+}, 35000);
+
+// ── Weather Expiry Scanner ──
+// 3 hours before a weather event expires, buy 10sh on everything at 99.5%+
+const weatherExpiryFired = new Set();
+
+function scheduleWeatherExpiry() {
+  setTimeout(async () => {
+    try {
+      if (!clobClient) { scheduleWeatherExpiry(); return; }
+      const bal = await getUsdcBalance();
+      if (bal < 10) { scheduleWeatherExpiry(); return; }
+      if (!await isGammaAlive()) { scheduleWeatherExpiry(); return; }
+
+      const now = Date.now();
+      const allCities = [...Object.keys(WEATHER_CITIES), 'amsterdam', 'wuhan', 'ankara', 'mumbai', 'delhi', 'bangkok', 'sao-paulo', 'mexico-city', 'cairo', 'istanbul'];
+      const monthNames = ['january','february','march','april','may','june','july','august','september','october','november','december'];
+
+      // Check today and tomorrow for each city
+      for (let dayOffset = 0; dayOffset <= 1; dayOffset++) {
+        const dt = new Date(now + dayOffset * 86400000);
+        const month = monthNames[dt.getMonth()];
+        const day = dt.getDate();
+        const year = dt.getFullYear();
+
+        for (const city of allCities) {
+          const slug = `highest-temperature-in-${city}-on-${month}-${day}-${year}`;
+          const expiryKey = slug;
+          if (weatherExpiryFired.has(expiryKey)) continue;
+
+          try {
+            const evR = await fetch(`https://gamma-api.polymarket.com/events?slug=${slug}`);
+            const evData = await evR.json();
+            const ev = Array.isArray(evData) ? evData[0] : evData;
+            if (!ev?.markets?.length || !ev.endDate) continue;
+
+            const endMs = new Date(ev.endDate).getTime();
+            const hoursLeft = (endMs - now) / 3600000;
+
+            // Only fire when 0-3 hours before expiry
+            if (hoursLeft > 3 || hoursLeft < 0) continue;
+
+            console.log(`[weather-expiry] ${city} ${month} ${day} | ${hoursLeft.toFixed(1)}h left | checking ${ev.markets.length} markets`);
+            weatherExpiryFired.add(expiryKey);
+
+            for (const mkt of ev.markets) {
+              const condId = mkt.conditionId;
+              if (!condId || weatherFired.has(condId)) continue;
+
+              const prices = typeof mkt.outcomePrices === 'string' ? JSON.parse(mkt.outcomePrices) : mkt.outcomePrices;
+              const tokens = typeof mkt.clobTokenIds === 'string' ? JSON.parse(mkt.clobTokenIds) : mkt.clobTokenIds;
+              const outcomes = typeof mkt.outcomes === 'string' ? JSON.parse(mkt.outcomes) : mkt.outcomes;
+              if (!prices || !tokens || prices.length < 2 || !outcomes) continue;
+
+              const p0 = parseFloat(prices[0]), p1 = parseFloat(prices[1]);
+              const winPrice = Math.max(p0, p1);
+              const vol = parseFloat(mkt.volume || 0);
+
+              // Must be 99.5%+ and have volume
+              if (winPrice < 0.995 || vol < 10) continue;
+
+              const winIdx = p0 >= p1 ? 0 : 1;
+              const winToken = tokens[winIdx];
+              const winLabel = outcomes[winIdx];
+              const negRisk = mkt.negRisk != null ? mkt.negRisk : true;
+
+              // CLOB both sides check
+              try {
+                const [r0, r1] = await Promise.all([
+                  fetch('https://clob.polymarket.com/price?token_id=' + tokens[0] + '&side=sell'),
+                  fetch('https://clob.polymarket.com/price?token_id=' + tokens[1] + '&side=sell'),
+                ]);
+                const d0 = await r0.json(), d1 = await r1.json();
+                const a0 = d0?.price ? parseFloat(d0.price) : null;
+                const a1 = d1?.price ? parseFloat(d1.price) : null;
+                if (a0 == null || a1 == null) continue;
+                if (a0 + a1 > 1.50) continue;
+                const winAsk = winIdx === 0 ? a0 : a1;
+                if (winAsk < 0.50) continue; // wrong side
+              } catch { continue; }
+
+              weatherFired.add(condId);
+              saveWeatherFired();
+
+              const q = mkt.question || '';
+              console.log(`[weather-expiry] ${city} → ${q.slice(0,40)} → ${winLabel} ${(winPrice*100).toFixed(1)}% ($${vol.toFixed(0)} vol)`);
+              try {
+                await placeLive99Order(winToken, 10, negRisk, `[weather-expiry] ${city} ${winLabel} 10sh`);
+              } catch (err) {
+                console.error(`[weather-expiry] Error:`, err.message?.slice(0, 60));
+              }
+            }
+          } catch {}
+        }
+      }
+    } catch (e) {
+      console.error('[weather-expiry] Error:', e.message?.slice(0, 100));
+    }
+    scheduleWeatherExpiry();
+  }, 300000); // Check every 5 minutes
+}
+setTimeout(() => {
+  console.log('[weather-expiry] Expiry scanner started');
+  scheduleWeatherExpiry();
+}, 30000);
 
 // ── Weather Temperature Scanner ──
 // Every hour, check actual observed temps and buy on decided weather markets
