@@ -7349,6 +7349,85 @@ setTimeout(() => {
   scheduleBtcHourlyScan();
 }, 20000);
 
+// ── Bitcoin Above Scanner ──
+// When hourly "Bitcoin above" events expire, place 99.9¢ on all decided markets
+const btcAboveState = { currentSlug: null, firedSlugs: new Set() };
+
+function getBtcAboveSlug() {
+  const now = new Date();
+  const et = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const months = ['january','february','march','april','may','june','july','august','september','october','november','december'];
+  const month = months[et.getMonth()];
+  const day = et.getDate();
+  const year = et.getFullYear();
+  let hour = et.getHours();
+  const ampm = hour >= 12 ? 'pm' : 'am';
+  if (hour === 0) hour = 12;
+  else if (hour > 12) hour -= 12;
+  return `bitcoin-above-on-${month}-${day}-${year}-${hour}${ampm}-et`;
+}
+
+function scheduleBtcAboveScan() {
+  setTimeout(async () => {
+    try {
+      if (!clobClient) { scheduleBtcAboveScan(); return; }
+
+      const currentSlug = getBtcAboveSlug();
+
+      // Detect event change — previous slug just expired
+      if (btcAboveState.currentSlug && btcAboveState.currentSlug !== currentSlug && !btcAboveState.firedSlugs.has(btcAboveState.currentSlug)) {
+        const oldSlug = btcAboveState.currentSlug;
+        btcAboveState.firedSlugs.add(oldSlug);
+
+        try {
+          const r = await fetch(`https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(oldSlug)}`);
+          const data = await r.json();
+          const e = Array.isArray(data) ? data[0] : data;
+          if (e?.markets?.length) {
+            const expiration = Math.floor(Date.now() / 1000) + 1800; // 30min GTD
+            let placed = 0;
+
+            for (const m of e.markets) {
+              const prices = typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices;
+              const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
+              const outcomes = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes;
+              if (!prices || !tokens || prices.length < 2) continue;
+
+              const p0 = parseFloat(prices[0]), p1 = parseFloat(prices[1]);
+              const winPrice = Math.max(p0, p1);
+              if (winPrice < 0.99) continue; // only 99%+ decided markets
+
+              const winIdx = p0 >= p1 ? 0 : 1;
+              const winToken = tokens[winIdx];
+              const winLabel = outcomes?.[winIdx] || (winIdx === 0 ? 'Yes' : 'No');
+              const negRisk = m.negRisk != null ? m.negRisk : false;
+
+              console.log(`[btc-above] ${oldSlug.slice(-10)} | ${m.question?.slice(0,40)} → ${winLabel} ${(winPrice*100).toFixed(0)}%`);
+              try {
+                await placeLive99Order(winToken, 30, negRisk, `[btc-above] ${winLabel} 30sh`);
+                placed++;
+              } catch (err) {
+                console.error('[btc-above] Error:', err.message?.slice(0, 60));
+              }
+            }
+            console.log(`[btc-above] ${oldSlug}: placed ${placed} orders`);
+          }
+        } catch {}
+      }
+
+      btcAboveState.currentSlug = currentSlug;
+    } catch (e) {
+      console.error('[btc-above] Error:', e.message?.slice(0, 60));
+    }
+    scheduleBtcAboveScan();
+  }, 5000); // Check every 5s for precise timing
+}
+setTimeout(() => {
+  btcAboveState.currentSlug = getBtcAboveSlug();
+  console.log(`[btc-above] Tracking: ${btcAboveState.currentSlug}`);
+  scheduleBtcAboveScan();
+}, 22000);
+
 // ── Weather Pre-Market Forecast Scanner ──
 // 30 min before each city's new day, use forecast to place NO on guaranteed-low temps
 const WEATHER_COORDS = {
@@ -7534,12 +7613,20 @@ function scheduleWeatherSandwich() {
             const noPrice = parseFloat(prices[1]);
             const q = m.question || '';
             let temp = null, label = '';
-            const belowMatch = q.match(/be\s+(\d+)°C\s+or\s+below/i);
-            const higherMatch = q.match(/be\s+(\d+)°C\s+or\s+high/i);
-            const exactMatch = q.match(/be\s+(\d+)°C\s+on/);
-            if (belowMatch) { temp = parseInt(belowMatch[1]); label = temp + ' or below'; }
-            else if (higherMatch) { temp = parseInt(higherMatch[1]); label = temp + '+ higher'; }
-            else if (exactMatch) { temp = parseInt(exactMatch[1]); label = temp + '°C'; }
+            // Match °C formats
+            const belowMatchC = q.match(/be\s+(\d+)°C\s+or\s+below/i);
+            const higherMatchC = q.match(/be\s+(\d+)°C\s+or\s+high/i);
+            const exactMatchC = q.match(/be\s+(\d+)°C\s+on/);
+            // Match °F formats: "69°F or below", "between 70-71°F", "88°F or higher"
+            const belowMatchF = q.match(/be\s+(\d+)°F\s+or\s+below/i);
+            const higherMatchF = q.match(/be\s+(\d+)°F\s+or\s+high/i);
+            const betweenMatchF = q.match(/between\s+(\d+)-(\d+)°F/i);
+            if (belowMatchC) { temp = parseInt(belowMatchC[1]); label = temp + '°C or below'; }
+            else if (higherMatchC) { temp = parseInt(higherMatchC[1]); label = temp + '°C+ higher'; }
+            else if (exactMatchC) { temp = parseInt(exactMatchC[1]); label = temp + '°C'; }
+            else if (belowMatchF) { temp = parseInt(belowMatchF[1]); label = temp + '°F or below'; }
+            else if (higherMatchF) { temp = parseInt(higherMatchF[1]); label = temp + '°F+ higher'; }
+            else if (betweenMatchF) { temp = parseInt(betweenMatchF[1]); label = temp + '-' + betweenMatchF[2] + '°F'; }
             if (temp == null) continue;
 
             const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
