@@ -237,8 +237,8 @@ async function checkAndRedeem() {
 
 let interval = null;
 
-export function startAutoRedeem(intervalMs = 60000) {
-  console.log(`[auto-redeem] Starting (check every ${intervalMs / 1000}s, via Gnosis Safe proxy)`);
+export function startAutoRedeem(intervalMs = 10800000) { // 3 hours
+  console.log(`[auto-redeem] Starting (check every ${intervalMs / 3600000}h, via Gnosis Safe proxy)`);
   setTimeout(() => checkAndRedeem(), 5000); // First check after 5s
   interval = setInterval(checkAndRedeem, intervalMs);
   return interval;
