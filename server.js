@@ -7648,9 +7648,21 @@ setTimeout(() => {
 // ── Crypto Above Pre-Expiry Scanner ──
 // 30 min before expiry: pick safest bet (biggest buffer >$1500 >97¢), 10sh
 const CRYPTO_ABOVE_CONFIGS = [
-  { name: 'BTC', slugPrefix: 'bitcoin-above-on', priceUrl: 'https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT', minBuffer: 1500 },
-  { name: 'ETH', slugPrefix: 'ethereum-above-on', priceUrl: 'https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT', minBuffer: 100 },
+  { name: 'BTC', slugPrefix: 'bitcoin-above-on', priceUrl: 'https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT', symbol: 'BTCUSDT', minBuffer: 1500 },
+  { name: 'ETH', slugPrefix: 'ethereum-above-on', priceUrl: 'https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT', symbol: 'ETHUSDT', minBuffer: 100 },
 ];
+
+// Check volatility of the last 30 minutes (high - low of last 30 min)
+async function getLast30mVolatility(symbol) {
+  try {
+    const r = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1m&limit=30`);
+    const klines = await r.json();
+    const highs = klines.map(k => parseFloat(k[2]));
+    const lows = klines.map(k => parseFloat(k[3]));
+    const range = Math.max(...highs) - Math.min(...lows);
+    return Math.ceil(range);
+  } catch { return null; }
+}
 const btcAbovePreFired = new Set();
 
 function scheduleBtcAbovePreScan() {
@@ -7709,39 +7721,30 @@ function scheduleBtcAbovePreScan() {
           cryptoPrice = parseFloat((await prR.json()).price);
         } catch {}
 
-        // Rule: price > 97¢ AND move needed > minBuffer to flip
-        const safeYes = markets
-          .filter(m => m.yesPrice >= 0.97 && cryptoPrice - m.level > cfg.minBuffer)
-          .sort((a, b) => a.yesPrice - b.yesPrice)[0];
-        const safeNo = markets
-          .filter(m => m.noPrice >= 0.97 && m.level - cryptoPrice > cfg.minBuffer)
-          .sort((a, b) => a.noPrice - b.noPrice)[0];
-
-        // Pick whichever has the biggest buffer
-        const yesBuffer = safeYes ? cryptoPrice - safeYes.level : 0;
-        const noBuffer = safeNo ? safeNo.level - cryptoPrice : 0;
-
-        if (yesBuffer > noBuffer && safeYes) {
-          console.log(`[${cfg.name}-above-pre] ${currentSlug.slice(-10)} | YES $${safeYes.level.toLocaleString()} at ${(safeYes.yesPrice*100).toFixed(1)}¢ (${cfg.name} $${cryptoPrice.toFixed(0)}, buffer $${yesBuffer.toFixed(0)})`);
-          try { await placeLive99Order(safeYes.tokens[0], 10, safeYes.negRisk, `[${cfg.name}-above-pre] YES $${safeYes.level} 10sh`); } catch {}
-        } else if (safeNo) {
-          console.log(`[${cfg.name}-above-pre] ${currentSlug.slice(-10)} | NO $${safeNo.level.toLocaleString()} at ${(safeNo.noPrice*100).toFixed(1)}¢ (${cfg.name} $${cryptoPrice.toFixed(0)}, buffer $${noBuffer.toFixed(0)})`);
-          try { await placeLive99Order(safeNo.tokens[1], 10, safeNo.negRisk, `[${cfg.name}-above-pre] NO $${safeNo.level} 10sh`); } catch {}
-        } else {
-          console.log(`[${cfg.name}-above-pre] ${currentSlug.slice(-10)} | ${cfg.name} $${cryptoPrice.toFixed(0)} — no safe picks`);
+        // Check last 30 min volatility — if higher than buffer, skip (too risky)
+        const vol30m = await getLast30mVolatility(cfg.symbol);
+        if (vol30m && vol30m > cfg.minBuffer) {
+          console.log(`[${cfg.name}-mm] ${cfg.name} $${cryptoPrice.toFixed(0)} | SKIP — last 30m vol $${vol30m} > $${cfg.minBuffer} buffer`);
+          continue;
         }
+        console.log(`[${cfg.name}-mm] ${cfg.name} $${cryptoPrice.toFixed(0)} | last 30m vol: $${vol30m || '?'} (< $${cfg.minBuffer} OK)`);
 
-        // Also place 10sh on ALL markets at 99%+ (market making)
+        // Market making: 10sh on all 99%+ with min buffer
+        let placed = 0;
         for (const m of markets) {
-          if (m.yesPrice >= 0.99) {
-            console.log(`[${cfg.name}-above-mm] YES $${m.level.toLocaleString()} at ${(m.yesPrice*100).toFixed(1)}¢`);
-            try { await placeLive99Order(m.tokens[0], 10, m.negRisk ?? false, `[${cfg.name}-mm] YES $${m.level} 10sh`); } catch {}
+          const yesBuffer = cryptoPrice - m.level;
+          const noBuffer = m.level - cryptoPrice;
+
+          if (m.yesPrice >= 0.99 && yesBuffer > cfg.minBuffer) {
+            console.log(`[${cfg.name}-mm] YES $${m.level.toLocaleString()} at ${(m.yesPrice*100).toFixed(1)}¢ (buffer $${yesBuffer.toFixed(0)})`);
+            try { await placeLive99Order(m.tokens[0], 10, m.negRisk ?? false, `[${cfg.name}-mm] YES $${m.level} 10sh`); placed++; } catch {}
           }
-          if (m.noPrice >= 0.99) {
-            console.log(`[${cfg.name}-above-mm] NO $${m.level.toLocaleString()} at ${(m.noPrice*100).toFixed(1)}¢`);
-            try { await placeLive99Order(m.tokens[1], 10, m.negRisk ?? false, `[${cfg.name}-mm] NO $${m.level} 10sh`); } catch {}
+          if (m.noPrice >= 0.99 && noBuffer > cfg.minBuffer) {
+            console.log(`[${cfg.name}-mm] NO $${m.level.toLocaleString()} at ${(m.noPrice*100).toFixed(1)}¢ (buffer $${noBuffer.toFixed(0)})`);
+            try { await placeLive99Order(m.tokens[1], 10, m.negRisk ?? false, `[${cfg.name}-mm] NO $${m.level} 10sh`); placed++; } catch {}
           }
         }
+        console.log(`[${cfg.name}-mm] placed ${placed} orders`);
       } catch {}
       } // end for CRYPTO_ABOVE_CONFIGS
     } catch {}
@@ -7957,10 +7960,11 @@ function scheduleWeatherPreMarket() {
     scheduleWeatherPreMarket();
   }, 60000); // Check every minute
 }
-setTimeout(() => {
-  console.log('[weather-pre] Pre-market forecast scanner started');
-  scheduleWeatherPreMarket();
-}, 25000);
+// DISABLED — pre-market forecast scanner
+// setTimeout(() => {
+//   console.log('[weather-pre] Pre-market forecast scanner started');
+//   scheduleWeatherPreMarket();
+// }, 25000);
 
 // ── Weather Sandwich Scanner ──
 // Every hour: find pricing dips in consecutive >99.5% NO runs
@@ -8100,7 +8104,7 @@ function scheduleWeatherExpiry() {
       if (!await isGammaAlive()) { scheduleWeatherExpiry(); return; }
 
       const now = Date.now();
-      const allCities = [...Object.keys(WEATHER_CITIES), 'amsterdam', 'wuhan', 'ankara', 'mumbai', 'delhi', 'bangkok', 'sao-paulo', 'mexico-city', 'cairo', 'istanbul'];
+      const allCities = SANDWICH_CITIES;
       const monthNames = ['january','february','march','april','may','june','july','august','september','october','november','december'];
 
       // Check today and tomorrow for each city
@@ -8143,8 +8147,8 @@ function scheduleWeatherExpiry() {
               const winPrice = Math.max(p0, p1);
               const vol = parseFloat(mkt.volume || 0);
 
-              // Must be 99.5%+ and have volume
-              if (winPrice < 0.995 || vol < 10) continue;
+              // Must be 99.8%+ (including 100% — limit sits waiting for sellers)
+              if (winPrice < 0.998) continue;
 
               const winIdx = p0 >= p1 ? 0 : 1;
               const winToken = tokens[winIdx];
