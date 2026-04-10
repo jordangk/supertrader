@@ -2388,8 +2388,39 @@ function schedule5mEvent() {
   const now = Date.now();
   const nowSecs = Math.floor(now / 1000);
   const nextSlot = (Math.floor(nowSecs / 300) + 1) * 300;
-  const delay = (nextSlot * 1000) - now + 3000; // 3s after 5m boundary
-  btc5mEventTimer = setTimeout(() => { refresh5mEvent(); schedule5mEvent(); }, delay);
+  const delay = (nextSlot * 1000) - now; // exactly on the 5m boundary
+  btc5mEventTimer = setTimeout(async () => {
+    // Place 99.9¢ on old event's winner before refreshing
+    if (btc5mState.tokenUp && btc5mState.tokenDown && clobClient) {
+      const oldUp = btc5mState.upPrice, oldDown = btc5mState.downPrice;
+      if (oldUp != null && oldDown != null) {
+        const winPrice = Math.max(oldUp, oldDown);
+        if (winPrice >= 0.90) {
+          const winSide = oldUp > oldDown ? 'up' : 'down';
+          const winToken = winSide === 'up' ? btc5mState.tokenUp : btc5mState.tokenDown;
+          console.log(`[btc5m-99] Event ended: ${btc5mState.eventSlug} | ${winSide} won (${(winPrice*100).toFixed(0)}¢)`);
+          try { await placeLive99Order(winToken, 50, btc5mState.negRisk || false, `[btc5m-99] ${winSide} 50sh`); } catch {}
+        }
+      }
+    }
+    // Also place on extra coins
+    for (const coin of EXTRA_5M_COINS) {
+      const e = extra5m[coin];
+      if (!e?.state?.tokenUp || !e?.state?.tokenDown || !clobClient) continue;
+      const up = e.state.upPrice, down = e.state.downPrice;
+      if (up == null || down == null) continue;
+      const winPrice = Math.max(up, down);
+      if (winPrice < 0.90) continue;
+      const winSide = up > down ? 'up' : 'down';
+      const winToken = winSide === 'up' ? e.state.tokenUp : e.state.tokenDown;
+      console.log(`[${coin}5m-99] Event ended: ${e.state.eventSlug} | ${winSide} won (${(winPrice*100).toFixed(0)}¢)`);
+      try { await placeLive99Order(winToken, 50, e.event?.negRisk || false, `[${coin}5m-99] ${winSide} 50sh`); } catch {}
+    }
+    refresh5mEvent();
+    // Also refresh extra coins
+    for (const coin of EXTRA_5M_COINS) { try { await refreshExtra5mEvent(coin); } catch {} }
+    schedule5mEvent();
+  }, delay);
 }
 
 // Multi-coin 5m tracker — all coins share the same logic
@@ -2486,7 +2517,7 @@ for (const coin of EXTRA_5M_COINS) {
     res.json({ success: true, side: winSide, price: 0.99, shares: 5 });
     (async () => {
       try {
-        const signed = await clobClient.createOrder({ tokenID: tokenId, price: 0.99, size: 5, side: 'BUY' }, { tickSize: String(e.event.tickSize || '0.01'), negRisk: e.event.negRisk || false });
+        const signed = await clobClient.createOrder({ tokenID: tokenId, price: 0.99, size: 50, side: 'BUY' }, { tickSize: String(e.event.tickSize || '0.01'), negRisk: e.event.negRisk || false });
         await clobClient.postOrder(signed, 'GTC');
       } catch (err) { console.error(`[${coin}-5m 99] error:`, err.message?.slice(0, 60)); }
     })();
@@ -2497,7 +2528,7 @@ for (const coin of EXTRA_5M_COINS) {
 
 
 // Server-side Auto-99: winning side >96¢ for 10s with no side switch → burst orders in last 1s
-const auto99State = { enabled: true, firedSlug: null, priceLog: [], firing: false };
+const auto99State = { enabled: false, firedSlug: null, priceLog: [], firing: false }; // Disabled — replaced by post-event 99.9¢ limit
 app.post('/api/btc5m/auto99/toggle', (req, res) => {
   auto99State.enabled = !auto99State.enabled;
   if (!auto99State.enabled) { auto99State.firedSlug = null; auto99State.priceLog = []; auto99State.firing = false; }
@@ -2516,10 +2547,10 @@ async function placeAuto99Order(coin, side, state, event) {
   const negRisk = event.negRisk || false;
   let result;
   try {
-    const signed = await clobClient.createOrder({ tokenID: tokenId, price: 0.999, size: 5, side: 'BUY' }, { tickSize: '0.001', negRisk });
+    const signed = await clobClient.createOrder({ tokenID: tokenId, price: 0.999, size: 50, side: 'BUY' }, { tickSize: '0.001', negRisk });
     result = await clobClient.postOrder(signed, 'GTC');
   } catch {
-    const signed2 = await clobClient.createOrder({ tokenID: tokenId, price: 0.99, size: 5, side: 'BUY' }, { tickSize: String(event.tickSize || '0.01'), negRisk });
+    const signed2 = await clobClient.createOrder({ tokenID: tokenId, price: 0.99, size: 50, side: 'BUY' }, { tickSize: String(event.tickSize || '0.01'), negRisk });
     result = await clobClient.postOrder(signed2, 'GTC');
   }
   console.log(`[${coin}-auto-99] PLACED: ${side} 5sh → ${result?.status} id:${result?.orderID?.slice(0,8)}`);
@@ -3399,7 +3430,7 @@ async function refreshEvent(clientBtcOpen) {
         (async () => {
           try {
             const negRisk = activeEvent?.negRisk || false;
-            const result = await placeLive99Order(winToken, 30, negRisk, `[btc15m-99] ${winSide} 5sh`);
+            const result = await placeLive99Order(winToken, 50, negRisk, `[btc15m-99] ${winSide} 5sh`);
           } catch (e) {
             console.error('[btc15m-99] Error:', e.message?.slice(0, 60));
           }
@@ -6109,7 +6140,7 @@ async function checkExactScores(slug, title, score, firedSet) {
 
       console.log(`[exact-score] ${title.slice(0,30)} score ${score} → ${mHome}-${mAway} IMPOSSIBLE → BUY NO`);
       try {
-        const result = await placeLive99Order(noToken, 30, negRisk, `[exact-score] NO on ${mHome}-${mAway} 10sh`);
+        const result = await placeLive99Order(noToken, 50, negRisk, `[exact-score] NO on ${mHome}-${mAway} 10sh`);
         liveEventTracker.log.unshift({ ts: Date.now(), event: title, score, market: `Exact ${mHome}-${mAway} NO`, side: 'NO', price: '99.9¢', status: result?.status });
         if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
       } catch (err) {
@@ -6168,7 +6199,7 @@ async function buyExactScoreOnEnd(slug, title, finalScore) {
       const winLabel = winIdx === 0 ? 'YES' : 'NO';
       console.log(`[exact-score] END: ${q.slice(0,40)} → BUY ${winLabel} (${(winPrice*100).toFixed(0)}¢)`);
       try {
-        const result = await placeLive99Order(winToken, 30, negRisk, `[exact-score] END ${winLabel} on ${q.slice(0,30)} 10sh`);
+        const result = await placeLive99Order(winToken, 50, negRisk, `[exact-score] END ${winLabel} on ${q.slice(0,30)} 10sh`);
         liveEventTracker.log.unshift({ ts: Date.now(), event: title, score: finalScore, market: q.slice(0, 50), side: winLabel, price: '99.9¢', status: result?.status });
         if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
       } catch (err) {
@@ -6326,7 +6357,7 @@ setTimeout(async () => {
 
               console.log(`[live-ht] ${e.title.slice(0,25)} | ${q.slice(0,40)} → BUY ${winLabel}`);
               try {
-                const result = await placeLive99Order(winToken, 30, negRisk, `[live-ht] ${winLabel} on ${q.slice(0,30)} 10sh`);
+                const result = await placeLive99Order(winToken, 50, negRisk, `[live-ht] ${winLabel} on ${q.slice(0,30)} 10sh`);
                 liveEventTracker.log.unshift({ ts: Date.now(), event: e.title, score: htScore, market: q.slice(0, 50), side: winLabel, price: '99.9¢', status: result?.status });
                 if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
               } catch (err) {
@@ -6465,7 +6496,7 @@ setTimeout(async () => {
 
           console.log(`[live-ou] SCORE ${data.score} (total ${ouTotal}) > O/U ${line} → BUY ${overLabel} | ${data.title}`);
           try {
-            const result = await placeLive99Order(overToken, 30, negRisk, `[live-ou] ${overLabel} O/U ${line} 10sh`);
+            const result = await placeLive99Order(overToken, 50, negRisk, `[live-ou] ${overLabel} O/U ${line} 10sh`);
             liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: `O/U ${line}`, side: overLabel, price: '99.9¢', status: result?.status });
             if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
           } catch (err) {
@@ -6604,7 +6635,7 @@ setTimeout(async () => {
 
         console.log(`[tennis] ${data.title.slice(0,30)} | ${q.slice(0,40)} → ${winLabel} (minGames=${minTotalGames}, sets=${totalSetsPlayed})`);
         try {
-          const result = await placeLive99Order(winToken, 30, negRisk, `[tennis] ${winLabel} on ${q.slice(0,30)} 10sh`);
+          const result = await placeLive99Order(winToken, 50, negRisk, `[tennis] ${winLabel} on ${q.slice(0,30)} 10sh`);
           liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: q.slice(0, 50), side: winLabel, price: '99.9¢', status: result?.status });
           if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
         } catch (err) {
@@ -6705,7 +6736,7 @@ setTimeout(async () => {
         const winToken = tokens[winIdx];
         console.log(`[esports] ${data.title.slice(0,30)} ${s1}-${s2} Bo${bestOf} → O/U ${line} ${winLabel} (${totalGamesPlayed} maps, min ${minTotalGames})`);
         try {
-          const result = await placeLive99Order(winToken, 30, negRisk, `[esports] ${winLabel} O/U ${line} 10sh`);
+          const result = await placeLive99Order(winToken, 50, negRisk, `[esports] ${winLabel} O/U ${line} 10sh`);
           liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: `Games O/U ${line} ${winLabel}`, side: winLabel, price: '99.9¢', status: result?.status });
           if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
         } catch (err) {
@@ -6747,7 +6778,7 @@ setTimeout(async () => {
           // No CLOB price check — map is completed, Gamma confirms winner, just place limit
           console.log(`[esports] ${data.title.slice(0,30)} Map ${mapNum} Winner → ${winLabel} (Gamma ${(Math.max(p0,p1)*100).toFixed(0)}%)`);
           try {
-            const result = await placeLive99Order(winToken, 30, negRisk, `[esports] ${winLabel} Map ${mapNum} 10sh`);
+            const result = await placeLive99Order(winToken, 50, negRisk, `[esports] ${winLabel} Map ${mapNum} 10sh`);
             liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: `Map ${mapNum} Winner`, side: winLabel, price: '99.9¢', status: result?.status });
             if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
           } catch (err) {
@@ -6803,7 +6834,7 @@ setTimeout(async () => {
           } catch { continue; }
 
           data._esportsFired.add(condId);
-          const shares = 30;
+          const shares = 50;
           console.log(`[esports] ${data.title.slice(0,25)} Game ${gameNum}: ${q.slice(0,35)} → ${winLabel} ($${mktVol.toFixed(0)} vol)`);
           try {
             const result = await placeLive99Order(winToken, shares, negRisk, `[esports] ${winLabel} ${q.slice(0,25)} ${shares}sh`);
@@ -6871,7 +6902,7 @@ setTimeout(async () => {
 
           console.log(`[esports] ${data.title.slice(0,30)} ${s1}-${s2} Handicap ${spread} → ${winLabel}`);
           try {
-            const result = await placeLive99Order(winToken, 30, negRisk, `[esports] ${winLabel} HC ${spread} 10sh`);
+            const result = await placeLive99Order(winToken, 50, negRisk, `[esports] ${winLabel} HC ${spread} 10sh`);
             liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: q.slice(0, 50), side: winLabel, price: '99.9¢', status: result?.status });
             if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
           } catch (err) {
@@ -6919,7 +6950,7 @@ setTimeout(async () => {
         data._bttsFired = true;
         console.log(`[soccer] ${data.title.slice(0,30)} ${data.score} → Both Teams to Score: YES`);
         try {
-          const result = await placeLive99Order(yesToken, 30, negRisk, `[soccer] BTTS Yes 10sh`);
+          const result = await placeLive99Order(yesToken, 50, negRisk, `[soccer] BTTS Yes 10sh`);
           liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: 'Both Teams to Score', side: 'Yes', price: '99.9¢', status: result?.status });
           if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
         } catch (err) {
@@ -6967,7 +6998,7 @@ setTimeout(async () => {
         data._firstInningFired = true;
         console.log(`[mlb] ${data.title.slice(0,30)} ${data.score} in ${data.period} → First inning run: YES`);
         try {
-          const result = await placeLive99Order(yesToken, 30, negRisk, `[mlb] 1st inning run Yes 10sh`);
+          const result = await placeLive99Order(yesToken, 50, negRisk, `[mlb] 1st inning run Yes 10sh`);
           liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: 'First inning run', side: 'Yes', price: '99.9¢', status: result?.status });
           if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
         } catch (err) {
@@ -7112,7 +7143,7 @@ setTimeout(async () => {
           continue;
         }
 
-        let orderSize = 30;
+        let orderSize = 50;
         // Verify BOTH sides from CLOB — sum must be <= 103¢
         try {
           const [r0, r1] = await Promise.all([
@@ -7276,7 +7307,7 @@ setTimeout(async () => {
         } catch { continue; }
 
         try {
-          const result = await placeLive99Order(winToken, 30, negRisk, `[startup-scan] ${winOutcome} on ${m.question?.slice(0,30)} 10sh`);
+          const result = await placeLive99Order(winToken, 50, negRisk, `[startup-scan] ${winOutcome} on ${m.question?.slice(0,30)} 10sh`);
           if (result) placed++;
         } catch {}
       }
@@ -7341,7 +7372,7 @@ function scheduleBtcHourlyScan() {
 
               console.log(`[btc1h-99] Event ended: ${oldSlug} | ${winLabel} won (${(winPrice*100).toFixed(0)}¢) — placing 99.9¢ limit`);
               try {
-                await placeLive99Order(winToken, 30, negRisk, `[btc1h-99] ${winLabel} 5sh`);
+                await placeLive99Order(winToken, 50, negRisk, `[btc1h-99] ${winLabel} 5sh`);
               } catch (err) {
                 console.error('[btc1h-99] Error:', err.message?.slice(0, 60));
               }
@@ -7365,6 +7396,415 @@ setTimeout(() => {
   console.log(`[btc1h] Tracking hourly BTC: ${btcHourlyState.currentSlug}`);
   scheduleBtcHourlyScan();
 }, 20000);
+
+// ── PandaScore Esports Scanner ──
+// Polls PandaScore every 4s, detects map completions BEFORE Gamma, places orders instantly
+const PANDASCORE_TOKEN = '_2V_cp_4ypcmLEUiu9BuUyqTQfnu3JK8NOcfDDrvJ-X40q7LJq4';
+const pandaState = {
+  matches: new Map(), // matchId → { teams, games: Map(position → status), polySlug }
+  firedMaps: new Set(), // "matchId-mapPos" keys
+  lagLog: [], // { event, pandaTime, gammaTime, lagMs }
+};
+
+function schedulePandaScan() {
+  setTimeout(async () => {
+    try {
+      if (!clobClient) { schedulePandaScan(); return; }
+
+      // Fetch both running AND upcoming (to pre-match before they start)
+      const [psRunR, psUpR] = await Promise.all([
+        fetch(`https://api.pandascore.co/matches/running?token=${PANDASCORE_TOKEN}`, { signal: AbortSignal.timeout(3000) }),
+        fetch(`https://api.pandascore.co/matches/upcoming?token=${PANDASCORE_TOKEN}&per_page=20`, { signal: AbortSignal.timeout(3000) }),
+      ]);
+      const psRunning = await psRunR.json();
+      const psUpcoming = await psUpR.json();
+      const psMatches = [...(Array.isArray(psRunning) ? psRunning : []), ...(Array.isArray(psUpcoming) ? psUpcoming : [])];
+      if (!psMatches.length) { schedulePandaScan(); return; }
+
+      for (const ps of psMatches) {
+        const matchId = ps.id;
+        const psTeams = ps.opponents?.map(o => o.opponent?.name) || [];
+        const psTeamsLower = psTeams.map(t => t?.toLowerCase());
+        const psGames = ps.games || [];
+
+        // Initialize tracking
+        if (!pandaState.matches.has(matchId)) {
+          pandaState.matches.set(matchId, {
+            teams: psTeams,
+            games: new Map(),
+            polySlug: null,
+            polyEvent: null,
+          });
+          // Try to match to Poly event — check knownLive first, then try Gamma API
+          let matched = false;
+          for (const [slug, data] of liveEventTracker.knownLive) {
+            const title = (data.title || '').toLowerCase();
+            if (psTeamsLower.some(t => t && t.length > 3 && title.includes(t))) {
+              pandaState.matches.get(matchId).polySlug = slug;
+              console.log(`[panda] Matched: ${psTeams.join(' vs ')} → ${slug}`);
+              matched = true;
+              break;
+            }
+          }
+          // If not in knownLive, search Gamma API for the event
+          if (!matched) {
+            try {
+              for (const team of psTeamsLower) {
+                if (!team || team.length < 3) continue;
+                const searchR = await fetch(`https://gamma-api.polymarket.com/events?active=true&closed=false&limit=20`);
+                const searchD = await searchR.json();
+                for (const ev of (searchD || [])) {
+                  const evTitle = (ev.title || '').toLowerCase();
+                  if (psTeamsLower.every(t => t.length > 3 && evTitle.includes(t))) {
+                    pandaState.matches.get(matchId).polySlug = ev.slug;
+                    console.log(`[panda] Matched (API): ${psTeams.join(' vs ')} → ${ev.slug}`);
+                    matched = true;
+                    break;
+                  }
+                }
+                if (matched) break;
+              }
+            } catch {}
+          }
+        }
+
+        const tracked = pandaState.matches.get(matchId);
+
+        // Check each game/map for completion
+        for (const game of psGames) {
+          const pos = game.position;
+          const oldStatus = tracked.games.get(pos);
+          tracked.games.set(pos, game.status);
+
+          // Map just finished!
+          if (oldStatus && oldStatus !== 'finished' && game.status === 'finished') {
+            const fireKey = `${matchId}-${pos}`;
+            if (pandaState.firedMaps.has(fireKey)) continue;
+            pandaState.firedMaps.add(fireKey);
+
+            const winnerId = game.winner?.id;
+            const winnerName = psTeams.find((t, i) => ps.opponents?.[i]?.opponent?.id === winnerId) || '?';
+            const pandaTime = Date.now();
+
+            console.log(`[panda] 🎯 MAP ${pos} FINISHED: ${psTeams.join(' vs ')} → Winner: ${winnerName} (detected at ${new Date().toISOString()})`);
+
+            // Check if Gamma already knows (for lag tracking)
+            const polySlug = tracked.polySlug;
+            if (polySlug) {
+              const polyData = liveEventTracker.knownLive.get(polySlug);
+              const polyScore = polyData?.score || '';
+              const polyParts = polyScore.split('|');
+              const polySeries = polyParts[1]?.trim() || '';
+              const polyMaps = polySeries.split('-').map(Number).reduce((a, b) => a + b, 0);
+              const psFinished = psGames.filter(g => g.status === 'finished').length;
+
+              if (polyMaps < psFinished) {
+                console.log(`[panda] ⏱️ AHEAD of Gamma! PandaScore: ${psFinished} maps done, Gamma: ${polyMaps}`);
+
+                // Track when Gamma catches up
+                const lagTracker = setInterval(() => {
+                  const pd = liveEventTracker.knownLive.get(polySlug);
+                  if (!pd) { clearInterval(lagTracker); return; }
+                  const ps2 = pd.score?.split('|')?.[1]?.trim() || '';
+                  const pm2 = ps2.split('-').map(Number).reduce((a, b) => a + b, 0);
+                  if (pm2 >= psFinished) {
+                    const lagMs = Date.now() - pandaTime;
+                    console.log(`[panda] ⏱️ Gamma caught up in ${(lagMs/1000).toFixed(1)}s for ${psTeams.join(' vs ')} map ${pos}`);
+                    pandaState.lagLog.push({ event: psTeams.join(' vs '), map: pos, lagMs });
+                    clearInterval(lagTracker);
+                  }
+                }, 1000);
+                // Timeout after 5 min
+                setTimeout(() => clearInterval(lagTracker), 300000);
+              }
+
+              // Place orders immediately using Poly markets
+              if (polyData?.markets?.length || polySlug) {
+                // Fetch fresh markets
+                let markets = polyData?.markets;
+                if (!markets?.length) {
+                  try {
+                    const mr = await fetch(`https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(polySlug)}`);
+                    const md = await mr.json();
+                    const me = Array.isArray(md) ? md[0] : md;
+                    if (me?.markets?.length) { markets = me.markets; if (polyData) polyData.markets = markets; }
+                  } catch {}
+                }
+                if (!markets?.length) continue;
+
+                const psScore = ps.results?.map(r => r.score) || [];
+                const totalMaps = psScore.reduce((a, b) => a + b, 0);
+
+                // Place on map winner
+                for (const m of markets) {
+                  const ql = (m.question || '').toLowerCase();
+                  const mapMatch = ql.match(/(?:map|game)\s*(\d+)\s*winner/);
+                  if (mapMatch && parseInt(mapMatch[1]) === pos) {
+                    const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
+                    const outcomes = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes;
+                    if (!tokens || !outcomes || tokens.length < 2) continue;
+
+                    // Match winner to outcome index
+                    const winIdx = outcomes.findIndex(o => o.toLowerCase().includes(winnerName.toLowerCase().split(' ').pop()));
+                    if (winIdx < 0) {
+                      // Fallback: use Gamma prices
+                      const prices = typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices;
+                      if (prices) {
+                        const p0 = parseFloat(prices[0]), p1 = parseFloat(prices[1]);
+                        if (Math.max(p0, p1) >= 0.90) {
+                          const wi = p0 >= p1 ? 0 : 1;
+                          console.log(`[panda] Placing: Map ${pos} Winner → ${outcomes[wi]} (Gamma fallback)`);
+                          try { await placeLive99Order(tokens[wi], 50, m.negRisk ?? true, `[panda] ${outcomes[wi]} Map ${pos} 50sh`); } catch {}
+                        }
+                      }
+                    } else {
+                      console.log(`[panda] Placing: Map ${pos} Winner → ${outcomes[winIdx]} (PandaScore verified)`);
+                      try { await placeLive99Order(tokens[winIdx], 50, m.negRisk ?? true, `[panda] ${outcomes[winIdx]} Map ${pos} 50sh`); } catch {}
+                    }
+                  }
+
+                  // Place on map props (Odd/Even, etc.) using Gamma prices
+                  const propMatch = ql.match(/(?:^(?:game|map)\s*(\d+)|in\s+(?:game|map)\s+(\d+))/);
+                  if (propMatch) {
+                    const propMap = parseInt(propMatch[1] || propMatch[2]);
+                    if (propMap !== pos) continue;
+                    if (ql.includes('winner') || ql.includes('o/u') || ql.includes('handicap')) continue;
+
+                    const prices = typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices;
+                    if (!prices) continue;
+                    const p0 = parseFloat(prices[0]), p1 = parseFloat(prices[1]);
+                    if (Math.max(p0, p1) < 0.90) continue;
+                    const vol = parseFloat(m.volume || 0);
+                    if (vol < 25) continue;
+
+                    const wi = p0 >= p1 ? 0 : 1;
+                    const tokens2 = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
+                    const outcomes2 = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes;
+                    if (!tokens2 || tokens2.length < 2) continue;
+
+                    console.log(`[panda] Placing: ${m.question?.slice(0, 35)} → ${outcomes2[wi]} ($${vol.toFixed(0)} vol)`);
+                    try { await placeLive99Order(tokens2[wi], 50, m.negRisk ?? true, `[panda] ${outcomes2[wi]} ${ql.slice(0,20)} 50sh`); } catch {}
+                  }
+                }
+
+                // O/U Games Total
+                const winsNeeded = Math.ceil((ps.number_of_games || 3) / 2);
+                const minRemaining = Math.max(0, winsNeeded - Math.max(...psScore));
+                const minTotalGames = totalMaps + minRemaining;
+
+                for (const m of markets) {
+                  const ql = (m.question || '').toLowerCase();
+                  if (!ql.includes('games total') || !ql.includes('o/u')) continue;
+                  const ouMatch = ql.match(/o\/u\s*([\d.]+)/);
+                  if (!ouMatch) continue;
+                  const line = parseFloat(ouMatch[1]);
+                  if (minTotalGames <= line) continue;
+
+                  const prices = typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices;
+                  if (!prices) continue;
+                  const gammaWin = parseFloat(prices[0]);
+                  if (gammaWin < 0.97) continue;
+
+                  const tokens2 = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
+                  const outcomes2 = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes;
+                  if (!tokens2 || tokens2.length < 2) continue;
+                  const overIdx = outcomes2?.findIndex(o => o.toLowerCase().includes('over')) ?? 0;
+
+                  console.log(`[panda] Placing: O/U ${line} Over (min ${minTotalGames} games)`);
+                  try { await placeLive99Order(tokens2[overIdx >= 0 ? overIdx : 0], 50, m.negRisk ?? true, `[panda] Over O/U ${line} 50sh`); } catch {}
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Clean up ended matches
+      for (const [matchId, tracked] of pandaState.matches) {
+        if (!psMatches.some(m => m.id === matchId)) {
+          pandaState.matches.delete(matchId);
+        }
+      }
+
+    } catch (e) {
+      // Silent — don't spam
+    }
+    schedulePandaScan();
+  }, 4000); // Every 4 seconds
+}
+
+setTimeout(() => {
+  console.log('[panda] PandaScore esports scanner started (4s polling)');
+  schedulePandaScan();
+}, 28000);
+
+// ── Bitcoin Above Pre-Expiry Scanner ──
+// 30 min before expiry: cheapest YES at 99.9%+ and cheapest NO at 99.8%+, 10sh each
+const btcAbovePreFired = new Set();
+
+function scheduleBtcAbovePreScan() {
+  setTimeout(async () => {
+    try {
+      if (!clobClient) { scheduleBtcAbovePreScan(); return; }
+
+      // The active event is the NEXT hour (e.g., at 8:32 PM the "9 PM" event is active)
+      const now2 = new Date();
+      const nextHour = new Date(now2.getTime() + 3600000);
+      const et2 = new Date(nextHour.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+      const months2 = ['january','february','march','april','may','june','july','august','september','october','november','december'];
+      let h2 = et2.getHours(); const ap2 = h2 >= 12 ? 'pm' : 'am';
+      if (h2 === 0) h2 = 12; else if (h2 > 12) h2 -= 12;
+      const currentSlug = `bitcoin-above-on-${months2[et2.getMonth()]}-${et2.getDate()}-${et2.getFullYear()}-${h2}${ap2}-et`;
+      if (btcAbovePreFired.has(currentSlug)) { scheduleBtcAbovePreScan(); return; }
+
+      // Check if within 40 min of expiry
+      try {
+        const r = await fetch(`https://gamma-api.polymarket.com/events?slug=${currentSlug}`);
+        const data = await r.json();
+        const e = Array.isArray(data) ? data[0] : data;
+        if (!e?.endDate || !e?.markets?.length) { scheduleBtcAbovePreScan(); return; }
+
+        const endMs = new Date(e.endDate).getTime();
+        const minsLeft = (endMs - Date.now()) / 60000;
+
+        if (minsLeft > 40 || minsLeft < 0) { scheduleBtcAbovePreScan(); return; }
+
+        btcAbovePreFired.add(currentSlug);
+
+        // Parse and sort markets by price level
+        const markets = [];
+        for (const m of e.markets) {
+          const prices = typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices;
+          const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
+          const outcomes = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes;
+          if (!prices || !tokens || prices.length < 2) continue;
+          const q = m.question || '';
+          const match = q.match(/above\s+([\d,]+)/);
+          const level = match ? parseInt(match[1].replace(/,/g, '')) : 0;
+          markets.push({
+            level, yesPrice: parseFloat(prices[0]), noPrice: parseFloat(prices[1]),
+            tokens, outcomes, negRisk: m.negRisk ?? false, q,
+          });
+        }
+        markets.sort((a, b) => a.level - b.level);
+
+        // Get current BTC price
+        let btcPrice = 0;
+        try {
+          const btcR = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT');
+          btcPrice = parseFloat((await btcR.json()).price);
+        } catch {}
+
+        // Rule: price > 97¢ AND move needed > $1500 to flip
+        // Pick the LOWEST price (best odds) on each side
+        const safeYes = markets
+          .filter(m => m.yesPrice >= 0.97 && btcPrice - m.level > 1500)
+          .sort((a, b) => a.yesPrice - b.yesPrice)[0]; // lowest YES price = best odds
+        const safeNo = markets
+          .filter(m => m.noPrice >= 0.97 && m.level - btcPrice > 1500)
+          .sort((a, b) => a.noPrice - b.noPrice)[0]; // lowest NO price = best odds
+
+        // Pick whichever has the biggest buffer (furthest from BTC price)
+        const yesBuffer = safeYes ? btcPrice - safeYes.level : 0;
+        const noBuffer = safeNo ? safeNo.level - btcPrice : 0;
+
+        if (yesBuffer > noBuffer && safeYes) {
+          console.log(`[btc-above-pre] ${currentSlug.slice(-10)} | YES $${safeYes.level.toLocaleString()} at ${(safeYes.yesPrice*100).toFixed(1)}¢ (BTC $${btcPrice.toFixed(0)}, buffer $${yesBuffer.toFixed(0)})`);
+          try { await placeLive99Order(safeYes.tokens[0], 10, safeYes.negRisk, `[btc-above-pre] YES $${safeYes.level} 10sh`); } catch {}
+        } else if (safeNo) {
+          console.log(`[btc-above-pre] ${currentSlug.slice(-10)} | NO $${safeNo.level.toLocaleString()} at ${(safeNo.noPrice*100).toFixed(1)}¢ (BTC $${btcPrice.toFixed(0)}, buffer $${noBuffer.toFixed(0)})`);
+          try { await placeLive99Order(safeNo.tokens[1], 10, safeNo.negRisk, `[btc-above-pre] NO $${safeNo.level} 10sh`); } catch {}
+        } else {
+          console.log(`[btc-above-pre] ${currentSlug.slice(-10)} | BTC $${btcPrice.toFixed(0)} — no safe picks (need >97¢ + $1500 buffer)`);
+        }
+      } catch {}
+    } catch {}
+    scheduleBtcAbovePreScan();
+  }, 30000); // Check every 30s
+}
+setTimeout(() => {
+  console.log('[btc-above-pre] Pre-expiry scanner started');
+  scheduleBtcAbovePreScan();
+}, 32000);
+
+// ── Bitcoin Above Scanner ──
+// When hourly "Bitcoin above" events expire, place 99.9¢ on all decided markets
+const btcAboveState = { currentSlug: null, firedSlugs: new Set() };
+
+function getBtcAboveSlug() {
+  const now = new Date();
+  const et = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const months = ['january','february','march','april','may','june','july','august','september','october','november','december'];
+  const month = months[et.getMonth()];
+  const day = et.getDate();
+  const year = et.getFullYear();
+  let hour = et.getHours();
+  const ampm = hour >= 12 ? 'pm' : 'am';
+  if (hour === 0) hour = 12;
+  else if (hour > 12) hour -= 12;
+  return `bitcoin-above-on-${month}-${day}-${year}-${hour}${ampm}-et`;
+}
+
+function scheduleBtcAboveScan() {
+  setTimeout(async () => {
+    try {
+      if (!clobClient) { scheduleBtcAboveScan(); return; }
+
+      const currentSlug = getBtcAboveSlug();
+
+      // Detect event change — previous slug just expired
+      if (btcAboveState.currentSlug && btcAboveState.currentSlug !== currentSlug && !btcAboveState.firedSlugs.has(btcAboveState.currentSlug)) {
+        const oldSlug = btcAboveState.currentSlug;
+        btcAboveState.firedSlugs.add(oldSlug);
+
+        try {
+          const r = await fetch(`https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(oldSlug)}`);
+          const data = await r.json();
+          const e = Array.isArray(data) ? data[0] : data;
+          if (e?.markets?.length) {
+            const expiration = Math.floor(Date.now() / 1000) + 1800; // 30min GTD
+            let placed = 0;
+
+            for (const m of e.markets) {
+              const prices = typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices;
+              const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
+              const outcomes = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes;
+              if (!prices || !tokens || prices.length < 2) continue;
+
+              const p0 = parseFloat(prices[0]), p1 = parseFloat(prices[1]);
+              const winPrice = Math.max(p0, p1);
+              if (winPrice < 0.99) continue; // only 99%+ decided markets
+
+              const winIdx = p0 >= p1 ? 0 : 1;
+              const winToken = tokens[winIdx];
+              const winLabel = outcomes?.[winIdx] || (winIdx === 0 ? 'Yes' : 'No');
+              const negRisk = m.negRisk != null ? m.negRisk : false;
+
+              console.log(`[btc-above] ${oldSlug.slice(-10)} | ${m.question?.slice(0,40)} → ${winLabel} ${(winPrice*100).toFixed(0)}%`);
+              try {
+                await placeLive99Order(winToken, 50, negRisk, `[btc-above] ${winLabel} 30sh`);
+                placed++;
+              } catch (err) {
+                console.error('[btc-above] Error:', err.message?.slice(0, 60));
+              }
+            }
+            console.log(`[btc-above] ${oldSlug}: placed ${placed} orders`);
+          }
+        } catch {}
+      }
+
+      btcAboveState.currentSlug = currentSlug;
+    } catch (e) {
+      console.error('[btc-above] Error:', e.message?.slice(0, 60));
+    }
+    scheduleBtcAboveScan();
+  }, 5000); // Check every 5s for precise timing
+}
+setTimeout(() => {
+  btcAboveState.currentSlug = getBtcAboveSlug();
+  console.log(`[btc-above] Tracking: ${btcAboveState.currentSlug}`);
+  scheduleBtcAboveScan();
+}, 22000);
 
 // ── Weather Pre-Market Forecast Scanner ──
 // 30 min before each city's new day, use forecast to place NO on guaranteed-low temps
@@ -7476,7 +7916,7 @@ function scheduleWeatherPreMarket() {
             const winLabel = outcomes[winIdx];
             console.log(`[weather-pre] ${city} → ${q.slice(0,40)} → ${winLabel} (floor ${safeFloor}°C)`);
             try {
-              await placeLive99Order(winToken, 30, negRisk, `[weather-pre] ${city} ${winLabel} 20sh`);
+              await placeLive99Order(winToken, 50, negRisk, `[weather-pre] ${city} ${winLabel} 20sh`);
             } catch (err) {
               console.error(`[weather-pre] Error:`, err.message?.slice(0, 60));
             }
@@ -7500,7 +7940,7 @@ setTimeout(() => {
 // Every hour: find pricing dips in consecutive >99.5% NO runs
 // A "sandwich" = a NO price dips below both neighbors, all >99.5%
 // If past 9 PM PT, scan tomorrow instead of today
-const SANDWICH_CITIES = ['wellington','tokyo','seoul','shanghai','beijing','taipei','singapore','kuala-lumpur','jakarta','paris','london','miami','chicago','los-angeles','amsterdam','ankara','wuhan','mumbai','delhi','bangkok','sao-paulo','mexico-city','cairo','istanbul','hong-kong','toronto','new-york','berlin','rome','madrid','lisbon'];
+const SANDWICH_CITIES = ['wellington','tokyo','seoul','shanghai','beijing','taipei','singapore','kuala-lumpur','jakarta','paris','london','miami','chicago','los-angeles','amsterdam','ankara','wuhan','mumbai','delhi','bangkok','sao-paulo','mexico-city','cairo','istanbul','hong-kong','toronto','new-york','berlin','rome','madrid','lisbon','milan','warsaw','helsinki','buenos-aires','munich','atlanta','denver','san-francisco','seattle','dallas','houston','austin'];
 const sandwichFired = new Set(); // conditionIds already placed
 
 function scheduleWeatherSandwich() {
@@ -7551,12 +7991,20 @@ function scheduleWeatherSandwich() {
             const noPrice = parseFloat(prices[1]);
             const q = m.question || '';
             let temp = null, label = '';
-            const belowMatch = q.match(/be\s+(\d+)°C\s+or\s+below/i);
-            const higherMatch = q.match(/be\s+(\d+)°C\s+or\s+high/i);
-            const exactMatch = q.match(/be\s+(\d+)°C\s+on/);
-            if (belowMatch) { temp = parseInt(belowMatch[1]); label = temp + ' or below'; }
-            else if (higherMatch) { temp = parseInt(higherMatch[1]); label = temp + '+ higher'; }
-            else if (exactMatch) { temp = parseInt(exactMatch[1]); label = temp + '°C'; }
+            // Match °C formats
+            const belowMatchC = q.match(/be\s+(\d+)°C\s+or\s+below/i);
+            const higherMatchC = q.match(/be\s+(\d+)°C\s+or\s+high/i);
+            const exactMatchC = q.match(/be\s+(\d+)°C\s+on/);
+            // Match °F formats: "69°F or below", "between 70-71°F", "88°F or higher"
+            const belowMatchF = q.match(/be\s+(\d+)°F\s+or\s+below/i);
+            const higherMatchF = q.match(/be\s+(\d+)°F\s+or\s+high/i);
+            const betweenMatchF = q.match(/between\s+(\d+)-(\d+)°F/i);
+            if (belowMatchC) { temp = parseInt(belowMatchC[1]); label = temp + '°C or below'; }
+            else if (higherMatchC) { temp = parseInt(higherMatchC[1]); label = temp + '°C+ higher'; }
+            else if (exactMatchC) { temp = parseInt(exactMatchC[1]); label = temp + '°C'; }
+            else if (belowMatchF) { temp = parseInt(belowMatchF[1]); label = temp + '°F or below'; }
+            else if (higherMatchF) { temp = parseInt(higherMatchF[1]); label = temp + '°F+ higher'; }
+            else if (betweenMatchF) { temp = parseInt(betweenMatchF[1]); label = temp + '-' + betweenMatchF[2] + '°F'; }
             if (temp == null) continue;
 
             const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
@@ -7867,7 +8315,7 @@ async function runWeatherScan() {
 
           console.log(`[weather] ${city} ${maxTemp}°C → ${q.slice(0, 45)} → ${winLabel}`);
           try {
-            const result = await placeLive99Order(winToken, 30, negRisk, `[weather] ${city} ${winLabel} 10sh`);
+            const result = await placeLive99Order(winToken, 50, negRisk, `[weather] ${city} ${winLabel} 10sh`);
             liveEventTracker.log.unshift({ ts: Date.now(), event: event.title, market: q.slice(0, 50), side: winLabel, price: '99.9¢', status: result?.status });
             if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
           } catch (err) {
