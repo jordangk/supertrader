@@ -7394,9 +7394,15 @@ function schedulePandaScan() {
     try {
       if (!clobClient) { schedulePandaScan(); return; }
 
-      const psR = await fetch(`https://api.pandascore.co/matches/running?token=${PANDASCORE_TOKEN}`, { signal: AbortSignal.timeout(3000) });
-      const psMatches = await psR.json();
-      if (!Array.isArray(psMatches)) { schedulePandaScan(); return; }
+      // Fetch both running AND upcoming (to pre-match before they start)
+      const [psRunR, psUpR] = await Promise.all([
+        fetch(`https://api.pandascore.co/matches/running?token=${PANDASCORE_TOKEN}`, { signal: AbortSignal.timeout(3000) }),
+        fetch(`https://api.pandascore.co/matches/upcoming?token=${PANDASCORE_TOKEN}&per_page=20`, { signal: AbortSignal.timeout(3000) }),
+      ]);
+      const psRunning = await psRunR.json();
+      const psUpcoming = await psUpR.json();
+      const psMatches = [...(Array.isArray(psRunning) ? psRunning : []), ...(Array.isArray(psUpcoming) ? psUpcoming : [])];
+      if (!psMatches.length) { schedulePandaScan(); return; }
 
       for (const ps of psMatches) {
         const matchId = ps.id;
@@ -7412,14 +7418,36 @@ function schedulePandaScan() {
             polySlug: null,
             polyEvent: null,
           });
-          // Try to match to Poly event
+          // Try to match to Poly event — check knownLive first, then try Gamma API
+          let matched = false;
           for (const [slug, data] of liveEventTracker.knownLive) {
             const title = (data.title || '').toLowerCase();
             if (psTeamsLower.some(t => t && t.length > 3 && title.includes(t))) {
               pandaState.matches.get(matchId).polySlug = slug;
               console.log(`[panda] Matched: ${psTeams.join(' vs ')} → ${slug}`);
+              matched = true;
               break;
             }
+          }
+          // If not in knownLive, search Gamma API for the event
+          if (!matched) {
+            try {
+              for (const team of psTeamsLower) {
+                if (!team || team.length < 3) continue;
+                const searchR = await fetch(`https://gamma-api.polymarket.com/events?active=true&closed=false&limit=20`);
+                const searchD = await searchR.json();
+                for (const ev of (searchD || [])) {
+                  const evTitle = (ev.title || '').toLowerCase();
+                  if (psTeamsLower.every(t => t.length > 3 && evTitle.includes(t))) {
+                    pandaState.matches.get(matchId).polySlug = ev.slug;
+                    console.log(`[panda] Matched (API): ${psTeams.join(' vs ')} → ${ev.slug}`);
+                    matched = true;
+                    break;
+                  }
+                }
+                if (matched) break;
+              }
+            } catch {}
           }
         }
 
@@ -7602,10 +7630,17 @@ function scheduleBtcAbovePreScan() {
     try {
       if (!clobClient) { scheduleBtcAbovePreScan(); return; }
 
-      const currentSlug = getBtcAboveSlug();
+      // The active event is the NEXT hour (e.g., at 8:32 PM the "9 PM" event is active)
+      const now2 = new Date();
+      const nextHour = new Date(now2.getTime() + 3600000);
+      const et2 = new Date(nextHour.toLocaleString('en-US', { timeZone: 'America/New_York' }));
+      const months2 = ['january','february','march','april','may','june','july','august','september','october','november','december'];
+      let h2 = et2.getHours(); const ap2 = h2 >= 12 ? 'pm' : 'am';
+      if (h2 === 0) h2 = 12; else if (h2 > 12) h2 -= 12;
+      const currentSlug = `bitcoin-above-on-${months2[et2.getMonth()]}-${et2.getDate()}-${et2.getFullYear()}-${h2}${ap2}-et`;
       if (btcAbovePreFired.has(currentSlug)) { scheduleBtcAbovePreScan(); return; }
 
-      // Check if 30 min before expiry
+      // Check if within 40 min of expiry
       try {
         const r = await fetch(`https://gamma-api.polymarket.com/events?slug=${currentSlug}`);
         const data = await r.json();
@@ -7615,7 +7650,7 @@ function scheduleBtcAbovePreScan() {
         const endMs = new Date(e.endDate).getTime();
         const minsLeft = (endMs - Date.now()) / 60000;
 
-        if (minsLeft > 30 || minsLeft < 0) { scheduleBtcAbovePreScan(); return; }
+        if (minsLeft > 40 || minsLeft < 0) { scheduleBtcAbovePreScan(); return; }
 
         btcAbovePreFired.add(currentSlug);
 
@@ -7636,21 +7671,34 @@ function scheduleBtcAbovePreScan() {
         }
         markets.sort((a, b) => a.level - b.level);
 
-        // Cheapest YES at 99.9%+ (highest level where YES is decided)
-        const bestYes = markets.filter(m => m.yesPrice >= 0.999).sort((a, b) => b.level - a.level)[0];
-        // Cheapest NO at 99.8%+ (lowest level where NO is decided)
-        const bestNo = markets.filter(m => m.noPrice >= 0.998).sort((a, b) => a.level - b.level)[0];
+        // Get current BTC price
+        let btcPrice = 0;
+        try {
+          const btcR = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT');
+          btcPrice = parseFloat((await btcR.json()).price);
+        } catch {}
 
-        if (bestYes) {
-          console.log(`[btc-above-pre] ${currentSlug.slice(-10)} | YES $${bestYes.level} at ${(bestYes.yesPrice*100).toFixed(1)}¢`);
-          try { await placeLive99Order(bestYes.tokens[0], 10, bestYes.negRisk, `[btc-above-pre] YES $${bestYes.level} 10sh`); } catch {}
-        }
-        if (bestNo) {
-          console.log(`[btc-above-pre] ${currentSlug.slice(-10)} | NO $${bestNo.level} at ${(bestNo.noPrice*100).toFixed(1)}¢`);
-          try { await placeLive99Order(bestNo.tokens[1], 10, bestNo.negRisk, `[btc-above-pre] NO $${bestNo.level} 10sh`); } catch {}
-        }
-        if (!bestYes && !bestNo) {
-          console.log(`[btc-above-pre] ${currentSlug.slice(-10)} | No markets at threshold yet`);
+        // Rule: price > 97¢ AND move needed > $1500 to flip
+        // Pick the LOWEST price (best odds) on each side
+        const safeYes = markets
+          .filter(m => m.yesPrice >= 0.97 && btcPrice - m.level > 1500)
+          .sort((a, b) => a.yesPrice - b.yesPrice)[0]; // lowest YES price = best odds
+        const safeNo = markets
+          .filter(m => m.noPrice >= 0.97 && m.level - btcPrice > 1500)
+          .sort((a, b) => a.noPrice - b.noPrice)[0]; // lowest NO price = best odds
+
+        // Pick whichever has the biggest buffer (furthest from BTC price)
+        const yesBuffer = safeYes ? btcPrice - safeYes.level : 0;
+        const noBuffer = safeNo ? safeNo.level - btcPrice : 0;
+
+        if (yesBuffer > noBuffer && safeYes) {
+          console.log(`[btc-above-pre] ${currentSlug.slice(-10)} | YES $${safeYes.level.toLocaleString()} at ${(safeYes.yesPrice*100).toFixed(1)}¢ (BTC $${btcPrice.toFixed(0)}, buffer $${yesBuffer.toFixed(0)})`);
+          try { await placeLive99Order(safeYes.tokens[0], 10, safeYes.negRisk, `[btc-above-pre] YES $${safeYes.level} 10sh`); } catch {}
+        } else if (safeNo) {
+          console.log(`[btc-above-pre] ${currentSlug.slice(-10)} | NO $${safeNo.level.toLocaleString()} at ${(safeNo.noPrice*100).toFixed(1)}¢ (BTC $${btcPrice.toFixed(0)}, buffer $${noBuffer.toFixed(0)})`);
+          try { await placeLive99Order(safeNo.tokens[1], 10, safeNo.negRisk, `[btc-above-pre] NO $${safeNo.level} 10sh`); } catch {}
+        } else {
+          console.log(`[btc-above-pre] ${currentSlug.slice(-10)} | BTC $${btcPrice.toFixed(0)} — no safe picks (need >97¢ + $1500 buffer)`);
         }
       } catch {}
     } catch {}
