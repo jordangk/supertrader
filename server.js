@@ -7538,11 +7538,14 @@ function schedulePandaScan() {
                           const wi = p0 >= p1 ? 0 : 1;
                           console.log(`[panda] Placing: Map ${pos} Winner → ${outcomes[wi]} (Gamma fallback)`);
                           try { await placeLive99Order(tokens[wi], 50, m.negRisk ?? true, `[panda] ${outcomes[wi]} Map ${pos} 50sh`); } catch {}
+                          if (polyData?._esportsFired && m.conditionId) polyData._esportsFired.add(m.conditionId);
                         }
                       }
                     } else {
                       console.log(`[panda] Placing: Map ${pos} Winner → ${outcomes[winIdx]} (PandaScore verified)`);
                       try { await placeLive99Order(tokens[winIdx], 50, m.negRisk ?? true, `[panda] ${outcomes[winIdx]} Map ${pos} 50sh`); } catch {}
+                      // Mark as fired so Gamma scanner doesn't buy opposite side
+                      if (polyData?._esportsFired && m.conditionId) polyData._esportsFired.add(m.conditionId);
                     }
                   }
 
@@ -7621,8 +7624,12 @@ setTimeout(() => {
   schedulePandaScan();
 }, 28000);
 
-// ── Bitcoin Above Pre-Expiry Scanner ──
-// 30 min before expiry: cheapest YES at 99.9%+ and cheapest NO at 99.8%+, 10sh each
+// ── Crypto Above Pre-Expiry Scanner ──
+// 30 min before expiry: pick safest bet (biggest buffer >$1500 >97¢), 10sh
+const CRYPTO_ABOVE_CONFIGS = [
+  { name: 'BTC', slugPrefix: 'bitcoin-above-on', priceUrl: 'https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT', minBuffer: 1500 },
+  { name: 'ETH', slugPrefix: 'ethereum-above-on', priceUrl: 'https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT', minBuffer: 100 },
+];
 const btcAbovePreFired = new Set();
 
 function scheduleBtcAbovePreScan() {
@@ -7630,15 +7637,18 @@ function scheduleBtcAbovePreScan() {
     try {
       if (!clobClient) { scheduleBtcAbovePreScan(); return; }
 
-      // The active event is the NEXT hour (e.g., at 8:32 PM the "9 PM" event is active)
+      // Build slug for next hour
       const now2 = new Date();
       const nextHour = new Date(now2.getTime() + 3600000);
       const et2 = new Date(nextHour.toLocaleString('en-US', { timeZone: 'America/New_York' }));
       const months2 = ['january','february','march','april','may','june','july','august','september','october','november','december'];
       let h2 = et2.getHours(); const ap2 = h2 >= 12 ? 'pm' : 'am';
       if (h2 === 0) h2 = 12; else if (h2 > 12) h2 -= 12;
-      const currentSlug = `bitcoin-above-on-${months2[et2.getMonth()]}-${et2.getDate()}-${et2.getFullYear()}-${h2}${ap2}-et`;
-      if (btcAbovePreFired.has(currentSlug)) { scheduleBtcAbovePreScan(); return; }
+      const hourSlug = `${months2[et2.getMonth()]}-${et2.getDate()}-${et2.getFullYear()}-${h2}${ap2}-et`;
+
+      for (const cfg of CRYPTO_ABOVE_CONFIGS) {
+      const currentSlug = `${cfg.slugPrefix}-${hourSlug}`;
+      if (btcAbovePreFired.has(currentSlug)) continue;
 
       // Check if within 40 min of expiry
       try {
@@ -7650,7 +7660,7 @@ function scheduleBtcAbovePreScan() {
         const endMs = new Date(e.endDate).getTime();
         const minsLeft = (endMs - Date.now()) / 60000;
 
-        if (minsLeft > 40 || minsLeft < 0) { scheduleBtcAbovePreScan(); return; }
+        if (minsLeft > 32 || minsLeft < 0) { scheduleBtcAbovePreScan(); return; }
 
         btcAbovePreFired.add(currentSlug);
 
@@ -7671,36 +7681,48 @@ function scheduleBtcAbovePreScan() {
         }
         markets.sort((a, b) => a.level - b.level);
 
-        // Get current BTC price
-        let btcPrice = 0;
+        // Get current crypto price
+        let cryptoPrice = 0;
         try {
-          const btcR = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT');
-          btcPrice = parseFloat((await btcR.json()).price);
+          const prR = await fetch(cfg.priceUrl);
+          cryptoPrice = parseFloat((await prR.json()).price);
         } catch {}
 
-        // Rule: price > 97¢ AND move needed > $1500 to flip
-        // Pick the LOWEST price (best odds) on each side
+        // Rule: price > 97¢ AND move needed > minBuffer to flip
         const safeYes = markets
-          .filter(m => m.yesPrice >= 0.97 && btcPrice - m.level > 1500)
-          .sort((a, b) => a.yesPrice - b.yesPrice)[0]; // lowest YES price = best odds
+          .filter(m => m.yesPrice >= 0.97 && cryptoPrice - m.level > cfg.minBuffer)
+          .sort((a, b) => a.yesPrice - b.yesPrice)[0];
         const safeNo = markets
-          .filter(m => m.noPrice >= 0.97 && m.level - btcPrice > 1500)
-          .sort((a, b) => a.noPrice - b.noPrice)[0]; // lowest NO price = best odds
+          .filter(m => m.noPrice >= 0.97 && m.level - cryptoPrice > cfg.minBuffer)
+          .sort((a, b) => a.noPrice - b.noPrice)[0];
 
-        // Pick whichever has the biggest buffer (furthest from BTC price)
-        const yesBuffer = safeYes ? btcPrice - safeYes.level : 0;
-        const noBuffer = safeNo ? safeNo.level - btcPrice : 0;
+        // Pick whichever has the biggest buffer
+        const yesBuffer = safeYes ? cryptoPrice - safeYes.level : 0;
+        const noBuffer = safeNo ? safeNo.level - cryptoPrice : 0;
 
         if (yesBuffer > noBuffer && safeYes) {
-          console.log(`[btc-above-pre] ${currentSlug.slice(-10)} | YES $${safeYes.level.toLocaleString()} at ${(safeYes.yesPrice*100).toFixed(1)}¢ (BTC $${btcPrice.toFixed(0)}, buffer $${yesBuffer.toFixed(0)})`);
-          try { await placeLive99Order(safeYes.tokens[0], 10, safeYes.negRisk, `[btc-above-pre] YES $${safeYes.level} 10sh`); } catch {}
+          console.log(`[${cfg.name}-above-pre] ${currentSlug.slice(-10)} | YES $${safeYes.level.toLocaleString()} at ${(safeYes.yesPrice*100).toFixed(1)}¢ (${cfg.name} $${cryptoPrice.toFixed(0)}, buffer $${yesBuffer.toFixed(0)})`);
+          try { await placeLive99Order(safeYes.tokens[0], 10, safeYes.negRisk, `[${cfg.name}-above-pre] YES $${safeYes.level} 10sh`); } catch {}
         } else if (safeNo) {
-          console.log(`[btc-above-pre] ${currentSlug.slice(-10)} | NO $${safeNo.level.toLocaleString()} at ${(safeNo.noPrice*100).toFixed(1)}¢ (BTC $${btcPrice.toFixed(0)}, buffer $${noBuffer.toFixed(0)})`);
-          try { await placeLive99Order(safeNo.tokens[1], 10, safeNo.negRisk, `[btc-above-pre] NO $${safeNo.level} 10sh`); } catch {}
+          console.log(`[${cfg.name}-above-pre] ${currentSlug.slice(-10)} | NO $${safeNo.level.toLocaleString()} at ${(safeNo.noPrice*100).toFixed(1)}¢ (${cfg.name} $${cryptoPrice.toFixed(0)}, buffer $${noBuffer.toFixed(0)})`);
+          try { await placeLive99Order(safeNo.tokens[1], 10, safeNo.negRisk, `[${cfg.name}-above-pre] NO $${safeNo.level} 10sh`); } catch {}
         } else {
-          console.log(`[btc-above-pre] ${currentSlug.slice(-10)} | BTC $${btcPrice.toFixed(0)} — no safe picks (need >97¢ + $1500 buffer)`);
+          console.log(`[${cfg.name}-above-pre] ${currentSlug.slice(-10)} | ${cfg.name} $${cryptoPrice.toFixed(0)} — no safe picks`);
+        }
+
+        // Also place 10sh on ALL markets at 99%+ (market making)
+        for (const m of markets) {
+          if (m.yesPrice >= 0.99) {
+            console.log(`[${cfg.name}-above-mm] YES $${m.level.toLocaleString()} at ${(m.yesPrice*100).toFixed(1)}¢`);
+            try { await placeLive99Order(m.tokens[0], 10, m.negRisk ?? false, `[${cfg.name}-mm] YES $${m.level} 10sh`); } catch {}
+          }
+          if (m.noPrice >= 0.99) {
+            console.log(`[${cfg.name}-above-mm] NO $${m.level.toLocaleString()} at ${(m.noPrice*100).toFixed(1)}¢`);
+            try { await placeLive99Order(m.tokens[1], 10, m.negRisk ?? false, `[${cfg.name}-mm] NO $${m.level} 10sh`); } catch {}
+          }
         }
       } catch {}
+      } // end for CRYPTO_ABOVE_CONFIGS
     } catch {}
     scheduleBtcAbovePreScan();
   }, 30000); // Check every 30s
