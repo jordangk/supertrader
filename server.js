@@ -6758,6 +6758,8 @@ setTimeout(async () => {
 
           const p0 = parseFloat(prices[0]), p1 = parseFloat(prices[1]);
           if (Math.max(p0, p1) < 0.90) continue; // not clear enough
+          // Gamma-only: must pass 103¢ check (both sides sum)
+          if (p0 + p1 > 1.03) { console.log(`[esports] SKIP Map ${mapNum}: ${(p0*100).toFixed(0)}+${(p1*100).toFixed(0)}=${((p0+p1)*100).toFixed(0)}¢ > 103 | ${data.title.slice(0,25)}`); continue; }
           const winIdx = p0 >= p1 ? 0 : 1;
           const winToken = tokens[winIdx];
           const winLabel = outcomes[winIdx];
@@ -6765,7 +6767,6 @@ setTimeout(async () => {
 
           data._esportsFired.add(condId);
 
-          // No CLOB price check — map is completed, Gamma confirms winner, just place limit
           console.log(`[esports] ${data.title.slice(0,30)} Map ${mapNum} Winner → ${winLabel} (Gamma ${(Math.max(p0,p1)*100).toFixed(0)}%)`);
           try {
             const result = await placeLive99Order(winToken, 50, negRisk, `[esports] ${winLabel} Map ${mapNum} 10sh`);
@@ -7534,14 +7535,17 @@ function schedulePandaScan() {
                       const prices = typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices;
                       if (prices) {
                         const p0 = parseFloat(prices[0]), p1 = parseFloat(prices[1]);
-                        if (Math.max(p0, p1) >= 0.90) {
+                        if (Math.max(p0, p1) >= 0.90 && p0 + p1 <= 1.03) {
                           const wi = p0 >= p1 ? 0 : 1;
                           console.log(`[panda] Placing: Map ${pos} Winner → ${outcomes[wi]} (Gamma fallback)`);
                           try { await placeLive99Order(tokens[wi], 50, m.negRisk ?? true, `[panda] ${outcomes[wi]} Map ${pos} 50sh`); } catch {}
                           if (polyData?._esportsFired && m.conditionId) polyData._esportsFired.add(m.conditionId);
+                        } else if (p0 + p1 > 1.03) {
+                          console.log(`[panda] SKIP Map ${pos} Winner: ${(p0*100).toFixed(0)}+${(p1*100).toFixed(0)}=${((p0+p1)*100).toFixed(0)}¢ > 103`);
                         }
                       }
                     } else {
+                      // PandaScore verified — trust it, no price check needed
                       console.log(`[panda] Placing: Map ${pos} Winner → ${outcomes[winIdx]} (PandaScore verified)`);
                       try { await placeLive99Order(tokens[winIdx], 50, m.negRisk ?? true, `[panda] ${outcomes[winIdx]} Map ${pos} 50sh`); } catch {}
                       // Mark as fired so Gamma scanner doesn't buy opposite side
