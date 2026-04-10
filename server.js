@@ -7635,14 +7635,15 @@ const CRYPTO_ABOVE_CONFIGS = [
   { name: 'ETH', slugPrefix: 'ethereum-above-on', priceUrl: 'https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT', symbol: 'ETHUSDT', minBuffer: 100 },
 ];
 
-// Dynamic buffer: 2x the 95th percentile of 30-min ranges (last 24h)
-async function getDynamicBuffer(symbol) {
+// Check volatility of the last 30 minutes (high - low of last 30 min)
+async function getLast30mVolatility(symbol) {
   try {
-    const r = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=30m&limit=48`);
+    const r = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=1m&limit=30`);
     const klines = await r.json();
-    const moves = klines.map(k => parseFloat(k[2]) - parseFloat(k[3])).sort((a, b) => a - b);
-    const p95 = moves[Math.floor(moves.length * 0.95)];
-    return Math.ceil(p95 * 2);
+    const highs = klines.map(k => parseFloat(k[2]));
+    const lows = klines.map(k => parseFloat(k[3]));
+    const range = Math.max(...highs) - Math.min(...lows);
+    return Math.ceil(range);
   } catch { return null; }
 }
 const btcAbovePreFired = new Set();
@@ -7703,23 +7704,26 @@ function scheduleBtcAbovePreScan() {
           cryptoPrice = parseFloat((await prR.json()).price);
         } catch {}
 
-        // Dynamic buffer from real-time volatility (2x 95th percentile of 30-min ranges)
-        const dynamicBuffer = await getDynamicBuffer(cfg.symbol);
-        const buffer = dynamicBuffer || cfg.minBuffer;
-        console.log(`[${cfg.name}-mm] ${cfg.name} $${cryptoPrice.toFixed(0)} | buffer: $${buffer} (${dynamicBuffer ? 'dynamic 2x P95' : 'fallback'})`);
+        // Check last 30 min volatility — if higher than buffer, skip (too risky)
+        const vol30m = await getLast30mVolatility(cfg.symbol);
+        if (vol30m && vol30m > cfg.minBuffer) {
+          console.log(`[${cfg.name}-mm] ${cfg.name} $${cryptoPrice.toFixed(0)} | SKIP — last 30m vol $${vol30m} > $${cfg.minBuffer} buffer`);
+          continue;
+        }
+        console.log(`[${cfg.name}-mm] ${cfg.name} $${cryptoPrice.toFixed(0)} | last 30m vol: $${vol30m || '?'} (< $${cfg.minBuffer} OK)`);
 
-        // Market making: 10sh on all 99%+ with dynamic buffer
+        // Market making: 10sh on all 99%+ with min buffer
         let placed = 0;
         for (const m of markets) {
           const yesBuffer = cryptoPrice - m.level;
           const noBuffer = m.level - cryptoPrice;
 
-          if (m.yesPrice >= 0.99 && yesBuffer > buffer) {
-            console.log(`[${cfg.name}-mm] YES $${m.level.toLocaleString()} at ${(m.yesPrice*100).toFixed(1)}¢ (buffer $${yesBuffer.toFixed(0)} > $${buffer})`);
+          if (m.yesPrice >= 0.99 && yesBuffer > cfg.minBuffer) {
+            console.log(`[${cfg.name}-mm] YES $${m.level.toLocaleString()} at ${(m.yesPrice*100).toFixed(1)}¢ (buffer $${yesBuffer.toFixed(0)})`);
             try { await placeLive99Order(m.tokens[0], 10, m.negRisk ?? false, `[${cfg.name}-mm] YES $${m.level} 10sh`); placed++; } catch {}
           }
-          if (m.noPrice >= 0.99 && noBuffer > buffer) {
-            console.log(`[${cfg.name}-mm] NO $${m.level.toLocaleString()} at ${(m.noPrice*100).toFixed(1)}¢ (buffer $${noBuffer.toFixed(0)} > $${buffer})`);
+          if (m.noPrice >= 0.99 && noBuffer > cfg.minBuffer) {
+            console.log(`[${cfg.name}-mm] NO $${m.level.toLocaleString()} at ${(m.noPrice*100).toFixed(1)}¢ (buffer $${noBuffer.toFixed(0)})`);
             try { await placeLive99Order(m.tokens[1], 10, m.negRisk ?? false, `[${cfg.name}-mm] NO $${m.level} 10sh`); placed++; } catch {}
           }
         }
@@ -7939,10 +7943,11 @@ function scheduleWeatherPreMarket() {
     scheduleWeatherPreMarket();
   }, 60000); // Check every minute
 }
-setTimeout(() => {
-  console.log('[weather-pre] Pre-market forecast scanner started');
-  scheduleWeatherPreMarket();
-}, 25000);
+// DISABLED — pre-market forecast scanner
+// setTimeout(() => {
+//   console.log('[weather-pre] Pre-market forecast scanner started');
+//   scheduleWeatherPreMarket();
+// }, 25000);
 
 // ── Weather Sandwich Scanner ──
 // Every hour: find pricing dips in consecutive >99.5% NO runs
@@ -8125,8 +8130,8 @@ function scheduleWeatherExpiry() {
               const winPrice = Math.max(p0, p1);
               const vol = parseFloat(mkt.volume || 0);
 
-              // Must be 99%+ (market making on decided markets)
-              if (winPrice < 0.99) continue;
+              // Must be 99.8%+ (including 100% — limit sits waiting for sellers)
+              if (winPrice < 0.998) continue;
 
               const winIdx = p0 >= p1 ? 0 : 1;
               const winToken = tokens[winIdx];
