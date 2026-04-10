@@ -8083,7 +8083,7 @@ function scheduleWeatherExpiry() {
       if (!await isGammaAlive()) { scheduleWeatherExpiry(); return; }
 
       const now = Date.now();
-      const allCities = [...Object.keys(WEATHER_CITIES), 'amsterdam', 'wuhan', 'ankara', 'mumbai', 'delhi', 'bangkok', 'sao-paulo', 'mexico-city', 'cairo', 'istanbul'];
+      const allCities = SANDWICH_CITIES;
       const monthNames = ['january','february','march','april','may','june','july','august','september','october','november','december'];
 
       // Check today and tomorrow for each city
@@ -8126,8 +8126,8 @@ function scheduleWeatherExpiry() {
               const winPrice = Math.max(p0, p1);
               const vol = parseFloat(mkt.volume || 0);
 
-              // Must be 99.5%+ and have volume
-              if (winPrice < 0.995 || vol < 10) continue;
+              // Must be 99%+ (market making on decided markets)
+              if (winPrice < 0.99) continue;
 
               const winIdx = p0 >= p1 ? 0 : 1;
               const winToken = tokens[winIdx];
