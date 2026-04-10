@@ -7631,9 +7631,20 @@ setTimeout(() => {
 // ── Crypto Above Pre-Expiry Scanner ──
 // 30 min before expiry: pick safest bet (biggest buffer >$1500 >97¢), 10sh
 const CRYPTO_ABOVE_CONFIGS = [
-  { name: 'BTC', slugPrefix: 'bitcoin-above-on', priceUrl: 'https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT', minBuffer: 1500 },
-  { name: 'ETH', slugPrefix: 'ethereum-above-on', priceUrl: 'https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT', minBuffer: 100 },
+  { name: 'BTC', slugPrefix: 'bitcoin-above-on', priceUrl: 'https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT', symbol: 'BTCUSDT', minBuffer: 1500 },
+  { name: 'ETH', slugPrefix: 'ethereum-above-on', priceUrl: 'https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT', symbol: 'ETHUSDT', minBuffer: 100 },
 ];
+
+// Dynamic buffer: 2x the 95th percentile of 30-min ranges (last 24h)
+async function getDynamicBuffer(symbol) {
+  try {
+    const r = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=30m&limit=48`);
+    const klines = await r.json();
+    const moves = klines.map(k => parseFloat(k[2]) - parseFloat(k[3])).sort((a, b) => a - b);
+    const p95 = moves[Math.floor(moves.length * 0.95)];
+    return Math.ceil(p95 * 2);
+  } catch { return null; }
+}
 const btcAbovePreFired = new Set();
 
 function scheduleBtcAbovePreScan() {
@@ -7692,39 +7703,27 @@ function scheduleBtcAbovePreScan() {
           cryptoPrice = parseFloat((await prR.json()).price);
         } catch {}
 
-        // Rule: price > 97¢ AND move needed > minBuffer to flip
-        const safeYes = markets
-          .filter(m => m.yesPrice >= 0.97 && cryptoPrice - m.level > cfg.minBuffer)
-          .sort((a, b) => a.yesPrice - b.yesPrice)[0];
-        const safeNo = markets
-          .filter(m => m.noPrice >= 0.97 && m.level - cryptoPrice > cfg.minBuffer)
-          .sort((a, b) => a.noPrice - b.noPrice)[0];
+        // Dynamic buffer from real-time volatility (2x 95th percentile of 30-min ranges)
+        const dynamicBuffer = await getDynamicBuffer(cfg.symbol);
+        const buffer = dynamicBuffer || cfg.minBuffer;
+        console.log(`[${cfg.name}-mm] ${cfg.name} $${cryptoPrice.toFixed(0)} | buffer: $${buffer} (${dynamicBuffer ? 'dynamic 2x P95' : 'fallback'})`);
 
-        // Pick whichever has the biggest buffer
-        const yesBuffer = safeYes ? cryptoPrice - safeYes.level : 0;
-        const noBuffer = safeNo ? safeNo.level - cryptoPrice : 0;
-
-        if (yesBuffer > noBuffer && safeYes) {
-          console.log(`[${cfg.name}-above-pre] ${currentSlug.slice(-10)} | YES $${safeYes.level.toLocaleString()} at ${(safeYes.yesPrice*100).toFixed(1)}¢ (${cfg.name} $${cryptoPrice.toFixed(0)}, buffer $${yesBuffer.toFixed(0)})`);
-          try { await placeLive99Order(safeYes.tokens[0], 10, safeYes.negRisk, `[${cfg.name}-above-pre] YES $${safeYes.level} 10sh`); } catch {}
-        } else if (safeNo) {
-          console.log(`[${cfg.name}-above-pre] ${currentSlug.slice(-10)} | NO $${safeNo.level.toLocaleString()} at ${(safeNo.noPrice*100).toFixed(1)}¢ (${cfg.name} $${cryptoPrice.toFixed(0)}, buffer $${noBuffer.toFixed(0)})`);
-          try { await placeLive99Order(safeNo.tokens[1], 10, safeNo.negRisk, `[${cfg.name}-above-pre] NO $${safeNo.level} 10sh`); } catch {}
-        } else {
-          console.log(`[${cfg.name}-above-pre] ${currentSlug.slice(-10)} | ${cfg.name} $${cryptoPrice.toFixed(0)} — no safe picks`);
-        }
-
-        // Also place 10sh on ALL markets at 99%+ (market making)
+        // Market making: 10sh on all 99%+ with dynamic buffer
+        let placed = 0;
         for (const m of markets) {
-          if (m.yesPrice >= 0.99) {
-            console.log(`[${cfg.name}-above-mm] YES $${m.level.toLocaleString()} at ${(m.yesPrice*100).toFixed(1)}¢`);
-            try { await placeLive99Order(m.tokens[0], 10, m.negRisk ?? false, `[${cfg.name}-mm] YES $${m.level} 10sh`); } catch {}
+          const yesBuffer = cryptoPrice - m.level;
+          const noBuffer = m.level - cryptoPrice;
+
+          if (m.yesPrice >= 0.99 && yesBuffer > buffer) {
+            console.log(`[${cfg.name}-mm] YES $${m.level.toLocaleString()} at ${(m.yesPrice*100).toFixed(1)}¢ (buffer $${yesBuffer.toFixed(0)} > $${buffer})`);
+            try { await placeLive99Order(m.tokens[0], 10, m.negRisk ?? false, `[${cfg.name}-mm] YES $${m.level} 10sh`); placed++; } catch {}
           }
-          if (m.noPrice >= 0.99) {
-            console.log(`[${cfg.name}-above-mm] NO $${m.level.toLocaleString()} at ${(m.noPrice*100).toFixed(1)}¢`);
-            try { await placeLive99Order(m.tokens[1], 10, m.negRisk ?? false, `[${cfg.name}-mm] NO $${m.level} 10sh`); } catch {}
+          if (m.noPrice >= 0.99 && noBuffer > buffer) {
+            console.log(`[${cfg.name}-mm] NO $${m.level.toLocaleString()} at ${(m.noPrice*100).toFixed(1)}¢ (buffer $${noBuffer.toFixed(0)} > $${buffer})`);
+            try { await placeLive99Order(m.tokens[1], 10, m.negRisk ?? false, `[${cfg.name}-mm] NO $${m.level} 10sh`); placed++; } catch {}
           }
         }
+        console.log(`[${cfg.name}-mm] placed ${placed} orders`);
       } catch {}
       } // end for CRYPTO_ABOVE_CONFIGS
     } catch {}
