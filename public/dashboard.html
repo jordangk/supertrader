@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SuperTrader Dashboard</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0a;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:16px;max-width:1400px;margin:0 auto}
+h1{font-size:22px;color:#fff;margin-bottom:16px;display:flex;align-items:center;gap:12px}
+h1 .live{width:8px;height:8px;border-radius:50%;background:#4ade80;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+
+.topbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
+.stat{background:#111;border:1px solid #222;border-radius:8px;padding:10px 16px;text-align:center;min-width:100px}
+.stat .label{font-size:9px;color:#555;text-transform:uppercase;letter-spacing:1px}
+.stat .val{font-size:18px;font-weight:700;color:#fff;margin-top:2px}
+
+.scanners{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;margin-bottom:16px}
+.scanner{background:#111;border:1px solid #222;border-radius:8px;padding:10px 12px;display:flex;align-items:center;justify-content:space-between;cursor:pointer;transition:border-color .2s}
+.scanner:hover{border-color:#444}
+.scanner .info{display:flex;align-items:center;gap:8px}
+.scanner .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.scanner .dot.on{background:#4ade80}
+.scanner .dot.off{background:#555}
+.scanner .name{font-size:12px;font-weight:600;color:#ccc}
+.scanner .detail{font-size:9px;color:#666;margin-top:1px}
+.toggle{width:36px;height:20px;border-radius:10px;border:none;cursor:pointer;position:relative;transition:background .2s;flex-shrink:0}
+.toggle.on{background:#166534}
+.toggle.off{background:#333}
+.toggle::after{content:'';position:absolute;width:16px;height:16px;border-radius:50%;background:#fff;top:2px;transition:left .2s}
+.toggle.on::after{left:18px}
+.toggle.off::after{left:2px}
+
+.events{margin-bottom:16px}
+.event-group{margin-bottom:10px}
+.event-group .group-header{font-size:11px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:1px;padding:4px 0;border-bottom:1px solid #1a1a1a;margin-bottom:4px}
+
+.event{background:#111;border:1px solid #1a1a1a;border-radius:8px;margin-bottom:4px;overflow:hidden;transition:border-color .2s}
+.event:hover{border-color:#333}
+.event-header{display:flex;align-items:center;gap:10px;padding:8px 12px;cursor:pointer;user-select:none}
+.event-header .cat{font-size:14px;flex-shrink:0}
+.event-header .title{flex:1;font-size:12px;color:#ccc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.event-header .score{font-family:monospace;font-size:11px;color:#fbbf24;flex-shrink:0}
+.event-header .period{font-size:10px;color:#555;flex-shrink:0}
+.event-header .strategy{font-size:9px;padding:2px 6px;border-radius:3px;font-weight:600;flex-shrink:0}
+.event-header .chevron{color:#444;font-size:12px;flex-shrink:0;transition:transform .2s}
+.event-header .chevron.open{transform:rotate(90deg)}
+
+.event-body{display:none;padding:0 12px 10px;border-top:1px solid #1a1a1a}
+.event-body.open{display:block}
+.event-body .strat-desc{font-size:10px;color:#888;padding:8px 0 6px;line-height:1.5}
+.event-body .bets-table{width:100%;font-size:10px;border-collapse:collapse}
+.event-body .bets-table th{text-align:left;color:#555;font-size:9px;text-transform:uppercase;padding:4px 6px;border-bottom:1px solid #1a1a1a}
+.event-body .bets-table td{padding:4px 6px;color:#aaa;font-family:monospace;border-bottom:1px solid #0f0f0f}
+.event-body .bets-table tr:hover td{background:#1a1a1a}
+
+.green{color:#4ade80}.red{color:#f87171}.yellow{color:#fbbf24}.blue{color:#60a5fa}.gray{color:#666}.cyan{color:#22d3ee}.purple{color:#c084fc}.orange{color:#fb923c}
+
+.strat-live{background:#052;color:#4f8}
+.strat-panda{background:#0c2d48;color:#22d3ee}
+.strat-weather{background:#2d1b00;color:#fb923c}
+.strat-crypto{background:#1a0033;color:#c084fc}
+.strat-decided{background:#002;color:#60a5fa}
+
+#updated{font-size:10px;color:#333;margin-top:12px;text-align:center}
+.empty{color:#444;font-size:11px;padding:20px;text-align:center;font-style:italic}
+
+.log-entry{font-family:monospace;font-size:10px;color:#888;padding:4px 8px;border-radius:3px;margin-bottom:1px;background:#0a0a0a}
+
+.section{background:#111;border:1px solid #222;border-radius:10px;padding:12px;margin-bottom:14px}
+.section h2{font-size:13px;color:#fff;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between}
+.section h2 .count{font-size:10px;color:#555;font-weight:400}
+.scroll{max-height:400px;overflow-y:auto}
+.pos-row{display:grid;grid-template-columns:1fr 90px 60px 60px 70px;gap:4px;padding:5px 8px;font-size:10px;border-radius:4px;margin-bottom:1px;align-items:center}
+.pos-row:nth-child(odd){background:#0f0f0f}
+.pos-row .title{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#aaa}
+.pos-header{display:grid;grid-template-columns:1fr 90px 60px 60px 70px;gap:4px;padding:4px 8px;font-size:9px;color:#555;text-transform:uppercase}
+</style></head><body>
+
+<h1><span class="live"></span> SuperTrader Dashboard</h1>
+<div class="topbar" id="topbar"></div>
+
+<div class="scanners" id="scanners"></div>
+
+<div class="events" id="events"></div>
+
+<div class="section">
+  <h2>Positions <span class="count" id="posCount"></span></h2>
+  <div class="pos-header"><div>Market</div><div>Side</div><div>Avg</div><div>Now</div><div>P&L</div></div>
+  <div class="scroll" id="positions"></div>
+</div>
+
+<div class="section">
+  <h2>Recent Orders <span class="count" id="logCount"></span></h2>
+  <div class="scroll" id="recentLog"></div>
+</div>
+
+<div id="updated"></div>
+
+<script>
+const STRAT_META = {
+  livePoller: { label: 'Live Events', color: 'strat-live', desc: 'Polls Gamma live API every 3s. Detects ended sports/esports events, buys winner at 99c. Includes end-of-game, halftime, O/U, exact score, BTTS sub-strategies.' },
+  pandaScore: { label: 'PandaScore', color: 'strat-panda', desc: 'Polls PandaScore every 4s for esports map completions. Fires 2-3 min before Gamma catches up. CS2, Dota2, LoL, Valorant.' },
+  weather: { label: 'Weather Temp', color: 'strat-weather', desc: 'Every 15min checks actual observed temps from Weather.com stations. Buys decided temperature brackets where observed temp already exceeds/falls below threshold.' },
+  sandwich: { label: 'Weather Sandwich', color: 'strat-weather', desc: 'Hourly scan of 43 cities. Finds pricing dips in consecutive 99.5%+ NO runs. If a bracket is cheaper than both neighbors, buys it.' },
+  weatherExpiry: { label: 'Weather Expiry', color: 'strat-weather', desc: '3 hours before weather event expires, buys 10sh on everything at 99.5%+ where outcome is decided.' },
+  btcAbovePre: { label: 'Crypto Above Pre', color: 'strat-crypto', desc: '30 min before hourly crypto-above expiry. Picks safest side (BTC >$1500 buffer, ETH >$100 buffer from strike), checks 30m volatility, buys 10sh.' },
+  btcAbove: { label: 'Crypto Above Post', color: 'strat-crypto', desc: 'After hourly expiry, buys all decided above/below strike markets at 99.9c. BTC and ETH.' },
+  crypto5m: { label: 'Crypto 5m', color: 'strat-crypto', desc: 'Fires on the 5-minute boundary for BTC/ETH/SOL/XRP up/down. Places 50sh at 99c on the winning side once direction is locked in.' },
+  decided99: { label: 'Decided 99', color: 'strat-decided', desc: 'Scans for any market at 99%+ implied probability and places 99.9c limit orders. Generic catch-all scanner. Off by default.' },
+};
+
+let expandedEvents = new Set();
+
+async function toggleScanner(key) {
+  try {
+    await fetch('/api/scanner/toggle', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ scanner: key }),
+    });
+    load();
+  } catch(e) { console.error('Toggle error:', e); }
+}
+
+function toggleEvent(id) {
+  if (expandedEvents.has(id)) expandedEvents.delete(id);
+  else expandedEvents.add(id);
+  renderEvents(window._lastData);
+}
+
+function stratBadge(key) {
+  const m = STRAT_META[key] || { label: key, color: '' };
+  return '<span class="strategy '+m.color+'">'+m.label+'</span>';
+}
+
+function renderEvents(d) {
+  if (!d) return;
+  window._lastData = d;
+  const el = document.getElementById('events');
+  const groups = d.trackedEvents || {};
+  let html = '';
+
+  for (const [groupKey, group] of Object.entries(groups)) {
+    const meta = STRAT_META[groupKey] || { label: groupKey, desc: '' };
+    const events = group.events || [];
+    if (!events.length) continue;
+
+    html += '<div class="event-group"><div class="group-header">'+meta.label+' ('+events.length+')</div>';
+
+    for (const ev of events) {
+      const id = groupKey + '_' + (ev.slug || ev.id || ev.title);
+      const isOpen = expandedEvents.has(id);
+      const cat = ev.category === 'esports' ? '&#127918;' : ev.category === 'tennis' ? '&#127934;' : ev.category === 'weather' ? '&#9748;' : ev.category === 'crypto' ? '&#9889;' : '&#9917;';
+
+      html += '<div class="event">';
+      html += '<div class="event-header" onclick="toggleEvent(\''+id.replace(/'/g,"\\'")+'\')">';
+      html += '<span class="cat">'+cat+'</span>';
+      html += '<span class="title">'+esc(ev.title || ev.slug || '')+'</span>';
+      if (ev.score) html += '<span class="score">'+esc(ev.score)+'</span>';
+      if (ev.period) html += '<span class="period">'+esc(ev.period)+'</span>';
+      if (ev.status) html += '<span class="strategy '+(ev.status==='fired'?'strat-live':ev.status==='tracking'?'strat-panda':'')+'">'+ev.status+'</span>';
+      html += stratBadge(groupKey);
+      html += '<span class="chevron '+(isOpen?'open':'')+'">&#9654;</span>';
+      html += '</div>';
+
+      if (isOpen) {
+        html += '<div class="event-body open">';
+        html += '<div class="strat-desc">'+meta.desc+'</div>';
+        if (ev.bets && ev.bets.length) {
+          html += '<table class="bets-table"><tr><th>Market</th><th>Side</th><th>Shares</th><th>Price</th><th>Status</th></tr>';
+          for (const b of ev.bets) {
+            html += '<tr><td>'+esc(b.market||'')+'</td><td class="'+(b.side==='Yes'||b.side==='UP'?'green':'red')+'">'+esc(b.side||'')+'</td><td>'+esc(String(b.shares||''))+'</td><td>'+esc(b.price||'')+'</td><td>'+esc(b.status||'')+'</td></tr>';
+          }
+          html += '</table>';
+        } else {
+          html += '<div class="empty">No bets placed yet - tracking only</div>';
+        }
+        if (ev.firedCount) html += '<div style="font-size:10px;color:#555;margin-top:6px">'+ev.firedCount+' markets fired on</div>';
+        html += '</div>';
+      }
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+
+  if (!html) html = '<div class="empty">No tracked events</div>';
+  el.innerHTML = html;
+}
+
+function esc(s) { const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+
+async function load() {
+  try {
+    const r = await fetch('/api/dashboard');
+    const d = await r.json();
+    if (!d || d.error) return;
+
+    // Top bar stats
+    const p = d.positions;
+    const pnl = p.value - p.cost;
+    document.getElementById('topbar').innerHTML = [
+      { l: 'Positions', v: p.total, c: '#fff' },
+      { l: 'Won', v: p.won, c: '#4ade80' },
+      { l: 'Lost', v: p.lost, c: '#f87171' },
+      { l: 'Open', v: p.open, c: '#fbbf24' },
+      { l: 'Orders', v: d.openOrders, c: '#60a5fa' },
+      { l: 'Cost', v: '$'+p.cost.toFixed(2), c: '#fff' },
+      { l: 'Value', v: '$'+p.value.toFixed(2), c: '#fff' },
+      { l: 'P&L', v: (pnl>=0?'+':'')+pnl.toFixed(2), c: pnl >= 0 ? '#4ade80' : '#f87171' },
+    ].map(s => '<div class="stat"><div class="label">'+s.l+'</div><div class="val" style="color:'+s.c+'">'+s.v+'</div></div>').join('');
+
+    // Scanners with toggles
+    const sc = d.scanners;
+    document.getElementById('scanners').innerHTML = Object.entries(sc).map(([k, s]) => {
+      const meta = STRAT_META[k] || { label: k };
+      let detail = '';
+      if (s.tracked != null) detail += s.tracked + ' tracked';
+      if (s.matched != null) detail += (detail?', ':'') + s.matched + ' matched';
+      if (s.cities != null) detail += (detail?', ':'') + s.cities + ' cities';
+      if (s.coins) detail += (detail?', ':'') + s.coins.join(', ');
+      if (s.fired != null) detail += (detail?', ':'') + s.fired + ' fired';
+      const toggleHtml = '<button class="toggle '+(s.active?'on':'off')+'" onclick="event.stopPropagation();toggleScanner(\''+k+'\')"></button>';
+      return '<div class="scanner"><div class="info"><div class="dot '+(s.active?'on':'off')+'"></div><div><div class="name">'+meta.label+'</div>'+(detail?'<div class="detail">'+detail+'</div>':'')+'</div></div>'+toggleHtml+'</div>';
+    }).join('');
+
+    // Events
+    renderEvents(d);
+
+    // Positions
+    const allPos = d.allPositions || [];
+    document.getElementById('posCount').textContent = '('+allPos.length+')';
+    document.getElementById('positions').innerHTML = allPos.map(p => {
+      const size = parseFloat(p.size||0);
+      const avg = parseFloat(p.avgPrice||0);
+      const cur = parseFloat(p.curPrice||0.5);
+      const pl = (cur-avg)*size;
+      return '<div class="pos-row"><div class="title">'+esc((p.title||'').slice(0,65))+'</div><div class="'+(p.outcome==='Yes'?'green':'red')+'">'+p.outcome+' '+size.toFixed(0)+'sh</div><div class="gray">'+(avg*100).toFixed(1)+'c</div><div class="gray">'+(cur*100).toFixed(1)+'c</div><div class="'+(pl>=0?'green':'red')+'">'+(pl>=0?'+':'')+pl.toFixed(2)+'</div></div>';
+    }).join('') || '<div class="empty">No positions</div>';
+
+    // Recent log
+    const logs = d.recentLog || [];
+    document.getElementById('logCount').textContent = '('+logs.length+')';
+    document.getElementById('recentLog').innerHTML = logs.map(l =>
+      '<div class="log-entry">'+esc((l.event||'').slice(0,25))+' | '+esc((l.market||'').slice(0,35))+' | '+esc(l.side||'')+' '+esc(l.price||'')+' | '+esc(l.status||'')+'</div>'
+    ).join('') || '<div class="empty">No recent orders</div>';
+
+    document.getElementById('updated').textContent = 'Updated: '+new Date().toLocaleTimeString();
+  } catch(e) { console.error('Dashboard error:', e); }
+}
+load();
+setInterval(load, 5000);
+</script>
+</body></html>

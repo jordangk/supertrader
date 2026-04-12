@@ -19,6 +19,7 @@ import EmaTradeLog from './components/EmaTradeLog.jsx';
 import Btc5mSequenceTab from './components/Btc5mSequenceTab.jsx';
 import Btc5mTrader from './components/Btc5mTrader.jsx';
 import EndingSoon from './components/EndingSoon.jsx';
+import Dashboard from './components/Dashboard.jsx';
 import { getApiBase } from './apiBase.js';
 
 const AMOUNTS = [50, 25, 10, 5];
@@ -798,6 +799,7 @@ export default function App() {
                 { id: 'btc5m', label: 'BTC 5m' },
                 { id: 'btc5mTrader', label: '5m Trade' },
                 { id: 'ending', label: 'Ending Soon' },
+                { id: 'dashboard', label: 'Dashboard' },
               ].map((t) => (
                 <button key={t.id} onClick={() => setTab(t.id)}
                   className={`px-4 py-1 rounded text-sm font-bold transition-colors ${tab === t.id ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700'}`}>
@@ -813,6 +815,8 @@ export default function App() {
               <Btc5mTrader />
             ) : tab === 'ending' ? (
               <EndingSoon />
+            ) : tab === 'dashboard' ? (
+              <Dashboard />
             ) : (
               <>
                 {/* ETH Auto-Trade Toggle */}

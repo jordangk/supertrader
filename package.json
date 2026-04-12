@@ -12,6 +12,8 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.80.0",
+    "@polymarket/builder-relayer-client": "^0.0.8",
+    "@polymarket/builder-signing-sdk": "^1.0.0",
     "@polymarket/clob-client": "^5.5.0",
     "@polymarket/order-utils": "^3.0.1",
     "@supabase/supabase-js": "^2.39.0",
