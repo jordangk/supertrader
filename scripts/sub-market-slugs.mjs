@@ -15,6 +15,14 @@ export const SOCCER_SUFFIXES = [
   '-exact-score-any-other',
 ];
 
+export const NBA_SUFFIXES = [
+  '-total-200pt5', '-total-205pt5', '-total-210pt5', '-total-215pt5', '-total-220pt5',
+  '-total-225pt5', '-total-230pt5', '-total-235pt5', '-total-240pt5',
+  '-spread-home-1pt5', '-spread-away-1pt5', '-spread-home-3pt5', '-spread-away-3pt5',
+  '-spread-home-5pt5', '-spread-away-5pt5', '-spread-home-7pt5', '-spread-away-7pt5',
+  '-spread-home-9pt5', '-spread-away-9pt5', '-spread-home-11pt5', '-spread-away-11pt5',
+];
+
 export const MLB_SUFFIXES = [
   '-total-5pt5', '-total-6pt5', '-total-7pt5', '-total-8pt5', '-total-9pt5',
   '-total-10pt5', '-total-11pt5', '-total-12pt5', '-total-13pt5', '-total-14pt5', '-total-15pt5',
@@ -50,6 +58,7 @@ export const TENNIS_SUFFIXES = [
 ];
 
 export function getSuffixesForSport(slug) {
+  if (slug.startsWith('nba-') || slug.startsWith('cbb-')) return NBA_SUFFIXES;
   if (slug.startsWith('mlb-')) return MLB_SUFFIXES;
   if (slug.startsWith('nhl-')) return NHL_SUFFIXES;
   if (slug.startsWith('cs2-') || slug.startsWith('lol-') || slug.startsWith('dota2-') || slug.startsWith('val-') || slug.startsWith('ow-') || slug.startsWith('r6siege-')) return ESPORTS_SUFFIXES;

@@ -97,9 +97,9 @@ async function initClobClient() {
       FUNDER_ADDRESS || undefined,
     );
     console.log('[CLOB] Client ready');
-    // Start auto-redeem for resolved Polymarket positions (every 60s)
-    // startAutoRedeem(10800000); // OLD — pays gas
-    startGaslessRedeem(600000); // Every 10 min — 1 redeem per cycle, ~6/hr to stay under daily quota
+    // Start auto-redeem: gasless every 15 min, batch gas fallback every 5 min if stuck
+    startGaslessRedeem(900000);
+    scheduleBatchGasRedeem();
   } catch (e) {
     console.error('[CLOB] Failed to init client:', e.message);
   }
@@ -114,6 +114,104 @@ const USDC_ABI = [
   'function allowance(address owner, address spender) view returns (uint256)',
   'function approve(address spender, uint256 amount) returns (bool)',
 ];
+
+// Batch gas redeem — multicall all redeemable positions in one tx
+let lastBatchRedeemTime = 0;
+function scheduleBatchGasRedeem() {
+  setTimeout(async () => {
+    try {
+      const FUNDER = process.env.FUNDER_ADDRESS?.toLowerCase();
+      const r = await fetch(`https://data-api.polymarket.com/positions?user=${FUNDER}&sizeThreshold=0.01&limit=200`);
+      const positions = await r.json();
+      const redeemable = (positions || []).filter(p => p.redeemable);
+
+      const redeemableTotal = redeemable.reduce((s,p) => s + parseFloat(p.size||0), 0);
+      if (redeemable.length >= 2 && redeemableTotal >= 300 && Date.now() - lastBatchRedeemTime > 300000) {
+        // $300+ redeemable — gasless couldn't handle it, batch via gas
+        console.log(`[batch-redeem] ${redeemable.length} redeemable, \$${redeemableTotal.toFixed(2)} ≥ $300 — batching via gas`);
+
+        const { Wallet } = await import('@ethersproject/wallet');
+        const { JsonRpcProvider } = await import('@ethersproject/providers');
+        const { Contract } = await import('@ethersproject/contracts');
+        const { Interface } = await import('@ethersproject/abi');
+        const { hexlify, arrayify } = await import('@ethersproject/bytes');
+
+        const RPC = `https://polygon-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_KEY || '8kruQGYamUT6J4Ib0aMfw'}`;
+        const CTF = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
+        const USDC = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+        const WCOL = '0x3a3bd7bb9528e159577f7c2e685cc81a765002e2';
+        const MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11';
+        const ZERO_ADDR = '0x0000000000000000000000000000000000000000';
+
+        const provider = new JsonRpcProvider(RPC);
+        const wallet = new Wallet(process.env.PRIVATE_KEY, provider);
+        const bal = await provider.getBalance(wallet.address);
+        if (Number(bal) < 1e17) { // need at least 0.1 POL
+          console.log(`[batch-redeem] SKIP — signer POL ${(Number(bal)/1e18).toFixed(4)} too low`);
+          scheduleBatchGasRedeem();
+          return;
+        }
+
+        const safe = new Contract(process.env.FUNDER_ADDRESS, [
+          'function execTransaction(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address refundReceiver, bytes signatures) returns (bool)',
+          'function nonce() view returns (uint256)',
+          'function getTransactionHash(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address refundReceiver, uint256 _nonce) view returns (bytes32)',
+        ], wallet);
+
+        const CTF_IFACE = new Interface(['function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)']);
+        const MULTICALL_IFACE = new Interface(['function aggregate(tuple(address target, bytes callData)[] calls) returns (uint256 blockNumber, bytes[] returnData)']);
+
+        const calls = [];
+        for (const p of redeemable) {
+          const collateral = p.negativeRisk ? WCOL : USDC;
+          const data = CTF_IFACE.encodeFunctionData('redeemPositions', [collateral, '0x' + '0'.repeat(64), p.conditionId, [1, 2]]);
+          calls.push({ target: CTF, callData: data });
+        }
+
+        const multicallData = MULTICALL_IFACE.encodeFunctionData('aggregate', [calls]);
+        const nonce = await safe.nonce();
+        const txHash = await safe.getTransactionHash(MULTICALL3, 0, multicallData, 1, 0, 0, 0, ZERO_ADDR, ZERO_ADDR, nonce);
+        const sig = await wallet.signMessage(arrayify(txHash));
+        const sigBytes = arrayify(sig);
+        sigBytes[64] += 4;
+        const gasPrice = await provider.getGasPrice();
+        const gasLimit = 100000 + redeemable.length * 80000;
+
+        try {
+          const tx = await safe.execTransaction(MULTICALL3, 0, multicallData, 1, 0, 0, 0, ZERO_ADDR, ZERO_ADDR, hexlify(sigBytes), { gasLimit, gasPrice: gasPrice.mul(110).div(100) });
+          const receipt = await tx.wait();
+          console.log(`[batch-redeem] ${receipt.status === 1 ? '✓' : 'FAIL'} ${redeemable.length} positions in 1 tx | gas: ${receipt.gasUsed.toString()}`);
+          lastBatchRedeemTime = Date.now();
+
+          // Unwrap WCOL if any
+          if (redeemable.some(p => p.negativeRisk)) {
+            try {
+              const wcolC = new Contract(WCOL, ['function balanceOf(address) view returns (uint256)'], provider);
+              const wcolBal = await wcolC.balanceOf(process.env.FUNDER_ADDRESS);
+              if (wcolBal.gt(0)) {
+                const WCOL_IFACE = new Interface(['function unwrap(address to, uint256 amount)']);
+                const unwrapData = WCOL_IFACE.encodeFunctionData('unwrap', [process.env.FUNDER_ADDRESS, wcolBal]);
+                const nonce2 = await safe.nonce();
+                const txHash2 = await safe.getTransactionHash(WCOL, 0, unwrapData, 0, 0, 0, 0, ZERO_ADDR, ZERO_ADDR, nonce2);
+                const sig2 = await wallet.signMessage(arrayify(txHash2));
+                const sigBytes2 = arrayify(sig2);
+                sigBytes2[64] += 4;
+                const tx2 = await safe.execTransaction(WCOL, 0, unwrapData, 0, 0, 0, 0, ZERO_ADDR, ZERO_ADDR, hexlify(sigBytes2), { gasLimit: 200000, gasPrice: gasPrice.mul(110).div(100) });
+                await tx2.wait();
+                console.log(`[batch-redeem] Unwrapped $${(Number(wcolBal)/1e6).toFixed(2)} WCOL`);
+              }
+            } catch (ue) { console.log('[batch-redeem] unwrap err:', ue.message?.slice(0, 60)); }
+          }
+        } catch (e) {
+          console.log('[batch-redeem] tx err:', e.message?.slice(0, 100));
+        }
+      }
+    } catch (e) {
+      console.error('[batch-redeem] err:', e.message?.slice(0, 80));
+    }
+    scheduleBatchGasRedeem();
+  }, 300000); // check every 5 min
+}
 
 async function ensureAllowance() {
   try {
@@ -2427,7 +2525,7 @@ function schedule5mEvent() {
   if (sprayDelay > 0) {
     btc5mSprayTimer = setTimeout(() => {
       if (!scannerFlags.crypto5m || !clobClient) return;
-      console.log(`[5m-spray] Starting — 10x 5sh every 400ms per coin (99.9¢, 50sh total in 4s)`);
+      console.log(`[5m-spray] Starting — 10x 10sh every 400ms per coin (99.9¢, 100sh total in 4s)`);
 
       // For each coin: check ask >= 99¢, then fire 10 orders of 5sh every 400ms
       async function sprayCoin(coin, tokenUp, tokenDown, upPrice, downPrice, negRisk) {
@@ -2450,7 +2548,7 @@ function schedule5mEvent() {
         // Fire 10 orders of 5sh, 400ms apart
         let placed = 0;
         for (let i = 0; i < 10; i++) {
-          place999Order(winToken, 5, negRisk, `[5m-spray] ${coin} ${winSide} 5sh #${i+1}`).catch(() => {});
+          place999Order(winToken, 10, negRisk, `[5m-spray] ${coin} ${winSide} 10sh #${i+1}`).catch(() => {});
           placed++;
           if (i < 9) await new Promise(r => setTimeout(r, 400));
         }
@@ -2620,7 +2718,7 @@ async function getEventOpenPrice(slug) {
 // Generic spray function for 15m/hourly — 10x 5sh every 400ms per coin
 async function sprayTimeframe(label, intervalSecs, getSlugFn) {
   if (!scannerFlags.crypto5m || !clobClient) return;
-  console.log(`[${label}-spray] Starting — 10x 5sh every 400ms per coin (99.9¢, 50sh total in 4s)`);
+  console.log(`[${label}-spray] Starting — 10x 10sh every 400ms per coin (99.9¢, 100sh total in 4s)`);
 
   // Fetch token data for all coins
   const coinData = {};
@@ -2652,7 +2750,7 @@ async function sprayTimeframe(label, intervalSecs, getSlugFn) {
     // Fire 10 orders of 5sh, 400ms apart
     let placed = 0;
     for (let i = 0; i < 10; i++) {
-      place999Order(winToken, 5, d.negRisk, `[${label}-spray] ${coin} ${winSide} 5sh #${i+1}`).catch(() => {});
+      place999Order(winToken, 10, d.negRisk, `[${label}-spray] ${coin} ${winSide} 10sh #${i+1}`).catch(() => {});
       placed++;
       if (i < 9) await new Promise(r => setTimeout(r, 400));
     }
@@ -2770,7 +2868,7 @@ async function placeAuto99Order(coin, side, state, event) {
     const signed2 = await clobClient.createOrder({ tokenID: tokenId, price: 0.99, size: 50, side: 'BUY' }, { tickSize: String(event.tickSize || '0.01'), negRisk });
     result = await clobClient.postOrder(signed2, 'GTC');
   }
-  console.log(`[${coin}-auto-99] PLACED: ${side} 5sh → ${result?.status} id:${result?.orderID?.slice(0,8)}`);
+  console.log(`[${coin}-auto-99] PLACED: ${side} 50sh → ${result?.status} id:${result?.orderID?.slice(0,8)}`);
   return result;
 }
 
@@ -5610,6 +5708,64 @@ app.get('/api/dashboard', async (req, res) => {
       })) };
     }
 
+    // ── KALSHI tracking ──
+    try {
+      if (typeof hasKalshiAuth === 'function' && hasKalshiAuth()) {
+        const { kalshiFetch: kf } = await import('./lib/kalshiAuth.mjs');
+        const o = await kf('https://api.elections.kalshi.com/trade-api/v2/portfolio/orders?limit=200', { method: 'GET' });
+        const od = await o.json();
+        const ksOrders = od.orders || [];
+        const ksByCat = {};
+        for (const x of ksOrders) {
+          const t = x.ticker || '';
+          let cat = 'kalshi-other';
+          if (t.includes('HIGH')) cat = 'kalshi-weather';
+          else if (t.includes('UCL') || t.includes('EPL') || t.includes('LALIGA') || t.includes('SERIEA') || t.includes('BUNDESLIGA') || t.includes('LIGUE1') || t.includes('MLS') || t.includes('LIGAMX') || t.includes('LIGAPORTUGAL') || t.includes('ARGPREMDIV') || t.includes('CONCACAF')) cat = 'kalshi-soccer';
+          else if (t.includes('MLB')) cat = 'kalshi-mlb';
+          else if (t.includes('NHL')) cat = 'kalshi-nhl';
+          else if (t.includes('NBA')) cat = 'kalshi-nba';
+          else if (t.includes('CS2') || t.includes('VALORANT') || t.includes('DOTA') || t.includes('LOL') || t.includes('R6GAME') || t.includes('RLGAME')) cat = 'kalshi-esports';
+          else if (t.includes('ATPMATCH') || t.includes('ATPCHALLENGER') || t.includes('WTAMATCH') || t.includes('WTACHALLENGER')) cat = 'kalshi-tennis';
+          else if (t.includes('BTC15M') || t.includes('ETH15M') || t.includes('SOL15M') || t.includes('XRP15M') || t.includes('BNB15M')) cat = 'kalshi-crypto';
+          else if (t.includes('IPL')) cat = 'kalshi-ipl';
+          if (!ksByCat[cat]) ksByCat[cat] = { resting: 0, executed: 0, canceled: 0, tickers: new Set() };
+          ksByCat[cat][x.status] = (ksByCat[cat][x.status] || 0) + 1;
+          ksByCat[cat].tickers.add(t);
+        }
+        for (const [cat, info] of Object.entries(ksByCat)) {
+          // Group orders by event (strip player/threshold suffix to get base event)
+          const eventMap = {};
+          for (const x of ksOrders) {
+            const t = x.ticker || '';
+            let cat2 = 'kalshi-other';
+            if (t.includes('HIGH')) cat2 = 'kalshi-weather';
+            else if (t.includes('UCL') || t.includes('EPL') || t.includes('LALIGA') || t.includes('SERIEA') || t.includes('BUNDESLIGA') || t.includes('LIGUE1') || t.includes('MLS') || t.includes('LIGAMX') || t.includes('LIGAPORTUGAL') || t.includes('ARGPREMDIV') || t.includes('CONCACAF')) cat2 = 'kalshi-soccer';
+            else if (t.includes('MLB')) cat2 = 'kalshi-mlb';
+            else if (t.includes('NHL')) cat2 = 'kalshi-nhl';
+            else if (t.includes('NBA')) cat2 = 'kalshi-nba';
+            else if (t.includes('CS2') || t.includes('VALORANT') || t.includes('DOTA') || t.includes('LOL') || t.includes('R6GAME') || t.includes('RLGAME')) cat2 = 'kalshi-esports';
+            else if (t.includes('ATPMATCH') || t.includes('ATPCHALLENGER') || t.includes('WTAMATCH') || t.includes('WTACHALLENGER')) cat2 = 'kalshi-tennis';
+            else if (t.includes('BTC15M') || t.includes('ETH15M') || t.includes('SOL15M') || t.includes('XRP15M') || t.includes('BNB15M')) cat2 = 'kalshi-crypto';
+            else if (t.includes('IPL')) cat2 = 'kalshi-ipl';
+            if (cat2 !== cat) continue;
+            // Extract event base from ticker (e.g., KXMLBHIT-26APR152135TBKC-XYZ-3 → KXMLBHIT-26APR152135TBKC)
+            const parts = t.split('-');
+            const eventBase = parts.slice(0, 2).join('-');
+            if (!eventMap[eventBase]) eventMap[eventBase] = { resting: 0, executed: 0, canceled: 0, tickers: 0 };
+            eventMap[eventBase][x.status] = (eventMap[eventBase][x.status] || 0) + 1;
+            eventMap[eventBase].tickers++;
+          }
+          const eventList = Object.entries(eventMap).map(([base, s]) => ({
+            title: `${base} (${s.tickers} mkts: ${s.resting||0}R/${s.executed||0}F/${s.canceled||0}C)`,
+            slug: base, category: cat.replace('kalshi-', ''),
+            status: s.resting > 0 ? 'resting' : s.executed > 0 ? 'filled' : 'cancelled',
+            firedCount: s.executed||0, bets: [],
+          })).sort((a,b) => (b.firedCount||0) - (a.firedCount||0)).slice(0, 30);
+          trackedEvents[cat] = { events: eventList };
+        }
+      }
+    } catch (e) { console.error('[dashboard] Kalshi err:', e.message?.slice(0,80)); }
+
     // PnL summary
     let totalCost = 0, totalValue = 0, won = 0, lost = 0, open = 0;
     for (const p of (positions || [])) {
@@ -6519,7 +6675,7 @@ async function checkExactScores(slug, title, score, firedSet) {
       console.log(`[exact-score] ${title.slice(0,30)} score ${score} → ${mHome}-${mAway} IMPOSSIBLE → BUY NO`);
       try {
         const esBal = await getUsdcBalance();
-        const esSize = Math.min(200, Math.floor(esBal * 0.95)); // use up to 95% of balance, max 200
+        const esSize = Math.min(100, Math.floor(esBal * 0.95)); // max 100sh per exact score
         if (esSize < 5) { firedSet.delete(condId); continue; }
         const result = await placeLive99Order(noToken, esSize, negRisk, `[exact-score] NO on ${mHome}-${mAway} ${esSize}sh`);
         liveEventTracker.log.unshift({ ts: Date.now(), event: title, score, market: `Exact ${mHome}-${mAway} NO`, side: 'NO', price: '99.9¢', status: result?.status });
@@ -6581,7 +6737,7 @@ async function buyExactScoreOnEnd(slug, title, finalScore) {
       console.log(`[exact-score] END: ${q.slice(0,40)} → BUY ${winLabel} (${(winPrice*100).toFixed(0)}¢)`);
       try {
         const esBal2 = await getUsdcBalance();
-        const esSize2 = Math.min(200, Math.floor(esBal2 * 0.95));
+        const esSize2 = Math.min(100, Math.floor(esBal2 * 0.95));
         if (esSize2 < 5) continue;
         const result = await placeLive99Order(winToken, esSize2, negRisk, `[exact-score] END ${winLabel} on ${q.slice(0,30)} ${esSize2}sh`);
         liveEventTracker.log.unshift({ ts: Date.now(), event: title, score: finalScore, market: q.slice(0, 50), side: winLabel, price: '99.9¢', status: result?.status });
@@ -6644,7 +6800,7 @@ app.get('/api/live99/status', (req, res) => {
 const scannerFlags = {
   pandaScore: true,
   weather: true,
-  sandwich: true,
+  sandwich: false, // DISABLED — buying non-anomalies
   weatherExpiry: true,
   btcAbovePre: true,
   btcAbove: true,
@@ -6790,7 +6946,30 @@ setTimeout(async () => {
     if (Date.now() - global._espnLastPoll > 1000) {
       global._espnLastPoll = Date.now();
       try {
-        for (const league of ['baseball/mlb', 'basketball/nba', 'hockey/nhl', 'soccer/eng.1', 'soccer/esp.1', 'soccer/ger.1', 'soccer/ita.1', 'soccer/fra.1', 'soccer/usa.1', 'soccer/nor.1']) {
+        for (const league of [
+            // US Major Sports
+            'baseball/mlb', 'basketball/nba', 'basketball/mens-college-basketball', 'basketball/womens-college-basketball', 'basketball/wnba', 'hockey/nhl',
+            // Top Soccer
+            'soccer/eng.1', 'soccer/eng.2', 'soccer/esp.1', 'soccer/esp.2', 'soccer/ger.1', 'soccer/ger.2',
+            'soccer/ita.1', 'soccer/ita.2', 'soccer/fra.1', 'soccer/fra.2', 'soccer/usa.1', 'soccer/mex.1',
+            // South America
+            'soccer/bra.1', 'soccer/bra.2', 'soccer/arg.1', 'soccer/col.1', 'soccer/chi.1', 'soccer/per.1', 'soccer/bol.1',
+            'soccer/conmebol.libertadores', 'soccer/conmebol.sudamericana',
+            // Europe
+            'soccer/por.1', 'soccer/tur.1', 'soccer/sco.1', 'soccer/ned.1', 'soccer/den.1', 'soccer/nor.1',
+            'soccer/cze.1', 'soccer/rou.1', 'soccer/gre.1', 'soccer/bel.1', 'soccer/sui.1',
+            'soccer/uefa.champions', 'soccer/uefa.europa', 'soccer/uefa.europa.conf',
+            // Asia/Africa/Oceania
+            'soccer/jpn.1', 'soccer/jpn.2', 'soccer/kor.1', 'soccer/chn.1', 'soccer/aus.1',
+            'soccer/egy.1', 'soccer/mor.1', 'soccer/sau.1',
+            'soccer/afc.champions', 'soccer/concacaf.champions',
+            // Combat
+            'mma/ufc',
+            // Tennis (for ESPN Finals detection)
+            'tennis/atp', 'tennis/wta',
+            // Other
+            'golf/pga', 'racing/f1',
+          ]) {
           const espnR = await fetch(`https://site.api.espn.com/apis/site/v2/sports/${league}/scoreboard`, { signal: AbortSignal.timeout(3000) });
           const espnData = await espnR.json();
           for (const ev of (espnData.events || [])) {
@@ -6851,7 +7030,26 @@ setTimeout(async () => {
                 const fHome = homeScore, fAway = awayScore, fTotal = fHome + fAway;
 
                 // Also construct the ESPN-based slug for sub-markets
-                const leaguePrefix = league.includes('mlb') ? 'mlb' : league.includes('nba') ? 'nba' : league.includes('nhl') ? 'nhl' : league.includes('usa.1') ? 'mls' : league.split('/')[1]?.replace('.1','') || '';
+                const _lm = {
+              'baseball/mlb':'mlb','basketball/nba':'nba','basketball/mens-college-basketball':'cbb',
+              'basketball/womens-college-basketball':'cwbb','basketball/wnba':'wnba','hockey/nhl':'nhl',
+              'soccer/eng.1':'epl','soccer/eng.2':'elc','soccer/esp.1':'lal','soccer/esp.2':'es2',
+              'soccer/ger.1':'bun','soccer/ger.2':'bl2','soccer/ita.1':'sea','soccer/ita.2':'itsb',
+              'soccer/fra.1':'fl1','soccer/fra.2':'fr2','soccer/usa.1':'mls','soccer/mex.1':'mex',
+              'soccer/bra.1':'bra','soccer/bra.2':'bra2','soccer/por.1':'por','soccer/tur.1':'tur',
+              'soccer/sco.1':'spl','soccer/col.1':'col1','soccer/chn.1':'csl','soccer/egy.1':'egy1',
+              'soccer/jpn.1':'jap','soccer/jpn.2':'j2100','soccer/kor.1':'kor','soccer/nor.1':'nor',
+              'soccer/ned.1':'ere','soccer/den.1':'den','soccer/cze.1':'cze1','soccer/rou.1':'rou1',
+              'soccer/aus.1':'aus','soccer/arg.1':'arg','soccer/chi.1':'chi1','soccer/per.1':'per1',
+              'soccer/bol.1':'bol1','soccer/mor.1':'mar1','soccer/sau.1':'spl',
+              'soccer/gre.1':'gre1','soccer/bel.1':'bel1','soccer/sui.1':'sui1',
+              'soccer/uefa.champions':'ucl','soccer/uefa.europa':'uel','soccer/uefa.europa.conf':'ucol',
+              'soccer/conmebol.libertadores':'lib','soccer/conmebol.sudamericana':'sud',
+              'soccer/afc.champions':'afc','soccer/concacaf.champions':'concacaf',
+              'mma/ufc':'ufc','tennis/atp':'atp','tennis/wta':'wta',
+              'golf/pga':'golf','racing/f1':'f1',
+            };
+            const leaguePrefix = _lm[league] || league.split('/')[1]?.replace('.1','').replace('.2','') || '';
                 const awayAbbr = (t0.homeAway === 'away' ? t0 : t1).team?.abbreviation?.toLowerCase() || '';
                 const homeAbbr = (t0.homeAway === 'home' ? t0 : t1).team?.abbreviation?.toLowerCase() || '';
                 const espnSlug = `${leaguePrefix}-${awayAbbr}-${homeAbbr}-${gameDate}`;
@@ -6911,7 +7109,8 @@ setTimeout(async () => {
                     const winLabel = market.outcomes[winIdx];
                     console.log(`[sub-mkt-end] ${marketSlug} → ${winLabel}`);
                     try {
-                      await placeLive99Order(winToken, 5, market.negRisk, `[sub-mkt-end] ${winLabel} ${market.question?.slice(0, 25)} 5sh`);
+                      const _smSize = ((data?.title||'').toLowerCase().match(/nhl|hockey|stanley|atp|wta|tennis|grand prix|bmw open|open:/) ? 150 : 50);
+                      await placeLive99Order(winToken, _smSize, market.negRisk, `[sub-mkt-end] ${winLabel} ${market.question?.slice(0, 25)} ${_smSize}sh`);
                     } catch {}
                   }
                 })();
@@ -6930,7 +7129,26 @@ setTimeout(async () => {
             const td = new Date().toISOString().slice(0, 10);
             if (gd && gd !== td) continue;
 
-            const leaguePrefix = league.includes('mlb') ? 'mlb' : league.includes('nba') ? 'nba' : league.includes('nhl') ? 'nhl' : league.includes('usa.1') ? 'mls' : league.split('/')[1]?.replace('.1','') || '';
+            const _lm = {
+              'baseball/mlb':'mlb','basketball/nba':'nba','basketball/mens-college-basketball':'cbb',
+              'basketball/womens-college-basketball':'cwbb','basketball/wnba':'wnba','hockey/nhl':'nhl',
+              'soccer/eng.1':'epl','soccer/eng.2':'elc','soccer/esp.1':'lal','soccer/esp.2':'es2',
+              'soccer/ger.1':'bun','soccer/ger.2':'bl2','soccer/ita.1':'sea','soccer/ita.2':'itsb',
+              'soccer/fra.1':'fl1','soccer/fra.2':'fr2','soccer/usa.1':'mls','soccer/mex.1':'mex',
+              'soccer/bra.1':'bra','soccer/bra.2':'bra2','soccer/por.1':'por','soccer/tur.1':'tur',
+              'soccer/sco.1':'spl','soccer/col.1':'col1','soccer/chn.1':'csl','soccer/egy.1':'egy1',
+              'soccer/jpn.1':'jap','soccer/jpn.2':'j2100','soccer/kor.1':'kor','soccer/nor.1':'nor',
+              'soccer/ned.1':'ere','soccer/den.1':'den','soccer/cze.1':'cze1','soccer/rou.1':'rou1',
+              'soccer/aus.1':'aus','soccer/arg.1':'arg','soccer/chi.1':'chi1','soccer/per.1':'per1',
+              'soccer/bol.1':'bol1','soccer/mor.1':'mar1','soccer/sau.1':'spl',
+              'soccer/gre.1':'gre1','soccer/bel.1':'bel1','soccer/sui.1':'sui1',
+              'soccer/uefa.champions':'ucl','soccer/uefa.europa':'uel','soccer/uefa.europa.conf':'ucol',
+              'soccer/conmebol.libertadores':'lib','soccer/conmebol.sudamericana':'sud',
+              'soccer/afc.champions':'afc','soccer/concacaf.champions':'concacaf',
+              'mma/ufc':'ufc','tennis/atp':'atp','tennis/wta':'wta',
+              'golf/pga':'golf','racing/f1':'f1',
+            };
+            const leaguePrefix = _lm[league] || league.split('/')[1]?.replace('.1','').replace('.2','') || '';
             const c0 = comp2.competitors[0], c1 = comp2.competitors[1];
             const awayT = c0.homeAway === 'away' ? c0 : c1;
             const homeT = c0.homeAway === 'home' ? c0 : c1;
@@ -6996,7 +7214,8 @@ setTimeout(async () => {
                 subMarketFired.add(marketSlug);
                 console.log(`[sub-mkt-end] ${marketSlug} → ${market.outcomes[winIdx]}`);
                 try {
-                  await placeLive99Order(winToken, 5, market.negRisk, `[sub-mkt-end] ${market.outcomes[winIdx]} ${market.question?.slice(0, 25)} 5sh`);
+                  const _smSize2 = ((data?.title||'').toLowerCase().match(/nhl|hockey|stanley|atp|wta|tennis|grand prix|bmw open|open:/) ? 150 : 50);
+                  await placeLive99Order(winToken, _smSize2, market.negRisk, `[sub-mkt-end] ${market.outcomes[winIdx]} ${market.question?.slice(0, 25)} ${_smSize2}sh`);
                 } catch {}
               }
             })();
@@ -7212,7 +7431,7 @@ setTimeout(async () => {
 
         console.log(`[tennis] ${data.title.slice(0,30)} | ${q.slice(0,40)} → ${winLabel} (minGames=${minTotalGames}, sets=${totalSetsPlayed})`);
         try {
-          const result = await placeLive99Order(winToken, 50, negRisk, `[tennis] ${winLabel} on ${q.slice(0,30)} 50sh`);
+          const result = await placeLive99Order(winToken, 150, negRisk, `[tennis] ${winLabel} on ${q.slice(0,30)} 150sh`);
           liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, score: data.score, market: q.slice(0, 50), side: winLabel, price: '99.9¢', status: result?.status });
           if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
         } catch (err) {
@@ -7634,7 +7853,30 @@ setTimeout(async () => {
       let espnSaysLive = false;
       try {
         const titleLower = (data.title || '').toLowerCase();
-        for (const league of ['baseball/mlb', 'basketball/nba', 'hockey/nhl', 'soccer/eng.1', 'soccer/esp.1', 'soccer/ger.1', 'soccer/ita.1', 'soccer/fra.1', 'soccer/usa.1', 'soccer/nor.1']) {
+        for (const league of [
+            // US Major Sports
+            'baseball/mlb', 'basketball/nba', 'basketball/mens-college-basketball', 'basketball/womens-college-basketball', 'basketball/wnba', 'hockey/nhl',
+            // Top Soccer
+            'soccer/eng.1', 'soccer/eng.2', 'soccer/esp.1', 'soccer/esp.2', 'soccer/ger.1', 'soccer/ger.2',
+            'soccer/ita.1', 'soccer/ita.2', 'soccer/fra.1', 'soccer/fra.2', 'soccer/usa.1', 'soccer/mex.1',
+            // South America
+            'soccer/bra.1', 'soccer/bra.2', 'soccer/arg.1', 'soccer/col.1', 'soccer/chi.1', 'soccer/per.1', 'soccer/bol.1',
+            'soccer/conmebol.libertadores', 'soccer/conmebol.sudamericana',
+            // Europe
+            'soccer/por.1', 'soccer/tur.1', 'soccer/sco.1', 'soccer/ned.1', 'soccer/den.1', 'soccer/nor.1',
+            'soccer/cze.1', 'soccer/rou.1', 'soccer/gre.1', 'soccer/bel.1', 'soccer/sui.1',
+            'soccer/uefa.champions', 'soccer/uefa.europa', 'soccer/uefa.europa.conf',
+            // Asia/Africa/Oceania
+            'soccer/jpn.1', 'soccer/jpn.2', 'soccer/kor.1', 'soccer/chn.1', 'soccer/aus.1',
+            'soccer/egy.1', 'soccer/mor.1', 'soccer/sau.1',
+            'soccer/afc.champions', 'soccer/concacaf.champions',
+            // Combat
+            'mma/ufc',
+            // Tennis (for ESPN Finals detection)
+            'tennis/atp', 'tennis/wta',
+            // Other
+            'golf/pga', 'racing/f1',
+          ]) {
           if (espnSaysLive) break;
           const espnR = await fetch(`https://site.api.espn.com/apis/site/v2/sports/${league}/scoreboard`, { signal: AbortSignal.timeout(3000) });
           const espnData = await espnR.json();
@@ -7736,6 +7978,10 @@ setTimeout(async () => {
             continue;
           }
           orderSize = clobSum > 1.03 ? 10 : 50; // 50sh if certain, 10sh if less certain
+          // Boost tennis and hockey to 150sh
+          const eventTitle = (data.title || '').toLowerCase();
+          if (orderSize === 50 && (eventTitle.includes('atp') || eventTitle.includes('wta') || eventTitle.includes('tennis') || eventTitle.includes('open:') || eventTitle.includes('grand prix') || eventTitle.includes('bmw open'))) orderSize = 150;
+          if (orderSize === 50 && (eventTitle.includes('nhl') || eventTitle.includes('hockey') || eventTitle.includes('stanley'))) orderSize = 150;
         } catch { continue; }
 
         // Try 99.9¢ first (0.001 tick), fall back to 99¢ (0.01 tick)
@@ -7862,7 +8108,8 @@ setTimeout(async () => {
             const winLabel = market.outcomes[winIdx];
             console.log(`[sub-mkt-end] ${marketSlug} → ${winLabel}`);
             try {
-              await placeLive99Order(winToken, 5, market.negRisk, `[sub-mkt-end] ${winLabel} ${market.question?.slice(0, 25)} 5sh`);
+              const _smSize = ((data?.title||'').toLowerCase().match(/nhl|hockey|stanley|atp|wta|tennis|grand prix|bmw open|open:/) ? 150 : 50);
+                      await placeLive99Order(winToken, _smSize, market.negRisk, `[sub-mkt-end] ${winLabel} ${market.question?.slice(0, 25)} ${_smSize}sh`);
             } catch (err) {
               console.error(`[sub-mkt-end] Error:`, err.message?.slice(0, 60));
             }
@@ -8125,8 +8372,8 @@ function schedulePandaScan() {
           const oldStatus = tracked.games.get(pos);
           tracked.games.set(pos, game.status);
 
-          // Map just finished!
-          if (oldStatus && oldStatus !== 'finished' && game.status === 'finished') {
+          // Map just finished! Also fire on first sight if already finished (catch restart gaps)
+          if (game.status === 'finished' && (!oldStatus || oldStatus !== 'finished')) {
             const fireKey = `${matchId}-${pos}`;
             if (pandaState.firedMaps.has(fireKey)) continue;
             pandaState.firedMaps.add(fireKey);
@@ -8137,13 +8384,44 @@ function schedulePandaScan() {
 
             console.log(`[panda] 🎯 MAP ${pos} FINISHED: ${psTeams.join(' vs ')} → Winner: ${winnerName} (detected at ${new Date().toISOString()})`);
 
+            // Kalshi Esports (CS2 + Valorant): fire map winner on each map end + match winner + total maps when decided
+            try {
+              const vgSlug = (ps.videogame?.slug || ps.videogame?.name || '').toLowerCase();
+              let ksGame = null;
+              if (vgSlug.includes('cs') || vgSlug.includes('counter')) ksGame = 'cs2';
+              else if (vgSlug.includes('valorant') || vgSlug.includes('valo')) ksGame = 'valorant';
+              else if (vgSlug.includes('dota')) ksGame = 'dota2';
+              else if (vgSlug.includes('league-of-legends') || vgSlug.includes('lol') || vgSlug === 'league of legends') ksGame = 'lol';
+              else if (vgSlug.includes('rainbow') || vgSlug.includes('r6') || vgSlug.includes('siege')) ksGame = 'r6';
+              else if (vgSlug.includes('rocket')) ksGame = 'rl';
+              if (ksGame) {
+                const schedAt = ps.scheduled_at || ps.begin_at || ps.original_scheduled_at;
+                // Map winner — every map end
+                if (winnerName && winnerName !== '?') {
+                  fireKalshiCs2MapWinner(psTeams, winnerName, matchId, pos, schedAt, ksGame).catch(e => console.error(`[kalshi-${ksGame}]`, e.message?.slice(0,60)));
+                }
+                // Total maps — evaluate after each map end (CS2 only — Valorant has no TOTALMAPS series)
+                fireKalshiCs2TotalMaps(psTeams, matchId, ps, schedAt, ksGame).catch(e => console.error(`[kalshi-${ksGame}]`, e.message?.slice(0,60)));
+                // Match winner — if mathematically decided
+                const nGames = ps.number_of_games || 3;
+                const winsNeeded = Math.ceil(nGames / 2);
+                const psScoreArr = ps.results?.map(r => r.score) || [];
+                const matchWinnerIdx = psScoreArr.findIndex(s => s >= winsNeeded);
+                if (matchWinnerIdx >= 0) {
+                  const matchWinner = psTeams[matchWinnerIdx];
+                  fireKalshiCs2Winner(psTeams, matchWinner, matchId, schedAt, ksGame).catch(e => console.error(`[kalshi-${ksGame}]`, e.message?.slice(0,60)));
+                }
+              }
+            } catch {}
+
             // Trigger Grid.gg for kill/round data on CS2/Dota2 matches
             const polySlug = tracked.polySlug;
             if (polySlug) {
               const polyTitle = (liveEventTracker.knownLive.get(polySlug)?.title || '').toLowerCase();
               if (polyTitle.includes('counter-strike') || polyTitle.includes('dota')) {
-                // Fire async — don't block PandaScore polling
-                fireGridOddEven(polySlug, psTeams, pos).catch(e => console.error('[grid] fireGridOddEven error:', e.message?.slice(0, 60)));
+                // Fire async — Grid.gg verifies BOTH team names + time match
+                const psScheduled = ps.scheduled_at || ps.begin_at || ps.original_scheduled_at;
+                fireGridOddEven(polySlug, psTeams, pos, psScheduled).catch(e => console.error('[grid] fireGridOddEven error:', e.message?.slice(0, 60)));
               }
             }
 
@@ -8227,28 +8505,8 @@ function schedulePandaScan() {
                     }
                   }
 
-                  // Place on map props (Odd/Even, etc.) using Gamma prices
-                  const propMatch = ql.match(/(?:^(?:game|map)\s*(\d+)|in\s+(?:game|map)\s+(\d+))/);
-                  if (propMatch) {
-                    const propMap = parseInt(propMatch[1] || propMatch[2]);
-                    if (propMap !== pos) continue;
-                    if (ql.includes('winner') || ql.includes('o/u') || ql.includes('handicap')) continue;
-
-                    const prices = typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices;
-                    if (!prices) continue;
-                    const p0 = parseFloat(prices[0]), p1 = parseFloat(prices[1]);
-                    if (Math.max(p0, p1) < 0.90) continue;
-                    const vol = parseFloat(m.volume || 0);
-                    if (vol < 25) continue;
-
-                    const wi = p0 >= p1 ? 0 : 1;
-                    const tokens2 = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
-                    const outcomes2 = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes;
-                    if (!tokens2 || tokens2.length < 2) continue;
-
-                    console.log(`[panda] Placing: ${m.question?.slice(0, 35)} → ${outcomes2[wi]} ($${vol.toFixed(0)} vol)`);
-                    try { await placeLive99Order(tokens2[wi], 50, m.negRisk === true, `[panda] ${outcomes2[wi]} ${ql.slice(0,20)} 50sh`); } catch {}
-                  }
+                  // All map props (odd/even, kills, rounds, baron, dragon, inhibitors) → wait for Grid.gg actual data
+                  // Gamma prices are unreliable for prop markets — disabled
                 }
 
                 // O/U Games Total
@@ -8301,6 +8559,94 @@ setTimeout(() => {
   console.log('[panda] PandaScore esports scanner started (4s polling)');
   schedulePandaScan();
 }, 28000);
+
+// ── PandaScore Catch-Up Scanner ──
+// Polls /past every 30s to catch matches we missed (transitions we didn't see)
+const pandaCatchupFired = new Set();
+function schedulePandaCatchup() {
+  setTimeout(async () => {
+    try {
+      if (!clobClient || !hasKalshiAuth()) { schedulePandaCatchup(); return; }
+      for (const game of ['csgo', 'valorant', 'dota2', 'lol', 'r6siege', 'rl']) {
+        try {
+          const r = await fetch(`https://api.pandascore.co/${game}/matches/past?token=${PANDASCORE_TOKEN}&per_page=10&sort=-scheduled_at`, { signal: AbortSignal.timeout(5000) });
+          const matches = await r.json();
+          if (!Array.isArray(matches)) continue;
+          for (const m of matches) {
+            if (!m.winner || m.status !== 'finished') continue;
+            // Only look at matches from last 2 hours
+            const endTime = new Date(m.end_at || m.modified_at || m.scheduled_at).getTime();
+            if (Date.now() - endTime > 2 * 3600000) continue;
+            const catchKey = `catchup-${m.id}`;
+            if (pandaCatchupFired.has(catchKey)) continue;
+            // Check if we already fired via live scanner
+            if (pandaState.firedMaps.has(`${m.id}-match`)) continue;
+            pandaCatchupFired.add(catchKey);
+
+            const psTeams = m.opponents?.map(o => o.opponent?.name) || [];
+            const winnerName = m.winner?.name || '';
+            if (psTeams.length < 2 || !winnerName) continue;
+
+            const vgSlug = (m.videogame?.slug || '').toLowerCase();
+            let ksGame = null;
+            if (vgSlug.includes('cs') || vgSlug.includes('counter')) ksGame = 'cs2';
+            else if (vgSlug.includes('valorant')) ksGame = 'valorant';
+            else if (vgSlug.includes('dota')) ksGame = 'dota2';
+            else if (vgSlug.includes('league-of-legends') || vgSlug.includes('lol')) ksGame = 'lol';
+            else if (vgSlug.includes('rainbow') || vgSlug.includes('r6')) ksGame = 'r6';
+            else if (vgSlug.includes('rocket')) ksGame = 'rl';
+            if (!ksGame) continue;
+
+            const schedAt = m.scheduled_at || m.begin_at;
+            console.log(`[panda-catchup] Found missed match: ${psTeams.join(' vs ')} → ${winnerName} (${ksGame})`);
+
+            // Fire match winner on Kalshi
+            fireKalshiCs2Winner(psTeams, winnerName, m.id, schedAt, ksGame).catch(() => {});
+
+            // Fire on each finished map
+            for (const g of (m.games || [])) {
+              if (g.status !== 'finished' || !g.winner) continue;
+              const mapWinner = psTeams.find((t, i) => m.opponents?.[i]?.opponent?.id === g.winner.id) || winnerName;
+              fireKalshiCs2MapWinner(psTeams, mapWinner, m.id, g.position, schedAt, ksGame).catch(() => {});
+            }
+
+            // Fire total maps
+            fireKalshiCs2TotalMaps(psTeams, m.id, { number_of_games: m.number_of_games, results: m.results, games: m.games, status: 'finished' }, schedAt, ksGame).catch(() => {});
+
+            // Also fire Poly match winner
+            try {
+              const gR = await fetch(`https://gamma-api.polymarket.com/events?active=true&closed=false&limit=50`, { signal: AbortSignal.timeout(5000) });
+              const gD = await gR.json();
+              const wLast = winnerName.toLowerCase();
+              const polyEvent = (gD || []).find(e => {
+                const t = (e.title || '').toLowerCase();
+                return psTeams.every(team => t.includes(team.toLowerCase().split(' ').pop()));
+              });
+              if (polyEvent?.markets?.length) {
+                for (const mkt of polyEvent.markets) {
+                  const q = (mkt.question || '').toLowerCase();
+                  if (!q.includes('winner') && !q.includes('vs')) continue;
+                  const outcomes = typeof mkt.outcomes === 'string' ? JSON.parse(mkt.outcomes) : mkt.outcomes;
+                  const tokens = typeof mkt.clobTokenIds === 'string' ? JSON.parse(mkt.clobTokenIds) : mkt.clobTokenIds;
+                  if (!outcomes || !tokens || tokens.length < 2) continue;
+                  const winIdx = outcomes.findIndex(o => o.toLowerCase().includes(wLast.split(' ').pop()));
+                  if (winIdx >= 0) {
+                    try { await placeLive99Order(tokens[winIdx], 50, mkt.negRisk === true, `[catchup] ${winnerName} 50sh`); } catch {}
+                    console.log(`[panda-catchup] Poly: ${winnerName} match winner 50sh`);
+                  }
+                  break;
+                }
+              }
+            } catch {}
+          }
+        } catch {}
+      }
+    } catch {}
+    schedulePandaCatchup();
+  }, 30000);
+}
+// Catch-up scanner DISABLED — /past fires too late (after whole match, not per-map) and rate limits PandaScore
+// setTimeout(() => { schedulePandaCatchup(); }, 45000);
 
 // ── Grid.gg CS2/Dota2 Scanner ──
 // Polls Grid.gg every 3s for live matches, tracks kills/rounds, fires on decided markets
@@ -8513,7 +8859,7 @@ function scheduleGridScan() {
               const winToken = tokens[winIdx];
               const winLabel = outcomes[winIdx];
               try {
-                const result = await placeLive99Order(winToken, 5, negRisk, `[grid] ${winLabel} ${ql.slice(0,25)} 5sh`);
+                const result = await placeLive99Order(winToken, 5, negRisk, `[grid] ${winLabel} ${ql.slice(0,25)} 50sh`);
                 liveEventTracker.log.unshift({ ts: Date.now(), event: tracked.teams.join(' vs '), market: m.question?.slice(0, 50), side: winLabel, price: '99.9¢', status: result?.status });
                 if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
               } catch (err) {
@@ -8543,7 +8889,7 @@ function scheduleGridScan() {
 const gridCache = new Map(); // "team1|team2" → { seriesId, startTime }
 const gridFired = new Set(); // "seriesId-gameNumber" — prevent firing on same game twice
 
-async function getGridGameData(teamNames, gameNumber) {
+async function getGridGameData(teamNames, gameNumber, scheduledAt) {
   try {
     const lower = teamNames.map(t => t.toLowerCase()).sort();
     const cacheKey = lower.join('|');
@@ -8602,16 +8948,36 @@ async function getGridGameData(teamNames, gameNumber) {
       return null;
     }
 
-    // Get game data with kills/rounds
-    const stateData = await gridQuery(GRID_GQL, `{ seriesState(id: ${seriesId}) { started finished games { sequenceNumber finished teams { name score players { name kills deaths } } } } }`);
+    // Get game data with kills/rounds AND team names for verification
+    const stateData = await gridQuery(GRID_GQL, `{ seriesState(id: ${seriesId}) { started finished teams { name score } games { sequenceNumber finished teams { name score players { name kills deaths } } } } }`);
     const ss = stateData?.data?.seriesState;
     if (!ss) return null;
 
-    // VERIFY: series must still be started and match must be the right one
+    // VERIFY: series must be started
     if (!ss.started) {
       console.log(`[grid] Series ${seriesId} not started — wrong match?`);
-      gridCache.delete(cacheKey); // clear cache so next call re-searches
+      gridCache.delete(cacheKey);
       return null;
+    }
+
+    // CRITICAL: verify BOTH PandaScore team names appear in Grid.gg series
+    const gridTeamNames = (ss.teams || []).map(t => (t.name || '').toLowerCase());
+    const bothMatch = lower.every(pTeam => gridTeamNames.some(gTeam => gTeam.includes(pTeam) || pTeam.includes(gTeam)));
+    if (!bothMatch) {
+      console.log(`[grid] MISMATCH teams: Panda=${teamNames.join(' vs ')} Grid=${gridTeamNames.join(' vs ')} — WRONG SERIES`);
+      gridCache.delete(cacheKey);
+      return null;
+    }
+
+    // CRITICAL: verify Grid.gg series start time is within 2h of PandaScore scheduled time
+    if (scheduledAt) {
+      const psTime = new Date(scheduledAt).getTime();
+      const gridTime = new Date(gridCache.get(cacheKey)?.startTime || 0).getTime();
+      if (gridTime && Math.abs(psTime - gridTime) > 2 * 3600000) {
+        console.log(`[grid] MISMATCH time: Panda=${scheduledAt} Grid=${gridCache.get(cacheKey)?.startTime} — >2h apart, skipping`);
+        gridCache.delete(cacheKey);
+        return null;
+      }
     }
 
     const games = ss.games || [];
@@ -8642,8 +9008,8 @@ async function getGridGameData(teamNames, gameNumber) {
 }
 
 // Fire on odd/even markets using Grid.gg data — called after PandaScore detects game finish
-async function fireGridOddEven(polySlug, teamNames, gameNumber) {
-  const gridData = await getGridGameData(teamNames, gameNumber);
+async function fireGridOddEven(polySlug, teamNames, gameNumber, scheduledAt) {
+  const gridData = await getGridGameData(teamNames, gameNumber, scheduledAt);
   if (!gridData) return;
 
   // Fetch Poly markets
@@ -8715,7 +9081,7 @@ async function fireGridOddEven(polySlug, teamNames, gameNumber) {
     const winToken = tokens[winIdx];
     const winLabel = outcomes[winIdx];
     try {
-      const result = await placeLive99Order(winToken, 5, negRisk, `[grid] ${winLabel} ${ql.slice(0, 25)} 5sh`);
+      const result = await placeLive99Order(winToken, 1, negRisk, `[grid] ${winLabel} ${ql.slice(0, 25)} 1sh`);
       liveEventTracker.log.unshift({ ts: Date.now(), event: teamNames.join(' vs '), market: m.question?.slice(0, 50), side: winLabel, price: '99.9¢', status: result?.status });
       if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
     } catch (err) {
@@ -8919,7 +9285,7 @@ function scheduleSubMarketScan() {
           console.log(`[sub-mkt] ${marketSlug} → ${winLabel} | score ${home}-${away} total ${total}`);
 
           try {
-            await placeLive99Order(winToken, 5, market.negRisk, `[sub-mkt] ${winLabel} ${market.question?.slice(0, 25)} 5sh`);
+            await placeLive99Order(winToken, 50, market.negRisk, `[sub-mkt] ${winLabel} ${market.question?.slice(0, 25)} 50sh`);
             liveEventTracker.log.unshift({ ts: Date.now(), event: data.title, market: market.question?.slice(0, 50), side: winLabel, price: '99.9¢', status: 'placed' });
             if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
           } catch (err) {
@@ -8931,12 +9297,3323 @@ function scheduleSubMarketScan() {
       console.error('[sub-mkt] Error:', e.message?.slice(0, 100));
     }
     scheduleSubMarketScan();
-  }, 30000); // Every 30s
+  }, 1000); // Every 1s
 }
 setTimeout(() => {
-  console.log('[sub-mkt] Sub-market scanner started (30s, 5sh test)');
+  console.log('[sub-mkt] Sub-market scanner started (30s, 50sh)');
   scheduleSubMarketScan();
 }, 20000);
+
+// ── NBA Player Props Scanner ──
+// Checks ESPN box scores for live/finished NBA games, buys YES on decided player props
+// 5sh at 99¢ — testing phase
+const playerPropsFired = new Set();
+
+const PROP_LINES = {
+  points: [4.5, 8.5, 10.5, 12.5, 14.5, 16.5, 18.5, 20.5, 22.5, 24.5, 26.5, 28.5, 30.5, 32.5, 34.5],
+  assists: [1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5],
+  rebounds: [2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5, 11.5, 12.5, 13.5],
+};
+
+function playerSlug(name) {
+  return name.toLowerCase().replace(/[^a-z\s-]/g, '').replace(/\s+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+}
+
+function schedulePlayerPropsScan() {
+  setTimeout(async () => {
+    try {
+      if (!clobClient) { schedulePlayerPropsScan(); return; }
+
+      // Get all live/finished NBA games from ESPN
+      const espnR = await fetch('https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard', { signal: AbortSignal.timeout(5000) });
+      const espnData = await espnR.json();
+
+      for (const ev of (espnData.events || [])) {
+        const comp = ev.competitions?.[0];
+        if (!comp?.competitors?.length) continue;
+        const status = comp.status?.type?.description || '';
+        if (status !== 'In Progress' && !status.startsWith('Final')) continue;
+
+        // Get game slug parts
+        const espnDateUTC = new Date(ev.date);
+        const etDateStr = new Date(espnDateUTC.getTime() - 4 * 3600000).toISOString().slice(0, 10);
+        const awayT = comp.competitors.find(c => c.homeAway === 'away') || comp.competitors[1];
+        const homeT = comp.competitors.find(c => c.homeAway === 'home') || comp.competitors[0];
+        const awayAbbr = awayT.team?.abbreviation?.toLowerCase() || '';
+        const homeAbbr = homeT.team?.abbreviation?.toLowerCase() || '';
+        const gameSlug = `nba-${awayAbbr}-${homeAbbr}-${etDateStr}`;
+
+        // Get box score
+        const gameId = ev.id;
+        let boxData;
+        try {
+          const boxR = await fetch(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event=${gameId}`, { signal: AbortSignal.timeout(5000) });
+          boxData = await boxR.json();
+        } catch { continue; }
+
+        const boxscore = boxData?.boxscore;
+        if (!boxscore?.players?.length) continue;
+
+        for (const team of boxscore.players) {
+          for (const statGroup of (team.statistics || [])) {
+            const labels = statGroup.labels || [];
+            const ptsIdx = labels.indexOf('PTS');
+            const astIdx = labels.indexOf('AST');
+            const rebIdx = labels.indexOf('REB');
+
+            for (const athlete of (statGroup.athletes || [])) {
+              const name = athlete.athlete?.displayName || '';
+              const stats = athlete.stats || [];
+              if (!name || !stats.length) continue;
+
+              const pts = ptsIdx >= 0 ? parseInt(stats[ptsIdx]) || 0 : 0;
+              const ast = astIdx >= 0 ? parseInt(stats[astIdx]) || 0 : 0;
+              const reb = rebIdx >= 0 ? parseInt(stats[rebIdx]) || 0 : 0;
+              const pSlug = playerSlug(name);
+
+              // Check each stat against lines
+              const checks = [
+                { stat: 'points', val: pts, lines: PROP_LINES.points },
+                { stat: 'assists', val: ast, lines: PROP_LINES.assists },
+                { stat: 'rebounds', val: reb, lines: PROP_LINES.rebounds },
+              ];
+
+              for (const check of checks) {
+                if (check.val < 1) continue; // skip players with 0
+
+                for (const line of check.lines) {
+                  if (check.val <= line) continue; // not exceeded yet
+
+                  const lineStr = line.toString().replace('.', 'pt');
+                  const marketSlug = `${gameSlug}-${check.stat}-${pSlug}-${lineStr}`;
+                  if (playerPropsFired.has(marketSlug)) continue;
+
+                  // Check if market exists
+                  try {
+                    const mr = await fetch(`https://gamma-api.polymarket.com/markets?slug=${marketSlug}`, { signal: AbortSignal.timeout(3000) });
+                    const md = await mr.json();
+                    const m = Array.isArray(md) ? md[0] : null;
+                    if (!m?.conditionId) continue;
+
+                    const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
+                    const outcomes = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes;
+                    if (!tokens || tokens.length < 2) continue;
+                    const negRisk = m.negRisk === true;
+
+                    // YES = Over, which is index 0 (or find 'Over'/'Yes')
+                    const yesIdx = outcomes ? outcomes.findIndex(o => o.toLowerCase().includes('over') || o.toLowerCase() === 'yes') : 0;
+                    if (yesIdx < 0) continue;
+                    const yesToken = tokens[yesIdx >= 0 ? yesIdx : 0];
+
+                    // Check ask price >= 90¢
+                    try {
+                      const askRes = await fetch('https://clob.polymarket.com/price?token_id=' + yesToken + '&side=sell', { signal: AbortSignal.timeout(2000) });
+                      const askData = await askRes.json();
+                      const askPrice = askData?.price ? parseFloat(askData.price) : null;
+                      if (askPrice != null && askPrice < 0.90) {
+                        playerPropsFired.add(marketSlug); // don't retry
+                        continue;
+                      }
+                    } catch { continue; }
+
+                    playerPropsFired.add(marketSlug);
+                    console.log(`[player-props] ${name} ${check.stat}=${check.val} > ${line} → YES | ${marketSlug}`);
+
+                    // Place 5sh — try 99.9¢ first, fall back to 99¢
+                    try {
+                      const expiration = Math.floor(Date.now() / 1000) + 1800;
+                      let result;
+                      try {
+                        const signed = await clobClient.createOrder(
+                          { tokenID: yesToken, price: 0.999, size: 30, side: 'BUY', expiration },
+                          { tickSize: '0.001', negRisk }
+                        );
+                        result = await clobClient.postOrder(signed, 'GTD');
+                      } catch {
+                        const signed2 = await clobClient.createOrder(
+                          { tokenID: yesToken, price: 0.99, size: 30, side: 'BUY', expiration },
+                          { tickSize: '0.01', negRisk }
+                        );
+                        result = await clobClient.postOrder(signed2, 'GTD');
+                      }
+                      console.log(`[player-props] ${name} ${check.stat} O/U ${line} YES 5sh → ${result?.status}`);
+                      liveEventTracker.log.unshift({ ts: Date.now(), event: `${awayT.team?.shortDisplayName} vs ${homeT.team?.shortDisplayName}`, market: `${name}: ${check.stat} O/U ${line}`, side: 'Over', price: '99¢', status: result?.status });
+                      if (liveEventTracker.log.length > 50) liveEventTracker.log.length = 50;
+                    } catch (e) {
+                      console.log(`[player-props] ERR ${name} ${check.stat} O/U ${line}: ${e?.response?.data?.error?.slice(0,50) || e.message?.slice(0,50)}`);
+                    }
+                  } catch {}
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[player-props] Error:', e.message?.slice(0, 80));
+    }
+    schedulePlayerPropsScan();
+  }, 1000); // Every 1s
+}
+setTimeout(() => {
+  console.log('[player-props] NBA player props scanner started (30s, 5sh @ 99¢)');
+  schedulePlayerPropsScan();
+}, 25000);
+
+// ── Kalshi Soccer Match Scanner (multi-league) ──
+// Polls ESPN for each league every 10s. Fires Kalshi orders on decided markets.
+const kalshiEplFired = new Set();
+// ESPN → Kalshi 3-letter abbreviation per league
+const ESPN_TO_KALSHI_EPL = {
+  'MAN':'MUN','MCI':'MCI','MNC':'MCI','ARS':'ARS','CHE':'CFC','LIV':'LFC','TOT':'TOT',
+  'NEW':'NEW','AVL':'AVL','WHU':'WHU','BHA':'BRI','BRE':'BRE','BOU':'BOU',
+  'FUL':'FUL','CRY':'CRY','EVE':'EVE','WOL':'WOL','NFO':'NFO','LEE':'LEE',
+  'BUR':'BUR','SUN':'SUN','LEI':'LEI','IPS':'IPS','SOU':'SOU',
+  'MANU':'MUN','MANCITY':'MCI',
+};
+const ESPN_TO_KALSHI_LALIGA = {
+  'RM':'RMA','RMA':'RMA','BAR':'BAR','ATM':'ATM','ATL':'ATM','ATH':'ATH','BET':'RBB',
+  'SEV':'SEV','VIL':'VIL','SOC':'RSO','VAL':'VCF','GIR':'GIR','RAY':'RVC','MLL':'MLL',
+  'OSA':'OSA','CEL':'RCC','GET':'GET','ESP':'ESP','LEG':'LEG','LEV':'LEV','RAC':'RAC',
+  'ALA':'ALA','ELC':'ELC','OVI':'OVI','RVD':'RVD',
+};
+const ESPN_TO_KALSHI_BUNDES = {
+  'BAY':'BMU','MUN':'BMU','BVB':'BVB','DOR':'BVB','RBL':'RBL','LEV':'LEV','B04':'LEV','VFB':'VFB',
+  'FRA':'SGE','WOB':'WOB','MGL':'BMG','FCA':'FCA','HOF':'TSG','UNI':'UNI','BOC':'BOC',
+  'M05':'M05','WER':'SVW','FCH':'FCH','SGE':'SGE','KOE':'KOE','HSV':'HSV','STP':'STP','SCF':'SCF',
+};
+const ESPN_TO_KALSHI_SERIEA = {
+  'INT':'INT','JUV':'JUV','MIL':'ACM','NAP':'NAP','ROM':'ROM','LAZ':'LAZ','ATA':'ATA',
+  'FIO':'FIO','TOR':'TOR','BOL':'BFC','EMP':'EMP','GEN':'GEN','UDI':'UDI','MON':'MON',
+  'LEC':'LEC','VER':'VER','PAR':'PAR','COM':'COM','CAG':'CAG','VEN':'VEN',
+  'CRE':'CRE','PIS':'PIS','SAS':'SAS',
+};
+const ESPN_TO_KALSHI_LIGUE1 = {
+  'PSG':'PSG','OM':'OM','LYO':'OL','OL':'OL','MON':'ASM','LIL':'LIL','OGC':'NIC','NIC':'NIC',
+  'REN':'REN','NAN':'FCN','LEN':'RCL','STR':'RCS','TOU':'TFC','STE':'STE','ANG':'ANG',
+  'BRE':'STB','MET':'FCM','AUX':'AUX','HAV':'HAC','REI':'REI','LOR':'FCL','PAR':'PAR',
+};
+const ESPN_TO_KALSHI_MLS = {
+  'ATL':'ATL','AUS':'ATX','CHA':'CLT','CHI':'CHI','CIN':'CIN','COL':'COL','CLB':'CLB',
+  'DC':'DCU','DAL':'DAL','HOU':'HOU','IMC':'MTL','LA':'LAG','LAG':'LAG','LAFC':'LAFC','MIA':'MIA',
+  'MIN':'MIN','NE':'NE','NYC':'NYC','NYR':'NYRB','ORL':'ORL','PHI':'PHI','POR':'POR','RSL':'RSL',
+  'SEA':'SEA','SJ':'SJ','SKC':'SKC','TOR':'TOR','VAN':'VAN','NSH':'NSH','STL':'STL','SD':'SD',
+};
+const ESPN_TO_KALSHI_LIGAMX = {
+  'AME':'AME','GUA':'CDG','TIG':'TIG','MTY':'MON','CAZ':'CRA','CRU':'CRA','TOL':'TOL',
+  'PAC':'PAC','NEC':'NCX','ASL':'ASL','ATL':'ATL','PUE':'PUE','LEO':'LEO','TIJ':'TIJ',
+  'SAN':'SLA','UAN':'PUM','UNM':'PUM','MAZ':'MAZ','JUA':'JUA','QUE':'QUE',
+};
+const ESPN_TO_KALSHI_BRASILEIRO = {
+  'BAH':'BAH',
+  'BOT':'BOT',
+  'BRA':'RBB', // Bragantino
+  'CAM':'ATL', // Atletico-MG
+  'CAP':'CAP',
+  'CFC':'CTB', // Coritiba
+  'CHA':'CHA',
+  'COR':'COR',
+  'CRU':'CRU',
+  'FLA':'FLA',
+  'FLU':'FLU',
+  'GRE':'GPA', // Gremio
+  'INT':'INT',
+  'MIR':'MIR',
+  'PAL':'PAL',
+  'REMO':'RMO',
+  'SAN':'SAN',
+  'SAO':'SPA', // Sao Paulo
+  'VAS':'VDG', // Vasco da Gama
+  'VIT':'VIT',
+};
+const ESPN_TO_KALSHI_ARG = {
+  'BOC':'BOC','RIV':'RIV','IND':'IND','RAC':'RAC','SLO':'SLO','ESI':'ESI','HUR':'HUR',
+  'BAN':'BAN','VEL':'VEL','LAN':'LAN','DYJ':'DYJ','GLP':'GLP','ROS':'ROS','NOB':'NOB','NWL':'NOB',
+  'COL':'COL','UNI':'UNI','EST':'EST','GOD':'GOD','TAL':'TAL','TALL':'TAL','TIG':'TIG',
+  'SARM':'CAS','ARG':'ARG','PLA':'PLA','IRO':'IRO','INS':'INS','PAT':'PAT','BEL':'BEL',
+  'CTR':'CTR','CCE':'CCE','BAR':'BAR','ALD':'ALD','SCR':'SCR','DEP':'DEP',
+};
+const ESPN_TO_KALSHI_LIGAPOR = {
+  'POR':'FCP','FCP':'FCP','SPOR':'SPO','SCP':'SPO','BEN':'BEN','SLB':'BEN','BRA':'BRA','SCB':'BRA',
+  'VIT':'VIT','VSC':'VIT','GUI':'VIT','RIO':'RAV','RAV':'RAV','RAFC':'RAV','MOR':'MOR','EST':'EST','ESTO':'EST',
+  'FAM':'FAM','FCF':'FAM','CAS':'CAS','AVS':'AVS','NAC':'CDN','CDN':'CDN','AFS':'AFS',
+  'BOA':'BOA','GIL':'GIL','GVFC':'GIL','TON':'TON','CDT':'TON','ARO':'ARO','ARA':'ARO','ALV':'ALV',
+  'ESTR':'ESA','EDA':'ESA','ESA':'ESA','AVE':'AVE','MAI':'MAI','PAC':'PAC','CDA':'CDA','CLU':'CLU',
+  'SCL':'SCL','SCA':'SCL', // Santa Clara Azores
+};
+// Leagues config: ESPN path + Kalshi series prefix + team abbr map + which markets exist
+// Series presence varies: verified that EPL/LALIGA/BUNDESLIGA have GAME/TOTAL/BTTS/1H, others may be game-only
+const SOCCER_LEAGUES = [
+  { name: 'epl',       espn: 'soccer/eng.1', ks: 'EPL',          abbr: ESPN_TO_KALSHI_EPL,      has: { game: true, total: true, btts: true, h1: true, spread: true } },
+  { name: 'laliga',    espn: 'soccer/esp.1', ks: 'LALIGA',       abbr: ESPN_TO_KALSHI_LALIGA,   has: { game: true, total: true, btts: true, h1: true, spread: true } },
+  { name: 'bundes',    espn: 'soccer/ger.1', ks: 'BUNDESLIGA',   abbr: ESPN_TO_KALSHI_BUNDES,   has: { game: true, total: true, btts: true, h1: true, spread: true } },
+  { name: 'seriea',    espn: 'soccer/ita.1', ks: 'SERIEA',       abbr: ESPN_TO_KALSHI_SERIEA,   has: { game: true, total: true, btts: true, h1: true, spread: true } },
+  { name: 'ligue1',    espn: 'soccer/fra.1', ks: 'LIGUE1',       abbr: ESPN_TO_KALSHI_LIGUE1,   has: { game: true, total: true, btts: true, h1: true, spread: true } },
+  { name: 'mls',       espn: 'soccer/usa.1', ks: 'MLS',          abbr: ESPN_TO_KALSHI_MLS,      has: { game: true, total: true, btts: true, h1: false, spread: true } },
+  { name: 'ligamx',    espn: 'soccer/mex.1', ks: 'LIGAMX',       abbr: ESPN_TO_KALSHI_LIGAMX,   has: { game: true, total: true, btts: false, h1: false, spread: true } },
+  { name: 'brasileiro', espn: 'soccer/bra.1', ks: 'BRASILEIRO',  abbr: ESPN_TO_KALSHI_BRASILEIRO, has: { game: true, total: false, btts: false, h1: false, spread: false } },
+  { name: 'ligapor',   espn: 'soccer/por.1', ks: 'LIGAPORTUGAL', abbr: ESPN_TO_KALSHI_LIGAPOR,  has: { game: true, total: false, btts: false, h1: false, spread: false } },
+  { name: 'argprem',   espn: 'soccer/arg.1', ks: 'ARGPREMDIV',   abbr: ESPN_TO_KALSHI_ARG,      has: { game: true, total: false, btts: false, h1: false, spread: false } },
+  { name: 'concacaf',  espn: 'soccer/concacaf.champions', ks: 'CONCACAFCCUP', abbr: {
+    'AME':'AME','NSH':'NSH','LAFC':'LAFC','CAZ':'CRA','CRU':'CRA','MTY':'MON','CLB':'CLB','RSL':'RSL',
+    'ATL':'ATL','POR':'POR','COL':'COL','SEA':'SEA','MIA':'MIA','TIG':'TIG','PAC':'PAC',
+    'LAG':'LAG','LA':'LAG','CIN':'CIN','VAN':'VAN','PHI':'PHI','SD':'SD','TOL':'TOL',
+  }, has: { game: true, total: false, btts: false, h1: false, spread: false } },
+  { name: 'jleague',  espn: 'soccer/jpn.1', ks: 'JLEAGUE', abbr: {
+    'MAR':'MAR','YFM':'MAR','KAW':'KAW','FRO':'KAW','CER':'CER','KYO':'KYO','VER':'VER',
+    'JEF':'JEF','SAN':'SAN','HRS':'SAN','KAS':'KAS','ANT':'KAS','URD':'URD','URW':'URD',
+    'NGE':'NGE','NAG':'NGE','AVI':'AVI','AVF':'AVI','GAM':'GAM','MIT':'MIT','MITO':'MIT',
+    'REY':'REY','KRE':'REY','FAG':'FAG','OKA':'FAG','TOK':'TOK','VIK':'VIK','SHI':'SHI',
+    'MAC':'MAC','VVN':'VVN','GIL':'GIL','TON':'TON','CDT':'TON','BOA':'BOA',
+  }, has: { game: true, total: false, btts: false, h1: false, spread: false } },
+  { name: 'ucl',       espn: 'soccer/uefa.champions', ks: 'UCL', abbr: {
+    // ESPN sends 'MUN' for Bayern Munich in UCL — map to Kalshi's BMU
+    'MUN':'BMU',
+    'ATM':'ATM','BAR':'BAR','RMA':'RMA','LIV':'LFC','LFC':'LFC','PSG':'PSG','BVB':'BVB','BAY':'BMU',
+    'MCI':'MCI','INT':'INT','JUV':'JUV','ARS':'ARS','MIL':'ACM','BEN':'BEN','POR':'POR',
+    'FCB':'BAR','ATL':'ATM','PSV':'PSV','FEY':'FEY','LEV':'LEV','VIL':'VIL','AST':'AST',
+    'CEL':'CEL','MON':'MON','LIL':'LIL','BRU':'BRU','STU':'STU','SLB':'BEN','SPO':'SPO',
+  }, has: { game: true, total: true, btts: true, h1: true, spread: true } },
+];
+const KALSHI_ENTRY_MIN_ASK_DOLLARS = 0.80;
+const KALSHI_LIMIT_PRICE_CENTS = 99;
+const KALSHI_ORDER_CAP_DOLLARS = 2;
+const KALSHI_CAPPED_ORDER_COUNT = Math.max(1, Math.floor((KALSHI_ORDER_CAP_DOLLARS * 100) / KALSHI_LIMIT_PRICE_CENTS));
+
+function kalshiCappedCount(requestedCount = 1) {
+  return Math.max(1, Math.min(requestedCount, KALSHI_CAPPED_ORDER_COUNT));
+}
+
+async function checkKalshiAskAbove90(ticker, side) {
+  // Blanket safety: only place order if market ask for OUR side is >= threshold.
+  // Lower threshold captures more winners while capping per-order notional.
+  try {
+    const r = await fetch(`https://api.elections.kalshi.com/trade-api/v2/markets/${ticker}`, { signal: AbortSignal.timeout(3000) });
+    if (!r.ok) return false;
+    const d = await r.json();
+    const m = d.market || {};
+    const ask = side === 'yes' ? parseFloat(m.yes_ask_dollars || '1.00') : parseFloat(m.no_ask_dollars || '1.00');
+    if (ask < KALSHI_ENTRY_MIN_ASK_DOLLARS) return false;
+    // Volume check: skip empty/dead markets
+    const vol = parseFloat(m.volume_fp || 0);
+    const oi = parseFloat(m.open_interest_fp || 0);
+    if (vol < 10 && oi < 10) {
+      console.log(`[kalshi] SKIP ${ticker} — dead market (vol:$${vol.toFixed(0)} oi:${oi.toFixed(0)})`);
+      return false;
+    }
+    // Book check: if buying YES, the YES bid should be > 80¢ (market agrees stat happened)
+    // If YES bid is 0 or very low, nobody believes it — stat likely being revised
+    const bid = side === 'yes' ? parseFloat(m.yes_bid_dollars || '0') : parseFloat(m.no_bid_dollars || '0');
+    if (bid < 0.80) {
+      console.log(`[kalshi] SKIP ${ticker} — empty book (${side} bid:${(bid*100).toFixed(0)}¢ < 80¢, market doesn't confirm)`);
+      return false;
+    }
+    return true;
+  } catch { return false; }
+}
+
+async function fireKalshiOrder(ticker, side, label) {
+  try {
+    const ok = await checkKalshiAskAbove90(ticker, side);
+    if (!ok) { console.log(`${label} SKIP (ask < 80¢) on ${ticker}`); return; }
+    const count = 14;
+    const body = JSON.stringify({ ticker, action: 'buy', side, type: 'limit', count, [side === 'yes' ? 'yes_price' : 'no_price']: KALSHI_LIMIT_PRICE_CENTS });
+    const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+    const od = await or.json();
+    const filled = od.order?.fill_count_fp || '0';
+    console.log(`${label} → ${side.toUpperCase()} ${count}sh@99¢ [✓GEMINI] on ${ticker} → filled:${filled}`);
+  } catch (e) {
+    console.error(`${label} err:`, e.message?.slice(0, 80));
+  }
+}
+
+async function scanSoccerLeague(lg) {
+  try {
+    const er = await fetch(`https://site.api.espn.com/apis/site/v2/sports/${lg.espn}/scoreboard`, { signal: AbortSignal.timeout(5000) });
+    const ed = await er.json();
+    for (const ev of (ed.events || [])) {
+        const comp = ev.competitions?.[0];
+        if (!comp?.competitors?.length) continue;
+        const status = comp.status?.type?.description || '';
+        const stateCode = comp.status?.type?.state || ''; // 'pre','in','post'
+        const isLive = stateCode === 'in';
+        const isFinal = status.startsWith('Final') || status === 'FT' || stateCode === 'post';
+        const isHalftime = status.toLowerCase().includes('half') && !status.toLowerCase().startsWith('first') || status === 'Halftime';
+        // Halftime more robust: check period >= 2 or "Halftime" / "Second Half" / "End of 1st"
+        const period = comp.status?.period || 0;
+        const firstHalfDone = isHalftime || period >= 2 || status === 'Halftime' || status === 'End of 1st Half' || status.startsWith('Second Half') || isFinal;
+        if (!isLive && !isFinal) continue;
+
+        const home = comp.competitors.find(c => c.homeAway === 'home') || comp.competitors[0];
+        const away = comp.competitors.find(c => c.homeAway === 'away') || comp.competitors[1];
+        const hs = parseInt(home.score || 0);
+        const as_ = parseInt(away.score || 0);
+        const total = hs + as_;
+        const d = new Date(ev.date);
+        const et = new Date(d.getTime() - 4 * 3600000);
+        const months = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+        const dateStr = '26' + months[et.getUTCMonth()] + String(et.getUTCDate()).padStart(2, '0');
+        const hAbbr = lg.abbr[home.team?.abbreviation?.toUpperCase()] || home.team?.abbreviation?.toUpperCase() || '';
+        const aAbbr = lg.abbr[away.team?.abbreviation?.toUpperCase()] || away.team?.abbreviation?.toUpperCase() || '';
+        if (!hAbbr || !aAbbr) continue;
+        const matchKey = `${dateStr}${hAbbr}${aAbbr}`;
+        const logPfx = `[kalshi-${lg.name}]`;
+        console.log(`${logPfx} ${hAbbr} ${hs}-${as_} ${aAbbr} | ${status} | key=${matchKey}`);
+
+        // 1) MATCH WINNER (Final only)
+        if (lg.has.game && isFinal) {
+          const key = `${lg.name}-game-${matchKey}`;
+          if (!kalshiEplFired.has(key)) {
+            kalshiEplFired.add(key);
+            const suffix = hs > as_ ? hAbbr : as_ > hs ? aAbbr : 'TIE';
+            fireKalshiOrder(`KX${lg.ks}GAME-${matchKey}-${suffix}`, 'yes', `${logPfx} ${hAbbr} ${hs}-${as_} ${aAbbr} MATCH→${suffix}`);
+          }
+        }
+
+        // 2) TOTAL GOALS Over N.5
+        if (lg.has.total) {
+          for (const line of [1, 2, 3, 4]) {
+            const key = `${lg.name}-total-${matchKey}-${line}`;
+            if (!kalshiEplFired.has(key) && total > line) {
+              kalshiEplFired.add(key);
+              fireKalshiOrder(`KX${lg.ks}TOTAL-${matchKey}-${line}`, 'yes', `${logPfx} ${hAbbr} ${hs}-${as_} ${aAbbr} TOTAL Over ${line}.5`);
+            }
+          }
+          if (isFinal) {
+            for (const line of [1, 2, 3, 4]) {
+              const key = `${lg.name}-total-no-${matchKey}-${line}`;
+              if (!kalshiEplFired.has(key) && total <= line) {
+                kalshiEplFired.add(key);
+                fireKalshiOrder(`KX${lg.ks}TOTAL-${matchKey}-${line}`, 'no', `${logPfx} ${hAbbr} ${hs}-${as_} ${aAbbr} FINAL NO Over ${line}.5`);
+              }
+            }
+          }
+        }
+
+        // 3) BTTS
+        if (lg.has.btts) {
+          const bttsKey = `${lg.name}-btts-${matchKey}`;
+          if (!kalshiEplFired.has(bttsKey)) {
+            if (hs > 0 && as_ > 0) {
+              kalshiEplFired.add(bttsKey);
+              fireKalshiOrder(`KX${lg.ks}BTTS-${matchKey}`, 'yes', `${logPfx} ${hAbbr} ${hs}-${as_} ${aAbbr} BTTS`);
+            } else if (isFinal && (hs === 0 || as_ === 0)) {
+              kalshiEplFired.add(bttsKey);
+              fireKalshiOrder(`KX${lg.ks}BTTS-${matchKey}`, 'no', `${logPfx} ${hAbbr} ${hs}-${as_} ${aAbbr} FINAL BTTS NO`);
+            }
+          }
+        }
+
+        // 5) SPREAD — fire at Final if winner covers by over N.5
+        if (lg.has.spread && isFinal) {
+          const diff = Math.abs(hs - as_);
+          const winner = hs > as_ ? hAbbr : as_ > hs ? aAbbr : null;
+          if (winner) {
+            for (const line of [1, 2]) {
+              if (diff > line) {
+                const key = `${lg.name}-spread-${matchKey}-${winner}-${line}`;
+                if (!kalshiEplFired.has(key)) {
+                  kalshiEplFired.add(key);
+                  // Kalshi suffix: 1 = over 1.5, 2 = over 2.5
+                  fireKalshiOrder(`KX${lg.ks}SPREAD-${matchKey}-${winner}${line}`, 'yes', `${logPfx} ${hAbbr} ${hs}-${as_} ${aAbbr} SPREAD ${winner} -${line}.5`);
+                }
+              }
+            }
+          }
+        }
+
+        // 4) 1ST HALF WINNER (fire at halftime only)
+        if (lg.has.h1 && firstHalfDone) {
+          const key = `${lg.name}-1h-${matchKey}`;
+          if (!kalshiEplFired.has(key)) {
+            const exactlyHalftime = status === 'Halftime' || status === 'End of 1st Half' || (period === 2 && isLive);
+            if (exactlyHalftime) {
+              kalshiEplFired.add(key);
+              const suffix = hs > as_ ? hAbbr : as_ > hs ? aAbbr : 'TIE';
+              fireKalshiOrder(`KX${lg.ks}1H-${matchKey}-${suffix}`, 'yes', `${logPfx} ${hAbbr} ${hs}-${as_} ${aAbbr} 1H→${suffix}`);
+            }
+          }
+        }
+      }
+  } catch (e) {
+    console.error(`[kalshi-${lg.name}] Error:`, e.message?.slice(0, 80));
+  }
+}
+function scheduleKalshiSoccerScan() {
+  setTimeout(async () => {
+    if (typeof hasKalshiAuth !== 'function' || !hasKalshiAuth()) { console.log('[kalshi-soccer] auth not ready, retry in 10s'); scheduleKalshiSoccerScan(); return; }
+    for (const lg of SOCCER_LEAGUES) { try { await scanSoccerLeague(lg); } catch (e) { console.error(`[kalshi-soccer] ${lg.name} scan err:`, e.message?.slice(0,100)); } }
+    scheduleKalshiSoccerScan();
+  }, 10000);
+}
+setTimeout(() => {
+  if (typeof hasKalshiAuth === 'function' && hasKalshiAuth()) {
+    console.log(`[kalshi-soccer] Scanner started (10s, ${SOCCER_LEAGUES.length} leagues, 28sh @ 99¢)`);
+    scheduleKalshiSoccerScan();
+  }
+}, 30000);
+
+// ── Kalshi NBA Game Scanner ──
+// Tracks final NBA winners and buys YES on the winning KXNBAGAME side.
+const kalshiNbaFired = new Set();
+const kalshiNbaEventCache = { events: [], ts: 0 };
+const ESPN_TO_KALSHI_NBA = {
+  GS: 'GSW',
+  NO: 'NOP',
+  NY: 'NYK',
+  SA: 'SAS',
+};
+function toKalshiNbaAbbr(espnAbbr) {
+  const a = (espnAbbr || '').toUpperCase();
+  return ESPN_TO_KALSHI_NBA[a] || a;
+}
+function nbaDateTag(isoTs) {
+  try {
+    const d = new Date(isoTs);
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    return `(${months[d.getUTCMonth()]} ${d.getUTCDate()})`;
+  } catch { return null; }
+}
+function nbaNorm(s) {
+  return (s || '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+async function refreshKalshiNbaEvents() {
+  if (Date.now() - kalshiNbaEventCache.ts < 60000 && kalshiNbaEventCache.events.length) return kalshiNbaEventCache.events;
+  try {
+    const r = await fetch('https://api.elections.kalshi.com/trade-api/v2/events?series_ticker=KXNBAGAME&status=open&limit=200', { signal: AbortSignal.timeout(5000) });
+    const d = await r.json();
+    kalshiNbaEventCache.events = d.events || [];
+    kalshiNbaEventCache.ts = Date.now();
+  } catch {}
+  return kalshiNbaEventCache.events;
+}
+function findKalshiNbaEvent(events, awayName, homeName, awayAbbr, homeAbbr, dateTag) {
+  const pool = events.filter(e => !dateTag || ((e.sub_title || '') + ' ' + (e.title || '')).includes(dateTag));
+  const p = pool.length ? pool : events;
+  const abbrNeedle = `${awayAbbr} at ${homeAbbr}`.toLowerCase();
+  const byAbbr = p.find(e => ((e.sub_title || '') + ' ' + (e.title || '')).toLowerCase().includes(abbrNeedle));
+  if (byAbbr) return byAbbr;
+
+  const aNorm = nbaNorm(awayName);
+  const hNorm = nbaNorm(homeName);
+  const aTok = aNorm.split(' ').filter(t => t.length > 2);
+  const hTok = hNorm.split(' ').filter(t => t.length > 2);
+  return p.find(e => {
+    const s = nbaNorm((e.sub_title || '') + ' ' + (e.title || ''));
+    const aOk = aTok.length ? aTok.some(t => s.includes(t)) : false;
+    const hOk = hTok.length ? hTok.some(t => s.includes(t)) : false;
+    return aOk && hOk;
+  }) || null;
+}
+function scheduleKalshiNbaScan() {
+  setTimeout(async () => {
+    try {
+      if (typeof hasKalshiAuth !== 'function' || !hasKalshiAuth()) { scheduleKalshiNbaScan(); return; }
+      const er = await fetch('https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard', { signal: AbortSignal.timeout(5000) });
+      const ed = await er.json();
+      for (const ev of (ed.events || [])) {
+        const comp = ev.competitions?.[0];
+        if (!comp?.competitors?.length) continue;
+        const stateCode = comp.status?.type?.state || '';
+        const status = comp.status?.type?.description || '';
+        const isFinal = stateCode === 'post' || status.startsWith('Final');
+        if (!isFinal) continue;
+
+        const awayT = comp.competitors.find(c => c.homeAway === 'away') || comp.competitors[1];
+        const homeT = comp.competitors.find(c => c.homeAway === 'home') || comp.competitors[0];
+        const awayName = awayT.team?.displayName || awayT.team?.shortDisplayName || '';
+        const homeName = homeT.team?.displayName || homeT.team?.shortDisplayName || '';
+        const awayAbbr = toKalshiNbaAbbr(awayT.team?.abbreviation);
+        const homeAbbr = toKalshiNbaAbbr(homeT.team?.abbreviation);
+        const awayScore = parseInt(awayT.score || 0);
+        const homeScore = parseInt(homeT.score || 0);
+        if (!awayAbbr || !homeAbbr || awayScore === homeScore) continue; // no ties in NBA
+
+        const firedKey = `nba-${ev.id}`;
+        if (kalshiNbaFired.has(firedKey)) continue;
+        kalshiNbaFired.add(firedKey);
+
+        const dateTag = nbaDateTag(ev.date);
+        const events = await refreshKalshiNbaEvents();
+        const kEvent = findKalshiNbaEvent(events, awayName, homeName, awayAbbr, homeAbbr, dateTag);
+        if (!kEvent) {
+          console.log(`[kalshi-nba] No KXNBAGAME event for ${awayAbbr} at ${homeAbbr} ${dateTag || ''}`);
+          continue;
+        }
+
+        let markets = [];
+        try {
+          const mr = await fetch(`https://api.elections.kalshi.com/trade-api/v2/markets?event_ticker=${encodeURIComponent(kEvent.event_ticker)}&limit=20`, { signal: AbortSignal.timeout(5000) });
+          const md = await mr.json();
+          markets = md.markets || [];
+        } catch {}
+        if (!markets.length) {
+          console.log(`[kalshi-nba] No markets found for ${kEvent.event_ticker}`);
+          continue;
+        }
+
+        const winnerAbbr = homeScore > awayScore ? homeAbbr : awayAbbr;
+        const winMarket = markets.find(m => (m.ticker || '').endsWith(`-${winnerAbbr}`));
+        if (!winMarket?.ticker) {
+          console.log(`[kalshi-nba] Winner market not found: ${winnerAbbr} in ${kEvent.event_ticker}`);
+          continue;
+        }
+
+        fireKalshiOrder(winMarket.ticker, 'yes', `[kalshi-nba] ${awayAbbr} ${awayScore}-${homeScore} ${homeAbbr} MATCH→${winnerAbbr}`);
+      }
+    } catch (e) {
+      console.error('[kalshi-nba] Error:', e.message?.slice(0, 80));
+    }
+    scheduleKalshiNbaScan();
+  }, 10000);
+}
+setTimeout(() => {
+  if (typeof hasKalshiAuth === 'function' && hasKalshiAuth()) {
+    console.log('[kalshi-nba] NBA game scanner started (10s, 1sh @ 99¢, final winner)');
+    scheduleKalshiNbaScan();
+  }
+}, 33000);
+
+// ── Gamma Esports → Kalshi Bridge ──
+// Catches matches PandaScore misses by polling Poly Gamma directly
+const gammaKalshiFired = new Set();
+const KS_ESPORTS_FROM_POLY = [
+  { polyPrefix: 'lol-', kSeries: 'KXLOLGAME' },
+  { polyPrefix: 'cs2-', kSeries: 'KXCS2GAME' },
+  { polyPrefix: 'val-', kSeries: 'KXVALORANTGAME' },
+  { polyPrefix: 'dota2-', kSeries: 'KXDOTA2GAME' },
+];
+
+function scheduleGammaKalshiBridge() {
+  setTimeout(async () => {
+    try {
+      if (typeof hasKalshiAuth !== 'function' || !hasKalshiAuth()) { scheduleGammaKalshiBridge(); return; }
+      const r = await fetch('https://gamma-api.polymarket.com/events?active=true&closed=false&tag=esports&limit=100', { signal: AbortSignal.timeout(8000) });
+      const events = await r.json();
+      if (!Array.isArray(events)) { scheduleGammaKalshiBridge(); return; }
+      for (const ev of events) {
+        const slug = ev.slug || '';
+        const cfg = KS_ESPORTS_FROM_POLY.find(c => slug.startsWith(c.polyPrefix));
+        if (!cfg) continue;
+        const matchMkt = (ev.markets || []).find(m => {
+          const q = (m.question || '').toLowerCase();
+          return !q.includes('game ') && !q.includes('map ') && !q.includes('total') && !q.includes('handicap') && !q.includes('o/u');
+        });
+        if (!matchMkt) continue;
+        const prices = typeof matchMkt.outcomePrices === 'string' ? JSON.parse(matchMkt.outcomePrices) : matchMkt.outcomePrices;
+        const outcomes = typeof matchMkt.outcomes === 'string' ? JSON.parse(matchMkt.outcomes) : matchMkt.outcomes;
+        if (!prices || !outcomes || prices.length < 2) continue;
+        const p0 = parseFloat(prices[0]); const p1 = parseFloat(prices[1]);
+        const maxP = Math.max(p0, p1);
+        if (maxP < 0.99) continue;
+        const winnerName = p0 >= p1 ? outcomes[0] : outcomes[1];
+        const winnerLast = winnerName.toLowerCase().split(/\s+/).pop();
+        const cacheKey = `${cfg.kSeries}-${slug}`;
+        if (gammaKalshiFired.has(cacheKey)) continue;
+        try {
+          const kr = await fetch(`https://api.elections.kalshi.com/trade-api/v2/events?series_ticker=${cfg.kSeries}&status=open&limit=200`, { signal: AbortSignal.timeout(5000) });
+          const kd = await kr.json();
+          const t1Last = outcomes[0].toLowerCase().split(/\s+/).pop();
+          const t2Last = outcomes[1].toLowerCase().split(/\s+/).pop();
+          const kEvent = (kd.events || []).find(e => {
+            const s = ((e.sub_title || '') + ' ' + (e.title || '')).toLowerCase();
+            return s.includes(t1Last) && s.includes(t2Last);
+          });
+          if (!kEvent) continue;
+          const mr = await fetch(`https://api.elections.kalshi.com/trade-api/v2/events/${kEvent.event_ticker}`, { signal: AbortSignal.timeout(5000) });
+          const md = await mr.json();
+          const winMkt = (md.markets || []).find(m => {
+            const ys = (m.yes_sub_title || '').toLowerCase();
+            return ys.includes(winnerLast.slice(0, 4));
+          });
+          if (!winMkt || winMkt.status !== 'active') continue;
+          gammaKalshiFired.add(cacheKey);
+          const ask = parseFloat(winMkt.yes_ask_dollars || '1');
+          if (ask < 0.80) { console.log(`[gamma-bridge] SKIP (ask ${ask}) ${winnerName} on ${winMkt.ticker}`); continue; }
+          const count = kalshiCappedCount(14);
+          const body = JSON.stringify({ ticker: winMkt.ticker, action: 'buy', side: 'yes', type: 'limit', count, yes_price: KALSHI_LIMIT_PRICE_CENTS });
+          const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+          const od = await or.json();
+          console.log(`[gamma-bridge] ${winnerName} ${(maxP*100).toFixed(0)}% → Kalshi YES ${count}sh@99¢ on ${winMkt.ticker} → filled:${od.order?.fill_count_fp || '0'}`);
+        } catch (e) { console.error('[gamma-bridge] err:', e.message?.slice(0, 60)); }
+      }
+    } catch (e) { console.error('[gamma-bridge] Error:', e.message?.slice(0, 80)); }
+    scheduleGammaKalshiBridge();
+  }, 15000);
+}
+setTimeout(() => {
+  if (typeof hasKalshiAuth === 'function' && hasKalshiAuth()) {
+    console.log('[gamma-bridge] Gamma → Kalshi esports bridge started (15s)');
+    scheduleGammaKalshiBridge();
+  }
+}, 50000);
+
+// ── Kalshi NBA Player Props Scanner (PTS/AST/REB from ESPN) ──
+const kalshiNbaPropFired2 = new Set();
+const KALSHI_NBA_PROP_SERIES = [
+  { series: 'KXNBAPTS', stat: 'points' },
+  { series: 'KXNBAAST', stat: 'assists' },
+  { series: 'KXNBAREB', stat: 'rebounds' },
+  { series: 'KXNBA3PT', stat: 'threes' },
+  // KXNBASTL and KXNBABLK disabled — steals/blocks get revised too often, even with dual-source check
+  // { series: 'KXNBASTL', stat: 'steals' },
+  // { series: 'KXNBABLK', stat: 'blocks' },
+];
+
+function nbaTickerDateStr(isoTs) {
+  const d = new Date(new Date(isoTs).getTime() - 4 * 3600000); // ET
+  const months = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+  return '26' + months[d.getUTCMonth()] + String(d.getUTCDate()).padStart(2, '0');
+}
+
+function nbaPlayerNorm(name) {
+  return String(name || '')
+    .toLowerCase()
+    .replace(/\b(jr|sr|ii|iii|iv|v)\b\.?/g, '')
+    .replace(/[^a-z0-9 ]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function nbaPlayerNameVariants(name) {
+  const norm = nbaPlayerNorm(name);
+  const parts = norm.split(' ').filter(Boolean);
+  const set = new Set();
+  if (!parts.length) return set;
+  set.add(parts.join(' '));
+  set.add(parts.join(''));
+  if (parts.length >= 2) {
+    set.add(`${parts[0]} ${parts[parts.length - 1]}`);
+    set.add(parts[parts.length - 1]);
+  }
+  return set;
+}
+
+function parseNbaPropYesSubtitle(yesSubTitle) {
+  const m = String(yesSubTitle || '').match(/^(.+?):\s*(\d+)\+$/);
+  if (!m) return null;
+  return { playerName: m[1].trim(), line: parseInt(m[2], 10) };
+}
+
+function buildNbaStatMaps(boxscore) {
+  const exact = new Map(); // "first last" -> stat row
+  const loose = new Map(); // variants -> stat row
+
+  for (const team of (boxscore?.players || [])) {
+    for (const group of (team.statistics || [])) {
+      const labels = group.labels || [];
+      const ptsIdx = labels.indexOf('PTS');
+      const astIdx = labels.indexOf('AST');
+      const rebIdx = labels.indexOf('REB');
+      const tptIdx = labels.indexOf('3PT');
+      const stlIdx = labels.indexOf('STL');
+      const blkIdx = labels.indexOf('BLK');
+      if (ptsIdx < 0 && astIdx < 0 && rebIdx < 0) continue;
+
+      for (const athlete of (group.athletes || [])) {
+        const displayName = athlete?.athlete?.displayName || '';
+        if (!displayName) continue;
+        const stats = athlete.stats || [];
+        // Parse 3PT: format is "X-Y" (made-attempted), we want made
+        let threes = 0;
+        if (tptIdx >= 0 && stats[tptIdx]) {
+          const tptParts = String(stats[tptIdx]).split('-');
+          threes = parseInt(tptParts[0], 10) || 0;
+        }
+        const row = {
+          displayName,
+          points: ptsIdx >= 0 ? (parseInt(stats[ptsIdx], 10) || 0) : 0,
+          assists: astIdx >= 0 ? (parseInt(stats[astIdx], 10) || 0) : 0,
+          rebounds: rebIdx >= 0 ? (parseInt(stats[rebIdx], 10) || 0) : 0,
+          threes,
+          steals: stlIdx >= 0 ? (parseInt(stats[stlIdx], 10) || 0) : 0,
+          blocks: blkIdx >= 0 ? (parseInt(stats[blkIdx], 10) || 0) : 0,
+        };
+        const ex = nbaPlayerNorm(displayName);
+        if (!exact.has(ex)) exact.set(ex, row);
+        for (const v of nbaPlayerNameVariants(displayName)) if (!loose.has(v)) loose.set(v, row);
+      }
+    }
+  }
+  return { exact, loose };
+}
+
+async function fireKalshiNbaPropOrder(ticker, side, label) {
+  try {
+    const ok = await checkKalshiAskAbove90(ticker, side);
+    if (!ok) {
+      console.log(`${label} SKIP (ask < 80¢) on ${ticker}`);
+      return false;
+    }
+    const certain = await geminiVerifyBet(label, side);
+    if (!certain) { console.log(`${label} SKIP (Gemini not certain) on ${ticker}`); return false; }
+    const count = 14;
+    const body = JSON.stringify({
+      ticker,
+      action: 'buy',
+      side,
+      type: 'limit',
+      count,
+      ...(side === 'yes' ? { yes_price: KALSHI_LIMIT_PRICE_CENTS } : { no_price: KALSHI_LIMIT_PRICE_CENTS }),
+    });
+    const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+    const od = await or.json();
+    const filled = od.order?.fill_count_fp || '0';
+    console.log(`${label} → ${side.toUpperCase()} ${count}sh@99¢ [✓GEMINI] on ${ticker} → filled:${filled}`);
+    return true;
+  } catch (e) {
+    console.error(`${label} err:`, e.message?.slice(0, 80));
+    return false;
+  }
+}
+
+// NBA CDN boxscore — Kalshi's primary settlement source
+async function fetchNbaCdnStats(espnGameId) {
+  try {
+    // Map ESPN game ID to NBA game ID via today's scoreboard
+    const sr = await fetch('https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json', { signal: AbortSignal.timeout(5000) });
+    const sd = await sr.json();
+    // Try to find game by matching teams (NBA CDN uses different IDs than ESPN)
+    // Cache the mapping
+    if (!fetchNbaCdnStats._cache) fetchNbaCdnStats._cache = {};
+    for (const g of (sd.scoreboard?.games || [])) {
+      fetchNbaCdnStats._cache[`${g.awayTeam?.teamTricode}-${g.homeTeam?.teamTricode}`] = g.gameId;
+    }
+    return fetchNbaCdnStats._cache;
+  } catch { return {}; }
+}
+
+async function getNbaCdnPlayerStat(gameId, playerName, stat) {
+  try {
+    const r = await fetch(`https://cdn.nba.com/static/json/liveData/boxscore/boxscore_${gameId}.json`, { signal: AbortSignal.timeout(5000) });
+    const d = await r.json();
+    const norm = (s) => String(s||'').toLowerCase().replace(/[^a-z ]/g,'').trim();
+    const target = norm(playerName);
+    for (const side of ['homeTeam', 'awayTeam']) {
+      for (const p of (d.game?.[side]?.players || [])) {
+        const name = norm(p.name || (p.firstName + ' ' + p.familyName));
+        const nameI = norm(p.nameI || '');
+        if (name.includes(target) || target.includes(name) || name.includes(target.split(' ').pop()) || nameI.includes(target.split(' ').pop())) {
+          const s = p.statistics || {};
+          const map = { points: s.points, assists: s.assists, rebounds: s.reboundsTotal, threes: s.threePointersMade, steals: s.steals, blocks: s.blocks };
+          return map[stat] ?? null;
+        }
+      }
+    }
+    return null;
+  } catch { return null; }
+}
+
+// NBA CDN game ID cache per team pair
+let nbaCdnGameIds = {};
+async function refreshNbaCdnGameIds() {
+  try {
+    const r = await fetch('https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json', { signal: AbortSignal.timeout(5000) });
+    const d = await r.json();
+    for (const g of (d.scoreboard?.games || [])) {
+      nbaCdnGameIds[`${g.awayTeam?.teamTricode}-${g.homeTeam?.teamTricode}`] = g.gameId;
+    }
+  } catch {}
+}
+
+function scheduleKalshiNbaPlayerPropsScan() {
+  setTimeout(async () => {
+    try {
+      if (typeof hasKalshiAuth !== 'function' || !hasKalshiAuth()) { scheduleKalshiNbaPlayerPropsScan(); return; }
+
+      await refreshNbaCdnGameIds();
+
+      const sr = await fetch('https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard', { signal: AbortSignal.timeout(5000) });
+      const sd = await sr.json();
+
+      for (const ev of (sd.events || [])) {
+        const comp = ev.competitions?.[0];
+        if (!comp?.competitors?.length) continue;
+        const stateCode = comp.status?.type?.state || '';
+        const status = comp.status?.type?.description || '';
+        const isLive = stateCode === 'in' || status === 'In Progress';
+        const isFinal = stateCode === 'post' || status.startsWith('Final');
+        if (!isLive && !isFinal) continue;
+
+        const awayT = comp.competitors.find(c => c.homeAway === 'away') || comp.competitors[1];
+        const homeT = comp.competitors.find(c => c.homeAway === 'home') || comp.competitors[0];
+        const awayAbbr = toKalshiNbaAbbr(awayT.team?.abbreviation);
+        const homeAbbr = toKalshiNbaAbbr(homeT.team?.abbreviation);
+        if (!awayAbbr || !homeAbbr) continue;
+
+        const gameKey = `${nbaTickerDateStr(ev.date)}${awayAbbr}${homeAbbr}`;
+
+        let summary;
+        try {
+          const br = await fetch(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event=${ev.id}`, { signal: AbortSignal.timeout(5000) });
+          summary = await br.json();
+        } catch { continue; }
+        const maps = buildNbaStatMaps(summary?.boxscore);
+        if (!maps.exact.size) continue;
+
+        for (const cfg of KALSHI_NBA_PROP_SERIES) {
+          const eventTicker = `${cfg.series}-${gameKey}`;
+          let markets = [];
+          try {
+            const er = await fetch(`${KALSHI_API}/trade-api/v2/events/${eventTicker}`, { signal: AbortSignal.timeout(5000) });
+            if (!er.ok) continue;
+            const ed = await er.json();
+            markets = ed.markets || [];
+          } catch { continue; }
+          if (!markets.length) continue;
+
+          for (const m of markets) {
+            if (!m?.ticker) continue;
+            const parsed = parseNbaPropYesSubtitle(m.yes_sub_title);
+            if (!parsed) continue;
+
+            const exactKey = nbaPlayerNorm(parsed.playerName);
+            const statRow = maps.exact.get(exactKey) || maps.loose.get(exactKey) || maps.loose.get(exactKey.replace(/\s+/g, ''));
+            if (!statRow) continue;
+
+            const actual = statRow[cfg.stat] || 0;
+            let side = null;
+            if (actual >= parsed.line) side = 'yes';
+            if (!side) continue;
+
+            const firedKey = `${m.ticker}-${side}`;
+            if (kalshiNbaPropFired2.has(firedKey)) continue;
+
+            // Cross-check with NBA CDN (Kalshi's settlement source)
+            const cdnGameId = nbaCdnGameIds[`${awayAbbr}-${homeAbbr}`] || nbaCdnGameIds[`${awayT.team?.abbreviation}-${homeT.team?.abbreviation}`];
+            if (cdnGameId) {
+              const cdnStat = await getNbaCdnPlayerStat(cdnGameId, parsed.playerName, cfg.stat);
+              if (cdnStat !== null && cdnStat < parsed.line) {
+                console.log(`[kalshi-nba-prop] ${awayAbbr}@${homeAbbr} ${parsed.playerName} ${cfg.stat}: ESPN=${actual} NBA.com=${cdnStat} < ${parsed.line} — MISMATCH, skipping`);
+                continue;
+              }
+              if (cdnStat !== null) {
+                console.log(`[kalshi-nba-prop] ${awayAbbr}@${homeAbbr} ${parsed.playerName} ${cfg.stat}: ESPN=${actual} NBA.com=${cdnStat} ✓ both confirm >= ${parsed.line}`);
+              }
+            }
+            const label = `[kalshi-nba-prop] ${awayAbbr}@${homeAbbr} ${statRow.displayName} ${cfg.stat}=${actual} ${side === 'yes' ? '>=' : '<'} ${parsed.line}`;
+            const placed = await fireKalshiNbaPropOrder(m.ticker, side, label);
+            if (placed) kalshiNbaPropFired2.add(firedKey);
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[kalshi-nba-prop] Error:', e.message?.slice(0, 80));
+    }
+    scheduleKalshiNbaPlayerPropsScan();
+  }, 10000);
+}
+setTimeout(() => {
+  if (typeof hasKalshiAuth === 'function' && hasKalshiAuth()) {
+    console.log('[kalshi-nba-prop] NBA player props scanner started (10s, ESPN PTS/AST/REB, 1sh @ 99¢)');
+    scheduleKalshiNbaPlayerPropsScan();
+  }
+}, 36000);
+
+// ── Kalshi MLB Scanner ──
+// Polls ESPN MLB every 10s. Fires on decided markets: Match, RFI, F5 Winner, F5 Total, F5 Spread,
+// Total, Spread, Team Total. Size: 1sh @ 99¢ (test mode, ~$1/order).
+const kalshiMlbFired = new Set();
+const ESPN_TO_KALSHI_MLB = {
+  'ARI':'AZ','ATL':'ATL','BAL':'BAL','BOS':'BOS','CHC':'CHC','CHW':'CWS','CIN':'CIN','CLE':'CLE',
+  'COL':'COL','DET':'DET','HOU':'HOU','KC':'KC','LAA':'LAA','LAD':'LAD','MIA':'MIA','MIL':'MIL',
+  'MIN':'MIN','NYM':'NYM','NYY':'NYY','OAK':'ATH','ATH':'ATH','PHI':'PHI','PIT':'PIT','SD':'SD',
+  'SEA':'SEA','SF':'SF','STL':'STL','TB':'TB','TEX':'TEX','TOR':'TOR','WSH':'WSH','WAS':'WSH',
+};
+// Gemini verification: ask if the bet is 100% certain based on data
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+async function geminiVerifyBet(label, side) {
+  if (!GEMINI_API_KEY) return false;
+  try {
+    const prompt = `You are a sports data verifier. A bot wants to bet on a sports market. Is this outcome 100% mathematically certain?
+
+Bet: ${label}
+Side: ${side.toUpperCase()}
+
+RULES — these make outcomes CERTAIN across ALL sports (baseball, soccer, basketball, hockey):
+- "TOTAL Over X.5" or "Over X.5 goals" YES: if the actual total in parentheses > X, CERTAIN. Goals/runs/points can only go UP, never down.
+- "TOTAL Over X.5" NO / "FINAL NO Over X.5 (Y)": ONLY certain if FINAL and Y ≤ X.
+- "MATCH→TEAM" with score like "HOM 3-2 AWY": if game is described as FINAL/FT/Full Time, the winner is CERTAIN.
+- "MATCH→TEAM" with score but no FINAL: the team with more goals is currently winning but game might not be over — NOT certain unless explicitly FINAL.
+- "BTTS" (Both Teams To Score) YES: if BOTH teams show ≥1 goal in the score, CERTAIN.
+- "1H→TEAM" (1st Half winner): CERTAIN if halftime score shows that team leading.
+- "Spread TEAM -X.5": CERTAIN only if FINAL and the margin > X.
+- "F5 Over X.5 (live Y)" or "(f5 total Y)" YES: if Y > X, CERTAIN.
+- "TeamTotal Over X.5 (Y)" YES: if Y > X, CERTAIN.
+- Player props "stat=Y >= X" YES: if Y >= X, CERTAIN. Works for ALL sports.
+- "RFI" YES: if runs in 1st > 0, CERTAIN.
+- Hockey goals "goals=Y >= X": if Y >= X, CERTAIN.
+- NBA "assists=Y >= X" or "rebounds=Y >= X" or "points=Y >= X": if Y >= X, CERTAIN.
+- Soccer: goals scored in a match CANNOT be taken back. If score shows 3-2 and you're betting Over 2.5, that's CERTAIN YES.
+- NHL goals "goals=Y >= X": if Y >= X, CERTAIN — goals already scored can't be taken back.
+- NBA "assists=Y >= X" or "rebounds=Y >= X" or "points=Y >= X": if Y >= X, CERTAIN.
+
+Answer ONLY "YES" or "NO". One word.`;
+
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+      signal: AbortSignal.timeout(5000),
+    });
+    const d = await r.json();
+    const answer = (d.candidates?.[0]?.content?.parts?.[0]?.text || '').trim().toUpperCase();
+    return answer === 'YES';
+  } catch (e) {
+    console.log(`[gemini] err: ${e.message?.slice(0, 60)} — defaulting to small bet`);
+    return false;
+  }
+}
+
+async function fireKalshiMlbOrder(ticker, side, label) {
+  try {
+    const ok = await checkKalshiAskAbove90(ticker, side);
+    if (!ok) { console.log(`${label} SKIP (ask < 80¢) on ${ticker}`); return; }
+    const certain = await geminiVerifyBet(label, side);
+    if (!certain) { console.log(`${label} SKIP (Gemini not certain) on ${ticker}`); return; }
+    const count = 14;
+    const body = JSON.stringify({ ticker, action: 'buy', side, type: 'limit', count, [side === 'yes' ? 'yes_price' : 'no_price']: KALSHI_LIMIT_PRICE_CENTS });
+    const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+    const od = await or.json();
+    const filled = od.order?.fill_count_fp || '0';
+    console.log(`${label} → ${side.toUpperCase()} ${count}sh@99¢ [✓GEMINI] on ${ticker} → filled:${filled}`);
+  } catch (e) {
+    console.error(`${label} err:`, e.message?.slice(0, 80));
+  }
+}
+async function fireKalshiMlbPropOrder(ticker, side, label) {
+  try {
+    const ok = await checkKalshiAskAbove90(ticker, side);
+    if (!ok) { console.log(`${label} SKIP (ask < 80¢) on ${ticker}`); return; }
+    const certain = await geminiVerifyBet(label, side);
+    if (!certain) { console.log(`${label} SKIP (Gemini not certain) on ${ticker}`); return; }
+    const count = 14;
+    const body = JSON.stringify({ ticker, action: 'buy', side, type: 'limit', count, [side === 'yes' ? 'yes_price' : 'no_price']: KALSHI_LIMIT_PRICE_CENTS });
+    const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+    const od = await or.json();
+    const filled = od.order?.fill_count_fp || '0';
+    console.log(`${label} → ${side.toUpperCase()} ${count}sh@99¢ [✓GEMINI] on ${ticker} → filled:${filled}`);
+  } catch (e) {
+    console.error(`${label} err:`, e.message?.slice(0, 80));
+  }
+}
+function scheduleKalshiMlbScan() {
+  setTimeout(async () => {
+    try {
+      if (typeof hasKalshiAuth !== 'function' || !hasKalshiAuth()) { scheduleKalshiMlbScan(); return; }
+      const er = await fetch('https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard', { signal: AbortSignal.timeout(5000) });
+      const ed = await er.json();
+      for (const ev of (ed.events || [])) {
+        const comp = ev.competitions?.[0];
+        if (!comp?.competitors?.length) continue;
+        const stateCode = comp.status?.type?.state || '';
+        const status = comp.status?.type?.description || '';
+        const isLive = stateCode === 'in';
+        const isFinal = stateCode === 'post' || status.startsWith('Final');
+        if (!isLive && !isFinal) continue;
+
+        const home = comp.competitors.find(c => c.homeAway === 'home') || comp.competitors[0];
+        const away = comp.competitors.find(c => c.homeAway === 'away') || comp.competitors[1];
+        const hs = parseInt(home.score || 0);
+        const as_ = parseInt(away.score || 0);
+        const total = hs + as_;
+        const period = comp.status?.period || 0; // inning
+        const inningHalfTop = comp.status?.type?.name?.includes('TOP') || (comp.status?.displayClock || '').toLowerCase().includes('top');
+        // ESPN MLB: status.period = inning number (1-9+)
+
+        // Kalshi ticker format: KX{SERIES}-{YY}{MMM}{DD}{HHMM}{AWAY}{HOME} — actual format observed: e.g. 26APR131610HOUSEA (HOU vs SEA where HOU is away)
+        // Wait — url says hou-sea and subtitle "HOU vs SEA"; sub_title format is "AWAY vs HOME"
+        // Verify by event ticker structure: the HOME team appears LAST in ticker in our data
+        // KXMLBGAME-26APR131610HOUSEA : looks like HOU + SEA where SEA is home
+        const d = new Date(ev.date);
+        const et = new Date(d.getTime() - 4 * 3600000);
+        const months = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+        const dateStr = '26' + months[et.getUTCMonth()] + String(et.getUTCDate()).padStart(2, '0');
+        const hh = String(et.getUTCHours()).padStart(2, '0');
+        const mm = String(et.getUTCMinutes()).padStart(2, '0');
+        const hAbbr = ESPN_TO_KALSHI_MLB[home.team?.abbreviation?.toUpperCase()] || home.team?.abbreviation?.toUpperCase() || '';
+        const aAbbr = ESPN_TO_KALSHI_MLB[away.team?.abbreviation?.toUpperCase()] || away.team?.abbreviation?.toUpperCase() || '';
+        if (!hAbbr || !aAbbr) continue;
+        // Note: Kalshi ticker is {AWAY}{HOME} — confirmed by looking at live events
+        const matchKey = `${dateStr}${hh}${mm}${aAbbr}${hAbbr}`;
+
+        // Extract linescores for innings
+        const homeLine = home.linescores || [];
+        const awayLine = away.linescores || [];
+        const homeRunsBy = i => parseInt(homeLine[i]?.value || 0);
+        const awayRunsBy = i => parseInt(awayLine[i]?.value || 0);
+        const runsIn1 = homeRunsBy(0) + awayRunsBy(0);
+        let f5Home = 0, f5Away = 0;
+        for (let i = 0; i < 5; i++) { f5Home += homeRunsBy(i); f5Away += awayRunsBy(i); }
+        const f5Total = f5Home + f5Away;
+        // F5 is locked ONLY when game is in inning 6+ or Final.
+        // Don't trust linescore length alone — entries can appear during in-progress innings
+        const f5Done = period > 5 || isFinal;
+        // ESPN occasionally lags/omits inning rows briefly; only trust F5 settlement-style
+        // decisions once both sides have at least 5 inning entries populated.
+        const f5LinesReady = homeLine.length >= 5 && awayLine.length >= 5;
+        const f5Locked = f5Done && f5LinesReady;
+        // Similarly: 1st inning done only when home team has >= 1 linescore entry (bottom of 1 done)
+        const firstInningDone = homeLine.length >= 1 && awayLine.length >= 1 && (period > 1 || isFinal);
+
+        // 1) MATCH WINNER
+        if (isFinal) {
+          const key = `m-${matchKey}`;
+          if (!kalshiMlbFired.has(key)) {
+            kalshiMlbFired.add(key);
+            const suffix = hs > as_ ? hAbbr : aAbbr;
+            fireKalshiMlbOrder(`KXMLBGAME-${matchKey}-${suffix}`, 'yes', `[kalshi-mlb] ${aAbbr} ${as_}-${hs} ${hAbbr} MATCH→${suffix}`);
+          }
+        }
+
+        // 2) RFI (Run in First Inning) — YES if 1st has a run; NO if 1st done & no runs
+        if (period >= 1) {
+          const rfiYesKey = `rfi-y-${matchKey}`;
+          const rfiNoKey = `rfi-n-${matchKey}`;
+          const oneInningDone = firstInningDone;
+          if (runsIn1 > 0 && !kalshiMlbFired.has(rfiYesKey)) {
+            kalshiMlbFired.add(rfiYesKey);
+            fireKalshiMlbOrder(`KXMLBRFI-${matchKey}`, 'yes', `[kalshi-mlb] ${aAbbr}@${hAbbr} RFI (run in 1st)`);
+          } else if (oneInningDone && runsIn1 === 0 && !kalshiMlbFired.has(rfiNoKey)) {
+            kalshiMlbFired.add(rfiNoKey);
+            fireKalshiMlbOrder(`KXMLBRFI-${matchKey}`, 'no', `[kalshi-mlb] ${aAbbr}@${hAbbr} RFI NO (0 runs 1st)`);
+          }
+        }
+
+        // 3) F5 WINNER — fire at end of 5 based on F5 score
+        if (f5Locked) {
+          const key = `f5-${matchKey}`;
+          if (!kalshiMlbFired.has(key)) {
+            kalshiMlbFired.add(key);
+            const suffix = f5Home > f5Away ? hAbbr : f5Away > f5Home ? aAbbr : 'TIE';
+            fireKalshiMlbOrder(`KXMLBF5-${matchKey}-${suffix}`, 'yes', `[kalshi-mlb] ${aAbbr} ${f5Away}-${f5Home} ${hAbbr} F5→${suffix}`);
+          }
+        }
+
+        // 4) F5 TOTAL Over N.5 — YES when exceeded; NO at end-of-5 if not
+        for (let line = 0; line <= 9; line++) {
+          const mkt = `KXMLBF5TOTAL-${matchKey}-${line + 1}`;
+          const yKey = `f5t-y-${matchKey}-${line}`;
+          const nKey = `f5t-n-${matchKey}-${line}`;
+          if (f5Total > line && !kalshiMlbFired.has(yKey)) {
+            kalshiMlbFired.add(yKey);
+            fireKalshiMlbOrder(mkt, 'yes', `[kalshi-mlb] ${aAbbr}@${hAbbr} F5 Over ${line}.5 (live ${f5Total})`);
+          } else if (f5Locked && f5Total <= line && !kalshiMlbFired.has(nKey)) {
+            kalshiMlbFired.add(nKey);
+            fireKalshiMlbOrder(mkt, 'no', `[kalshi-mlb] ${aAbbr}@${hAbbr} F5 NO Over ${line}.5 (f5 total ${f5Total})`);
+          }
+        }
+
+        // 5) F5 SPREAD — fire at end-of-5 if spread covered
+        if (f5Locked) {
+          for (const line of [1, 2]) {
+            const diff = Math.abs(f5Home - f5Away);
+            const winner = f5Home > f5Away ? hAbbr : f5Away > f5Home ? aAbbr : null;
+            if (!winner) continue;
+            const mkt = `KXMLBF5SPREAD-${matchKey}-${winner}${line + 1}`;
+            const yKey = `f5s-y-${matchKey}-${winner}-${line}`;
+            if (diff > line && !kalshiMlbFired.has(yKey)) {
+              kalshiMlbFired.add(yKey);
+              fireKalshiMlbOrder(mkt, 'yes', `[kalshi-mlb] ${aAbbr}@${hAbbr} F5 Spread ${winner} -${line}.5`);
+            }
+          }
+        }
+
+        // 6) TOTAL Over N.5 (full game)
+        for (let line = 1; line <= 14; line++) {
+          const mkt = `KXMLBTOTAL-${matchKey}-${line + 1}`;
+          const yKey = `tot-y-${matchKey}-${line}`;
+          const nKey = `tot-n-${matchKey}-${line}`;
+          if (total > line && !kalshiMlbFired.has(yKey)) {
+            kalshiMlbFired.add(yKey);
+            fireKalshiMlbOrder(mkt, 'yes', `[kalshi-mlb] ${aAbbr}@${hAbbr} Total Over ${line}.5 (${total})`);
+          } else if (isFinal && total <= line && !kalshiMlbFired.has(nKey)) {
+            kalshiMlbFired.add(nKey);
+            fireKalshiMlbOrder(mkt, 'no', `[kalshi-mlb] ${aAbbr}@${hAbbr} FINAL Total NO Over ${line}.5 (${total})`);
+          }
+        }
+
+        // 7) SPREAD (full game) — fire at Final
+        if (isFinal) {
+          for (const line of [1, 2, 3, 4, 5]) {
+            const diff = Math.abs(hs - as_);
+            const winner = hs > as_ ? hAbbr : aAbbr;
+            const mkt = `KXMLBSPREAD-${matchKey}-${winner}${line + 1}`;
+            const yKey = `sp-y-${matchKey}-${winner}-${line}`;
+            if (diff > line && !kalshiMlbFired.has(yKey)) {
+              kalshiMlbFired.add(yKey);
+              fireKalshiMlbOrder(mkt, 'yes', `[kalshi-mlb] ${aAbbr}@${hAbbr} Spread ${winner} -${line}.5`);
+            }
+          }
+        }
+
+        // 8) TEAM TOTAL
+        for (let line = 1; line <= 9; line++) {
+          for (const [team, sc, abbr] of [[hAbbr, hs, hAbbr], [aAbbr, as_, aAbbr]]) {
+            const mkt = `KXMLBTEAMTOTAL-${matchKey}-${abbr}${line + 1}`;
+            const yKey = `tt-y-${matchKey}-${abbr}-${line}`;
+            const nKey = `tt-n-${matchKey}-${abbr}-${line}`;
+            if (sc > line && !kalshiMlbFired.has(yKey)) {
+              kalshiMlbFired.add(yKey);
+              fireKalshiMlbOrder(mkt, 'yes', `[kalshi-mlb] ${abbr} TeamTotal Over ${line}.5 (${sc})`);
+            } else if (isFinal && sc <= line && !kalshiMlbFired.has(nKey)) {
+              kalshiMlbFired.add(nKey);
+              fireKalshiMlbOrder(mkt, 'no', `[kalshi-mlb] ${abbr} FINAL TeamTotal NO Over ${line}.5 (${sc})`);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[kalshi-mlb] Error:', e.message?.slice(0, 80));
+    }
+    scheduleKalshiMlbScan();
+  }, 3000);
+}
+setTimeout(() => {
+  if (typeof hasKalshiAuth === 'function' && hasKalshiAuth()) {
+    console.log('[kalshi-mlb] MLB scanner started (3s, 43sh @ 99¢ — 8 market types)');
+    scheduleKalshiMlbScan();
+  }
+}, 32000);
+
+// ── Kalshi MLB Player Props Scanner ──
+// Polls ESPN MLB summary + Kalshi player prop events. Fires when live stat >= threshold.
+// Series: KXMLBHR (home runs), KXMLBHIT (hits), KXMLBKS (strikeouts), KXMLBHRR (H+R+RBI), KXMLBTB (total bases lower bound)
+const kalshiMlbPropFired = new Set();
+const kalshiMlbPropEventCache = {}; // matchKey → { series → [{ticker, player, threshold}], ts }
+
+function parsePropMarketTicker(ticker, matchKey) {
+  // KX{SERIES}-{matchKey}-{team}{F}{LASTNAME}{jersey}-{threshold}
+  const parts = ticker.split('-');
+  if (parts.length < 4) return null;
+  const idxMatch = parts.indexOf(matchKey);
+  if (idxMatch < 0) return null;
+  const playerPart = parts[idxMatch + 1]; // e.g., HOUJALTUVE27
+  const threshold = parseInt(parts[idxMatch + 2]);
+  if (isNaN(threshold)) return null;
+  // Strip trailing digits (jersey) to get team+first+lastname
+  const playerKey = playerPart.replace(/\d+$/, '');
+  return { playerKey, threshold };
+}
+function espnPlayerKey(teamAbbr, displayName) {
+  // e.g., "Jose Altuve", HOU → "HOUJALTUVE"
+  const parts = (displayName || '').trim().split(/\s+/);
+  if (parts.length < 2) return null;
+  const first = parts[0][0].toUpperCase();
+  const last = parts.slice(1).join('').toUpperCase().replace(/[^A-Z]/g, '');
+  return `${teamAbbr.toUpperCase()}${first}${last}`;
+}
+async function fetchKalshiPropMarkets(matchKey, series) {
+  const cache = kalshiMlbPropEventCache[matchKey] || { series: {}, ts: 0 };
+  if (cache.series[series] && Date.now() - cache.ts < 60000) return cache.series[series];
+  try {
+    const r = await fetch(`https://api.elections.kalshi.com/trade-api/v2/events/${series}-${matchKey}`, { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) { cache.series[series] = []; kalshiMlbPropEventCache[matchKey] = cache; cache.ts = Date.now(); return []; }
+    const d = await r.json();
+    const items = [];
+    for (const m of (d.markets || [])) {
+      const p = parsePropMarketTicker(m.ticker, matchKey);
+      if (!p) continue;
+      items.push({ ticker: m.ticker, playerKey: p.playerKey, threshold: p.threshold });
+    }
+    cache.series[series] = items;
+    cache.ts = Date.now();
+    kalshiMlbPropEventCache[matchKey] = cache;
+    return items;
+  } catch { return []; }
+}
+
+// MLB Official API cross-check (statsapi.mlb.com — Kalshi's settlement source)
+async function getMlbOfficialPlayerStats(espnGameDate) {
+  try {
+    // Get today's MLB schedule
+    const dateStr = espnGameDate.toISOString().slice(0, 10);
+    const r = await fetch(`https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${dateStr}`, { signal: AbortSignal.timeout(5000) });
+    const d = await r.json();
+    const games = d.dates?.[0]?.games || [];
+    const allPlayers = {};
+    for (const g of games) {
+      if (g.status?.detailedState !== 'Final' && g.status?.detailedState !== 'In Progress') continue;
+      try {
+        const br = await fetch(`https://statsapi.mlb.com/api/v1/game/${g.gamePk}/boxscore`, { signal: AbortSignal.timeout(5000) });
+        const box = await br.json();
+        for (const side of ['away', 'home']) {
+          const teamAbbr = box.teams?.[side]?.team?.abbreviation || '';
+          for (const [id, p] of Object.entries(box.teams?.[side]?.players || {})) {
+            const name = p.person?.fullName || '';
+            if (!name) continue;
+            const bat = p.stats?.batting || {};
+            const pit = p.stats?.pitching || {};
+            const norm = name.toLowerCase().replace(/[^a-z ]/g, '').trim().split(' ').pop(); // last name
+            const key = `${teamAbbr.toUpperCase()}-${norm}`;
+            allPlayers[key] = {
+              h: bat.hits || 0, hr: bat.homeRuns || 0, rbi: bat.rbi || 0,
+              r: bat.runs || 0, tb: bat.totalBases || 0, k: pit.strikeOuts || 0,
+              name,
+            };
+          }
+        }
+      } catch {}
+    }
+    return allPlayers;
+  } catch { return {}; }
+}
+
+let mlbOfficialCache = { ts: 0, data: {} };
+
+async function getMlbOfficialStat(playerKey, statFn) {
+  // Refresh cache every 30s
+  if (Date.now() - mlbOfficialCache.ts > 30000) {
+    mlbOfficialCache.data = await getMlbOfficialPlayerStats(new Date());
+    mlbOfficialCache.ts = Date.now();
+  }
+  // playerKey format: TEAMPLAYERNAME (e.g., CHCIHAPP8) — extract team + last name
+  const m = playerKey.match(/^([A-Z]{2,4})([A-Z])(.+?)(\d+)?$/i);
+  if (!m) return null;
+  const teamAbbr = m[1].toUpperCase();
+  const lastName = (m[2] + m[3]).toLowerCase().replace(/\d+$/, '');
+  // Search for matching player
+  for (const [key, stats] of Object.entries(mlbOfficialCache.data)) {
+    if (key.startsWith(teamAbbr + '-') && key.toLowerCase().includes(lastName.slice(0, 4))) {
+      return statFn(stats);
+    }
+  }
+  return null;
+}
+
+function scheduleKalshiMlbPropsScan() {
+  setTimeout(async () => {
+    try {
+      if (typeof hasKalshiAuth !== 'function' || !hasKalshiAuth()) { scheduleKalshiMlbPropsScan(); return; }
+      const er = await fetch('https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard', { signal: AbortSignal.timeout(5000) });
+      const ed = await er.json();
+      for (const ev of (ed.events || [])) {
+        const comp = ev.competitions?.[0];
+        if (!comp?.competitors?.length) continue;
+        const stateCode = comp.status?.type?.state || '';
+        // NHL player props are noisy in live feeds (goal reversals/stat corrections).
+        // Only fire after final box score is posted.
+        if (stateCode !== 'post') continue;
+
+        const home = comp.competitors.find(c => c.homeAway === 'home') || comp.competitors[0];
+        const away = comp.competitors.find(c => c.homeAway === 'away') || comp.competitors[1];
+        const d = new Date(ev.date);
+        const et = new Date(d.getTime() - 4 * 3600000);
+        const months = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+        const dateStr = '26' + months[et.getUTCMonth()] + String(et.getUTCDate()).padStart(2, '0');
+        const hh = String(et.getUTCHours()).padStart(2, '0');
+        const mm = String(et.getUTCMinutes()).padStart(2, '0');
+        const hAbbr = ESPN_TO_KALSHI_MLB[home.team?.abbreviation?.toUpperCase()] || home.team?.abbreviation?.toUpperCase() || '';
+        const aAbbr = ESPN_TO_KALSHI_MLB[away.team?.abbreviation?.toUpperCase()] || away.team?.abbreviation?.toUpperCase() || '';
+        if (!hAbbr || !aAbbr) continue;
+        const matchKey = `${dateStr}${hh}${mm}${aAbbr}${hAbbr}`;
+
+        // Fetch ESPN box score
+        let box;
+        try {
+          const sR = await fetch(`https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/summary?event=${ev.id}`, { signal: AbortSignal.timeout(5000) });
+          box = await sR.json();
+        } catch { continue; }
+
+        // Build player → {stat: value} map
+        // CRITICAL: batting group has 'AB' in labels, pitching group has 'IP' in labels
+        // Only read H/HR/RBI/R/TB from BATTING group (has AB column)
+        // Only read K from PITCHING group (has IP column)
+        // Pitching H = hits ALLOWED (not player's hits!) — must NOT be used for HIT/HRR/TB markets
+        const players = {}; // playerKey → { h, hr, rbi, r, k, tb }
+        for (const teamBox of (box?.boxscore?.players || [])) {
+          const teamAbbrRaw = teamBox.team?.abbreviation?.toUpperCase() || '';
+          const teamAbbr = ESPN_TO_KALSHI_MLB[teamAbbrRaw] || teamAbbrRaw;
+          for (const group of (teamBox.statistics || [])) {
+            const labels = group.labels || [];
+            const isBatting = labels.includes('AB');
+            const isPitching = labels.includes('IP');
+
+            for (const a of (group.athletes || [])) {
+              const name = a.athlete?.displayName;
+              const key = espnPlayerKey(teamAbbr, name);
+              if (!key) continue;
+              const st = a.stats || [];
+              const existing = players[key] || { h:0, hr:0, rbi:0, r:0, k:0, tbMin:0, ab:0 };
+
+              if (isBatting) {
+                // BATTING stats: H, HR, RBI, R are the player's OWN stats
+                const hIdx = labels.indexOf('H');
+                const hrIdx = labels.indexOf('HR');
+                const rbiIdx = labels.indexOf('RBI');
+                const rIdx = labels.indexOf('R');
+                const abIdx = labels.indexOf('AB');
+                const ab = abIdx >= 0 ? parseInt(st[abIdx] || 0) : 0;
+                const h = hIdx >= 0 ? parseInt(st[hIdx] || 0) : 0;
+                const hr = hrIdx >= 0 ? parseInt(st[hrIdx] || 0) : 0;
+                const rbi = rbiIdx >= 0 ? parseInt(st[rbiIdx] || 0) : 0;
+                const r = rIdx >= 0 ? parseInt(st[rIdx] || 0) : 0;
+                // Sanity: H can't exceed AB
+                if (ab > 0 && h > ab) continue;
+                if (ab === 0 && (h > 0 || hr > 0 || rbi > 0 || r > 0)) continue;
+                const tbMin = h + 3 * hr;
+                existing.h = Math.max(existing.h, h);
+                existing.hr = Math.max(existing.hr, hr);
+                existing.rbi = Math.max(existing.rbi, rbi);
+                existing.r = Math.max(existing.r, r);
+                existing.tbMin = Math.max(existing.tbMin, tbMin);
+                existing.ab = Math.max(existing.ab, ab);
+              } else if (isPitching) {
+                // PITCHING stats: only K (strikeouts) is the pitcher's own stat
+                // H/R/HR in pitching = ALLOWED, NOT the pitcher's batting stats
+                const kIdx = labels.indexOf('K');
+                const k = kIdx >= 0 ? parseInt(st[kIdx] || 0) : 0;
+                existing.k = Math.max(existing.k, k);
+              }
+              players[key] = existing;
+            }
+          }
+        }
+
+        // For each Kalshi series, check markets
+        const seriesToStat = {
+          // KXMLBHIT: p => p.h,    // DISABLED — hit vs error is subjective scorer call
+          KXMLBHR:  p => p.hr,       // objective — ball left the park
+          KXMLBKS:  p => p.k,        // objective — strikeout is clear
+          // KXMLBHRR: p => p.h + p.r + p.rbi, // DISABLED — depends on hits (14 losses, worst offender)
+          // KXMLBTB:  p => p.tbMin, // DISABLED — depends on hits being correct
+        };
+        for (const [series, stat] of Object.entries(seriesToStat)) {
+          const markets = await fetchKalshiPropMarkets(matchKey, series);
+          for (const mkt of markets) {
+            if (kalshiMlbPropFired.has(mkt.ticker)) continue;
+            const p = players[mkt.playerKey];
+            if (!p) continue;
+            const val = stat(p);
+            // Guardrails: reject clearly impossible/suspect values to avoid bad auto-fires
+            // when upstream summary payload briefly includes non-game stat rows.
+            if (series === 'KXMLBHIT' && (p.ab > 8 || val > 6)) continue;
+            if (series === 'KXMLBHR' && val > 4) continue;
+            if (series === 'KXMLBHRR' && val > 12) continue;
+            if (series === 'KXMLBTB' && val > 16) continue;
+            if (series === 'KXMLBKS' && val > 20) continue;
+            if (val >= mkt.threshold) {
+              // Cross-check with MLB Official API
+              const mlbVal = await getMlbOfficialStat(mkt.playerKey, stat);
+              if (mlbVal !== null && mlbVal < mkt.threshold) {
+                console.log(`[kalshi-mlb-prop] ${mkt.playerKey} ESPN=${val} MLB.com=${mlbVal} < ${mkt.threshold} — MISMATCH, skipping`);
+                continue;
+              }
+              if (mlbVal !== null) {
+                console.log(`[kalshi-mlb-prop] ${mkt.playerKey} ESPN=${val} MLB.com=${mlbVal} ✓ both confirm >= ${mkt.threshold}`);
+              }
+              kalshiMlbPropFired.add(mkt.ticker);
+              const statName = series.replace('KXMLB','').toLowerCase();
+              fireKalshiMlbPropOrder(mkt.ticker, 'yes', `[kalshi-mlb-prop] ${mkt.playerKey} ${statName}=${val} >= ${mkt.threshold}`);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[kalshi-mlb-prop] Error:', e.message?.slice(0, 100));
+    }
+    scheduleKalshiMlbPropsScan();
+  }, 3000);
+}
+// ── Kalshi NBA Extended Scanner (totals, 1H, quarters, spreads, team totals) ──
+function scheduleKalshiNbaExtScan() {
+  setTimeout(async () => {
+    try {
+      if (typeof hasKalshiAuth !== 'function' || !hasKalshiAuth()) { scheduleKalshiNbaExtScan(); return; }
+      const er = await fetch('https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard', { signal: AbortSignal.timeout(5000) });
+      const ed = await er.json();
+      for (const ev of (ed.events || [])) {
+        const comp = ev.competitions?.[0];
+        if (!comp?.competitors?.length) continue;
+        const stateCode = comp.status?.type?.state || '';
+        const status = comp.status?.type?.description || '';
+        const isLive = stateCode === 'in';
+        const isFinal = stateCode === 'post' || status.startsWith('Final');
+        if (!isLive && !isFinal) continue;
+        const home = comp.competitors.find(c => c.homeAway === 'home') || comp.competitors[0];
+        const away = comp.competitors.find(c => c.homeAway === 'away') || comp.competitors[1];
+        const hs = parseInt(home.score || 0); const as_ = parseInt(away.score || 0);
+        const total = hs + as_;
+        const period = comp.status?.period || 0;
+        const homeLine = home.linescores || []; const awayLine = away.linescores || [];
+        const d2 = new Date(ev.date); const et = new Date(d2.getTime() - 4 * 3600000);
+        const months = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+        const dateStr = '26' + months[et.getUTCMonth()] + String(et.getUTCDate()).padStart(2, '0');
+        const hAbbr = ESPN_TO_KALSHI_NBA[home.team?.abbreviation?.toUpperCase()] || home.team?.abbreviation?.toUpperCase() || '';
+        const aAbbr = ESPN_TO_KALSHI_NBA[away.team?.abbreviation?.toUpperCase()] || away.team?.abbreviation?.toUpperCase() || '';
+        if (!hAbbr || !aAbbr) continue;
+        const matchKey = `${dateStr}${aAbbr}${hAbbr}`;
+        async function nbaFire(ticker, side, label) {
+          const fk = `nba-${ticker}`;
+          if (kalshiNbaFired.has(fk)) return;
+          const ok = await checkKalshiAskAbove90(ticker, side);
+          if (!ok) return;
+          kalshiNbaFired.add(fk);
+          try {
+            const count = kalshiCappedCount(14);
+            const body = JSON.stringify({ ticker, action: 'buy', side, type: 'limit', count, [side === 'yes' ? 'yes_price' : 'no_price']: KALSHI_LIMIT_PRICE_CENTS });
+            const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+            const od = await or.json();
+            console.log(`[kalshi-nba] ${label} → ${side.toUpperCase()} ${count}sh@99¢ on ${ticker} → filled:${od.order?.fill_count_fp || '0'}`);
+          } catch {}
+        }
+        const qH = (i) => parseFloat(homeLine[i]?.value || 0);
+        const qA = (i) => parseFloat(awayLine[i]?.value || 0);
+        const h1H = qH(0)+qH(1); const h1A = qA(0)+qA(1); const h1T = h1H+h1A;
+        const h1Done = homeLine.length >= 2 && awayLine.length >= 2 && (period > 2 || isFinal);
+        // 1) MATCH WINNER
+        if (isFinal) { const w = hs > as_ ? hAbbr : aAbbr; nbaFire(`KXNBAGAME-${matchKey}-${w}`, 'yes', `${aAbbr}@${hAbbr} FINAL ${as_}-${hs} MATCH→${w}`); }
+        // 2) 1H WINNER
+        if (h1Done) { const w = h1H > h1A ? hAbbr : h1A > h1H ? aAbbr : 'TIE'; nbaFire(`KXNBA1HWINNER-${matchKey}-${w}`, 'yes', `${aAbbr}@${hAbbr} 1H ${h1A}-${h1H}→${w}`); }
+        // 3) QUARTER WINNERS
+        for (let q = 0; q < 4; q++) {
+          if (homeLine.length <= q || awayLine.length <= q || (period <= q+1 && !isFinal)) continue;
+          const qWin = qH(q) > qA(q) ? hAbbr : qA(q) > qH(q) ? aAbbr : 'TIE';
+          const qS = ['KXNBA1QWINNER','KXNBA2QWINNER','KXNBA3QWINNER','KXNBA4QWINNER'][q];
+          if (qS) nbaFire(`${qS}-${matchKey}-${qWin}`, 'yes', `${aAbbr}@${hAbbr} Q${q+1} ${qA(q)}-${qH(q)}→${qWin}`);
+        }
+        // 4) TOTAL O/U
+        for (const line of [180,190,200,205,210,215,220,225,230,235,240,245,250]) {
+          if (total > line) nbaFire(`KXNBATOTAL-${matchKey}-${line+1}`, 'yes', `${aAbbr}@${hAbbr} Total ${total}>${line}.5`);
+        }
+        if (isFinal) { for (const line of [180,190,200,205,210,215,220,225,230,235,240,245,250]) {
+          if (total <= line) nbaFire(`KXNBATOTAL-${matchKey}-${line+1}`, 'no', `${aAbbr}@${hAbbr} FINAL Total≤${line}.5 NO`);
+        }}
+        // 5) 1H TOTAL
+        if (h1Done) { for (const line of [90,95,100,105,110,115,120,125,130]) {
+          if (h1T > line) nbaFire(`KXNBA1HTOTAL-${matchKey}-${line+1}`, 'yes', `${aAbbr}@${hAbbr} 1H ${h1T}>${line}.5`);
+          else nbaFire(`KXNBA1HTOTAL-${matchKey}-${line+1}`, 'no', `${aAbbr}@${hAbbr} 1H ${h1T}≤${line}.5 NO`);
+        }}
+        // 6) SPREAD (Final)
+        if (isFinal) { const diff = Math.abs(hs-as_); const w = hs>as_?hAbbr:aAbbr;
+          for (const line of [1,3,5,7,9,11,13]) { if (diff > line) nbaFire(`KXNBASPREAD-${matchKey}-${w}${line}`, 'yes', `${aAbbr}@${hAbbr} SPREAD ${w}-${line}.5`); }
+        }
+        // 7) TEAM TOTALS
+        for (const [abbr,sc] of [[hAbbr,hs],[aAbbr,as_]]) {
+          for (const line of [90,95,100,105,110,115,120,125,130]) {
+            if (sc > line) nbaFire(`KXNBATEAMTOTAL-${matchKey}-${abbr}${line+1}`, 'yes', `${abbr} TT ${sc}>${line}.5`);
+          }
+          if (isFinal) { for (const line of [90,95,100,105,110,115,120,125,130]) {
+            if (sc <= line) nbaFire(`KXNBATEAMTOTAL-${matchKey}-${abbr}${line+1}`, 'no', `${abbr} FINAL TT≤${line}.5 NO`);
+          }}
+        }
+      }
+    } catch (e) { console.error('[kalshi-nba] Error:', e.message?.slice(0, 80)); }
+    scheduleKalshiNbaExtScan();
+  }, 3000);
+}
+setTimeout(() => {
+  if (typeof hasKalshiAuth === 'function' && hasKalshiAuth()) {
+    console.log('[kalshi-nba-ext] NBA extended scanner started (3s — totals, 1H, quarters, spreads)');
+    scheduleKalshiNbaExtScan();
+  }
+}, 33000);
+
+// MLB player props re-enabled — fixed batting vs pitching group parsing
+setTimeout(() => {
+  if (typeof hasKalshiAuth === 'function' && hasKalshiAuth()) {
+    console.log('[kalshi-mlb-prop] MLB player props scanner started (3s, 1sh @ 99¢ — FIXED: batting only for HIT/HR/RBI/TB)');
+    scheduleKalshiMlbPropsScan();
+  }
+}, 40000);
+
+// ── Kalshi US City High-Temperature Scanner (multi-city) ──
+// Polls NWS observations. When today's observed max exceeds a bucket's upper bound, fire NO 99¢.
+const KALSHI_WEATHER_CITIES = [
+  { name: 'phl', station: 'KPHL', series: 'KXHIGHPHIL' },
+  { name: 'chi', station: 'KORD', series: 'KXHIGHCHI' },
+  { name: 'nyc', station: 'KJFK', series: 'KXHIGHNY' },
+  { name: 'mia', station: 'KMIA', series: 'KXHIGHMIA' },
+  { name: 'aus', station: 'KAUS', series: 'KXHIGHAUS' },
+  { name: 'lax', station: 'KLAX', series: 'KXHIGHLAX' },
+  { name: 'den', station: 'KDEN', series: 'KXHIGHDEN' },
+  { name: 'dc', station: 'KDCA', series: 'KXHIGHTDC' },
+  { name: 'msp', station: 'KMSP', series: 'KXHIGHTMIN' },
+  { name: 'bos', station: 'KBOS', series: 'KXHIGHTBOS' },
+  { name: 'dfw', station: 'KDFW', series: 'KXHIGHTDAL' },
+  { name: 'hou', station: 'KIAH', series: 'KXHIGHTHOU' },
+  { name: 'atl', station: 'KATL', series: 'KXHIGHTATL' },
+  { name: 'lv', station: 'KLAS', series: 'KXHIGHTLV' },
+  { name: 'nola', station: 'KMSY', series: 'KXHIGHTNOLA' },
+  { name: 'phx', station: 'KPHX', series: 'KXHIGHTPHX' },
+  { name: 'sea', station: 'KSEA', series: 'KXHIGHTSEA' },
+  { name: 'sfo', station: 'KSFO', series: 'KXHIGHTSFO' },
+  { name: 'okc', station: 'KOKC', series: 'KXHIGHTOKC' },
+  { name: 'sat', station: 'KSAT', series: 'KXHIGHTSATX' },
+];
+const kalshiWeatherFired = new Set();
+function parseKalshiTempMarket(m) {
+  const t = (m.yes_sub_title || '').toLowerCase();
+  let match;
+  if ((match = t.match(/^(\d+)°?\s*or\s*below/))) return { type: 'below', low: -Infinity, high: parseInt(match[1]) };
+  if ((match = t.match(/^(\d+)°?\s*or\s*above/))) return { type: 'above', low: parseInt(match[1]), high: Infinity };
+  if ((match = t.match(/^(\d+)°?\s*to\s*(\d+)/))) return { type: 'between', low: parseInt(match[1]), high: parseInt(match[2]) };
+  return null;
+}
+
+// ── Kalshi NHL Player Props Scanner ──
+// ESPN NHL box score: G (goals) at label index, A (assists), SV (saves for goalies)
+const kalshiNhlPropFired = new Set();
+const kalshiNhlPropCache = {}; // matchKey → { series → markets[], ts }
+
+async function fetchKalshiNhlPropMarkets(matchKey, series) {
+  const cache = kalshiNhlPropCache[matchKey] || { series: {}, ts: 0 };
+  if (cache.series[series] && Date.now() - cache.ts < 60000) return cache.series[series];
+  try {
+    const r = await fetch(`https://api.elections.kalshi.com/trade-api/v2/events/${series}-${matchKey}`, { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) { cache.series[series] = []; kalshiNhlPropCache[matchKey] = cache; cache.ts = Date.now(); return []; }
+    const d = await r.json();
+    const items = [];
+    for (const m of (d.markets || [])) {
+      const p = parsePropMarketTicker(m.ticker, matchKey);
+      if (!p) continue;
+      items.push({ ticker: m.ticker, playerKey: p.playerKey, threshold: p.threshold });
+    }
+    cache.series[series] = items;
+    cache.ts = Date.now();
+    kalshiNhlPropCache[matchKey] = cache;
+    return items;
+  } catch { return []; }
+}
+
+function scheduleKalshiNhlPropsScan() {
+  setTimeout(async () => {
+    try {
+      if (typeof hasKalshiAuth !== 'function' || !hasKalshiAuth()) { scheduleKalshiNhlPropsScan(); return; }
+      const er = await fetch('https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard', { signal: AbortSignal.timeout(5000) });
+      const ed = await er.json();
+      for (const ev of (ed.events || [])) {
+        const comp = ev.competitions?.[0];
+        if (!comp?.competitors?.length) continue;
+        const stateCode = comp.status?.type?.state || '';
+        if (stateCode !== 'in' && stateCode !== 'post') continue;
+        const home = comp.competitors.find(c => c.homeAway === 'home') || comp.competitors[0];
+        const away = comp.competitors.find(c => c.homeAway === 'away') || comp.competitors[1];
+        const d2 = new Date(ev.date); const et = new Date(d2.getTime() - 4 * 3600000);
+        const months = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+        const dateStr = '26' + months[et.getUTCMonth()] + String(et.getUTCDate()).padStart(2, '0');
+        const hAbbr = ESPN_TO_KALSHI_NHL[home.team?.abbreviation] || home.team?.abbreviation || '';
+        const aAbbr = ESPN_TO_KALSHI_NHL[away.team?.abbreviation] || away.team?.abbreviation || '';
+        if (!hAbbr || !aAbbr) continue;
+        const matchKey = `${dateStr}${aAbbr}${hAbbr}`;
+
+        // Fetch box score
+        let box;
+        try {
+          const sR = await fetch(`https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/summary?event=${ev.id}`, { signal: AbortSignal.timeout(5000) });
+          box = await sR.json();
+        } catch { continue; }
+
+        // Build player stats: goals, assists, saves
+        const players = {}; // key → { g, a, sv }
+        for (const teamBox of (box?.boxscore?.players || [])) {
+          const teamAbbrRaw = teamBox.team?.abbreviation?.toUpperCase() || '';
+          const teamAbbr = ESPN_TO_KALSHI_NHL[teamAbbrRaw] || teamAbbrRaw;
+          for (const group of (teamBox.statistics || [])) {
+            const labels = group.labels || [];
+            const isGoalie = group.name === 'goalies' || labels.includes('SA');
+            const gIdx = labels.indexOf('G');
+            const aIdx = labels.indexOf('A');
+            const svIdx = labels.indexOf('SV');
+            for (const a of (group.athletes || [])) {
+              const name = a.athlete?.displayName;
+              const key = espnPlayerKey(teamAbbr, name);
+              if (!key) continue;
+              const st = a.stats || [];
+              const existing = players[key] || { g: 0, a: 0, sv: 0 };
+              if (isGoalie) {
+                // Goalie: SV = saves made
+                if (svIdx >= 0) existing.sv = Math.max(existing.sv, parseInt(st[svIdx] || 0));
+              } else {
+                // Skater: G = goals scored, A = assists
+                if (gIdx >= 0) existing.g = Math.max(existing.g, parseInt(st[gIdx] || 0));
+                if (aIdx >= 0) existing.a = Math.max(existing.a, parseInt(st[aIdx] || 0));
+              }
+              players[key] = existing;
+            }
+          }
+        }
+
+        // Check Kalshi markets
+        const seriesToStat = {
+          KXNHLGOAL: p => p.g,
+          KXNHLAST: p => p.a,
+          KXNHLPTS: p => p.g + p.a,
+          KXNHLSAVES: p => p.sv,
+        };
+        for (const [series, stat] of Object.entries(seriesToStat)) {
+          const markets = await fetchKalshiNhlPropMarkets(matchKey, series);
+          for (const mkt of markets) {
+            if (kalshiNhlPropFired.has(mkt.ticker)) continue;
+            const p = players[mkt.playerKey];
+            if (!p) continue;
+            const val = stat(p);
+            if (val >= mkt.threshold) {
+              const totalGoals = parseInt(home.score || 0) + parseInt(away.score || 0);
+              if (series === 'KXNHLGOAL' && val > totalGoals) continue;
+              kalshiNhlPropFired.add(mkt.ticker);
+              const statName = series.replace('KXNHL', '').toLowerCase();
+              try {
+                const ok = await checkKalshiAskAbove90(mkt.ticker, 'yes');
+                if (!ok) continue;
+                // Cross-check with NHL official API
+                const { getNhlPlayerStat, getNhlGameId, refreshNhlGameIds } = await import('./scripts/nhl-api.mjs');
+                await refreshNhlGameIds();
+                const nhlGameId = getNhlGameId(away.team?.abbreviation, home.team?.abbreviation);
+                if (nhlGameId) {
+                  const nhlStatMap = { KXNHLGOAL: 'goals', KXNHLAST: 'assists', KXNHLPTS: 'points', KXNHLSAVES: 'saves' };
+                  const playerName = mkt.playerKey.replace(/^[A-Z]{2,4}/, '').replace(/\d+$/, '');
+                  const nhlVal = await getNhlPlayerStat(nhlGameId, playerName, nhlStatMap[series]);
+                  if (nhlVal !== null && nhlVal < mkt.threshold) {
+                    console.log(`[kalshi-nhl-prop] ${mkt.playerKey} ${statName}: ESPN=${val} NHL.com=${nhlVal} < ${mkt.threshold} — MISMATCH, skipping`);
+                    continue;
+                  }
+                  if (nhlVal !== null) console.log(`[kalshi-nhl-prop] ${mkt.playerKey} ${statName}: ESPN=${val} NHL.com=${nhlVal} ✓ both confirm >= ${mkt.threshold}`);
+                }
+                const count = 14;
+                const body = JSON.stringify({ ticker: mkt.ticker, action: 'buy', side: 'yes', type: 'limit', count, yes_price: KALSHI_LIMIT_PRICE_CENTS });
+                const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+                const od = await or.json();
+                console.log(`[kalshi-nhl-prop] ${mkt.playerKey} ${statName}=${val} >= ${mkt.threshold} → YES ${count}sh@99¢ on ${mkt.ticker} → filled:${od.order?.fill_count_fp || '0'}`);
+              } catch {}
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[kalshi-nhl-prop] Error:', e.message?.slice(0, 80));
+    }
+    scheduleKalshiNhlPropsScan();
+  }, 5000);
+}
+setTimeout(() => {
+  if (typeof hasKalshiAuth === 'function' && hasKalshiAuth()) {
+    console.log('[kalshi-nhl-prop] NHL player props started (5s, ESPN+NHL dual-check, 14sh @ 99¢)');
+    scheduleKalshiNhlPropsScan();
+  }
+}, 42000);
+
+// ── Kalshi Crypto 15m Scanner ──
+// Same strategy as Poly: check Binance price vs Kalshi target, buy winning side at 99.9¢
+const kalshiCryptoFired = new Set();
+const KALSHI_CRYPTO_SERIES = [
+  { series: 'KXBTC15M', symbol: 'BTCUSDT', name: 'BTC' },
+  { series: 'KXETH15M', symbol: 'ETHUSDT', name: 'ETH' },
+  { series: 'KXXRP15M', symbol: 'XRPUSDT', name: 'XRP' },
+  { series: 'KXSOL15M', symbol: 'SOLUSDT', name: 'SOL' },
+  { series: 'KXBNB15M', symbol: 'BNBUSDT', name: 'BNB' },
+];
+
+function scheduleKalshiCryptoScan() {
+  setTimeout(async () => {
+    try {
+      if (typeof hasKalshiAuth !== 'function' || !hasKalshiAuth()) { scheduleKalshiCryptoScan(); return; }
+
+      // BTC + ETH + SOL + XRP
+      for (const coin of KALSHI_CRYPTO_SERIES.slice(0, 4)) {
+      try {
+        // Get current price
+        const pR = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${coin.symbol}`, { signal: AbortSignal.timeout(3000) });
+        const pD = await pR.json();
+        const currentPrice = parseFloat(pD.price);
+        if (!currentPrice) { scheduleKalshiCryptoScan(); return; }
+
+        // Get open events
+        const eR = await fetch(`https://api.elections.kalshi.com/trade-api/v2/events?series_ticker=${coin.series}&status=open&limit=5`, { signal: AbortSignal.timeout(5000) });
+        const eD = await eR.json();
+
+        for (const ev of (eD.events || [])) {
+          const mR = await fetch(`https://api.elections.kalshi.com/trade-api/v2/events/${ev.event_ticker}`, { signal: AbortSignal.timeout(5000) });
+          const mD = await mR.json();
+
+          for (const m of (mD.markets || [])) {
+            if (kalshiCryptoFired.has(m.ticker)) continue;
+            if (m.status !== 'active') continue;
+
+            // Check: is market closing in the next 15 seconds?
+            const closeTime = m.close_time ? new Date(m.close_time).getTime() : 0;
+            const now = Date.now();
+            const secsToClose = (closeTime - now) / 1000;
+            if (secsToClose > 20 || secsToClose < 0) continue; // only fire in last 20s
+
+            // Extract target price
+            const targetMatch = (m.yes_sub_title || '').match(/\$?([\d,]+\.?\d*)/);
+            if (!targetMatch) continue;
+            const target = parseFloat(targetMatch[1].replace(/,/g, ''));
+            if (!target) continue;
+
+            const diff = currentPrice - target;
+
+            // Check if "super down or up" — one side's ask must be near $1 (no offers to sell)
+            const yesAsk = parseFloat(m.yes_ask_dollars || '1');
+            const noAsk = parseFloat(m.no_ask_dollars || '1');
+
+            let side = null;
+            // Up wins: YES priced at 97.7¢+, price above target
+            if (diff > 0 && yesAsk >= 0.977) side = 'yes';
+            // Down wins: NO priced at 97.7¢+, price below target
+            else if (diff < 0 && noAsk >= 0.977) side = 'no';
+            if (!side) continue;
+
+            try {
+              const count = kalshiCappedCount(14);
+              const priceField = side === 'yes' ? 'yes_price_dollars' : 'no_price_dollars';
+              const body = JSON.stringify({
+                ticker: m.ticker, action: 'buy', side, type: 'limit', count,
+                [priceField]: '0.996',
+              });
+              const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+              const od = await or.json();
+              const filled = parseFloat(od.order?.fill_count_fp || '0');
+              const errMsg = od.error?.message || '';
+              if (errMsg) {
+                // Fallback: try integer cents if dollars field not supported
+                console.log(`[kalshi-crypto] ${coin.name} 99.6¢ err: ${errMsg.slice(0,80)} — retry at 99¢`);
+                const body2 = JSON.stringify({ ticker: m.ticker, action: 'buy', side, type: 'limit', count, [side === 'yes' ? 'yes_price' : 'no_price']: 99 });
+                const or2 = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body: body2 });
+                const od2 = await or2.json();
+                const filled2 = parseFloat(od2.order?.fill_count_fp || '0');
+                console.log(`[kalshi-crypto] ${coin.name} fallback ${count}sh@99¢ → filled:${filled2}`);
+                if (filled2 > 0) kalshiCryptoFired.add(m.ticker);
+              } else {
+                console.log(`[kalshi-crypto] ${coin.name} $${currentPrice.toFixed(2)} vs $${target.toFixed(2)} | ${secsToClose.toFixed(0)}s left → ${side.toUpperCase()} ${count}sh@99.6¢ on ${m.ticker} → filled:${filled}`);
+                // Only stop retrying once we get a fill
+                if (filled > 0) kalshiCryptoFired.add(m.ticker);
+              }
+            } catch (e) {
+              console.error(`[kalshi-crypto] err:`, e.message?.slice(0, 80));
+            }
+          }
+        }
+      } catch {}
+      } // end for coin loop
+    } catch (e) {
+      console.error('[kalshi-crypto] Error:', e.message?.slice(0, 80));
+    }
+    scheduleKalshiCryptoScan();
+  }, 1000); // Poll every 1s to catch the 15s window
+}
+setTimeout(() => {
+  if (typeof hasKalshiAuth === 'function' && hasKalshiAuth()) {
+    console.log('[kalshi-crypto] Crypto 15m scanner started (3s, 14sh @ 99.9¢ — BTC/ETH/XRP/SOL/BNB)');
+    scheduleKalshiCryptoScan();
+  }
+}, 38000);
+
+// ── Kalshi BTC Daily "Above/Below" Liquidity-Hole Scanner (KXBTCD) ──
+// If BTC is safely above a strike by >= $1000 and YES side book goes thin/empty,
+// post a resting YES limit at 99¢ to catch stale/late sellers.
+const kalshiBtcdLiquidityFired = new Set();
+const KALSHI_BTCD_SAFE_BUFFER = 1200;
+let kalshiBtcdLiquidityInitialized = false;
+
+function parseBtcdStrike(yesSubtitle) {
+  const m = String(yesSubtitle || '').match(/\$?([\d,]+(?:\.\d+)?)/);
+  if (!m) return null;
+  const n = parseFloat(m[1].replace(/,/g, ''));
+  return Number.isFinite(n) ? n : null;
+}
+
+async function initKalshiBtcdLiquidityFired() {
+  if (kalshiBtcdLiquidityInitialized) return;
+  try {
+    const [oR, fR] = await Promise.all([
+      kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders?limit=500`, { method: 'GET' }),
+      kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/fills?limit=500`, { method: 'GET' }),
+    ]);
+    const [oD, fD] = await Promise.all([oR.json(), fR.json()]);
+    for (const x of (oD.orders || [])) {
+      if (x.ticker?.startsWith('KXBTCD-')) kalshiBtcdLiquidityFired.add(x.ticker);
+    }
+    for (const x of (fD.fills || [])) {
+      if (x.ticker?.startsWith('KXBTCD-')) kalshiBtcdLiquidityFired.add(x.ticker);
+    }
+    kalshiBtcdLiquidityInitialized = true;
+    console.log(`[kalshi-btcd] Pre-loaded ${kalshiBtcdLiquidityFired.size} already-used KXBTCD tickers`);
+  } catch {}
+}
+
+function scheduleKalshiBtcdLiquidityScan() {
+  setTimeout(async () => {
+    try {
+      if (typeof hasKalshiAuth !== 'function' || !hasKalshiAuth()) { scheduleKalshiBtcdLiquidityScan(); return; }
+      await initKalshiBtcdLiquidityFired();
+
+      const pR = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT', { signal: AbortSignal.timeout(3000) });
+      const pD = await pR.json();
+      const currentPrice = parseFloat(pD.price);
+      if (!currentPrice) { scheduleKalshiBtcdLiquidityScan(); return; }
+
+      // Only fire on the CURRENT hour (about to expire) — future hours are too risky
+      const etNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+      const dd = String(etNow.getDate()).padStart(2, '0');
+      const months = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+      const mm = months[etNow.getMonth()];
+      const yy = String(etNow.getFullYear()).slice(2);
+      const currentHour = etNow.getHours();
+      // Two tiers: $2000 buffer anytime, tighten to $1500 at :30
+      const minsIntoHour = etNow.getMinutes();
+      const buffer = minsIntoHour >= 30 ? 1500 : 2000;
+      // Next hour (the one currently active for trading — handles midnight rollover)
+      const nextHourET = new Date(etNow.getTime() + 3600000);
+      const ndd = String(nextHourET.getDate()).padStart(2, '0');
+      const nmm = months[nextHourET.getMonth()];
+      const nh = nextHourET.getHours();
+      const eventTickers = [
+        `KXBTCD-${yy}${mm}${dd}${String(currentHour).padStart(2, '0')}`,
+        `KXBTCD-${yy}${nmm}${ndd}${String(nh).padStart(2, '0')}`,
+      ];
+      for (const evTicker of eventTickers) {
+        // Use markets endpoint (paginated) instead of events endpoint (188 markets = huge payload = timeout)
+        let allMarkets = [];
+        let cursor = '';
+        for (let page = 0; page < 3; page++) {
+          const url = `${KALSHI_API}/trade-api/v2/markets?event_ticker=${evTicker}&limit=100${cursor ? '&cursor=' + cursor : ''}`;
+          const dR = await fetch(url, { signal: AbortSignal.timeout(10000) });
+          if (!dR.ok) break;
+          const dD = await dR.json();
+          allMarkets.push(...(dD.markets || []));
+          cursor = dD.cursor || '';
+          if (!cursor || (dD.markets || []).length < 100) break;
+        }
+        const dD = { markets: allMarkets };
+        for (const m of (dD.markets || [])) {
+          if (!m?.ticker || m.status !== 'active') continue;
+          if (kalshiBtcdLiquidityFired.has(m.ticker)) continue;
+
+          const strike = parseBtcdStrike(m.yes_sub_title);
+          if (!strike) continue;
+          if (currentPrice < strike + buffer) continue; // $2000 early, $1500 at :30
+
+          // For $2000+ buffer, buy regardless — it's basically certain
+          // For $1500-2000 (tightened at :30), only buy thin books
+          const actualBuffer = currentPrice - strike;
+          if (actualBuffer < 2000) {
+            const yesBid = parseFloat(m.yes_bid_dollars || '0');
+            const yesAsk = parseFloat(m.yes_ask_dollars || '1');
+            const yesBookThin = yesBid <= 0.01 || yesAsk >= 0.999;
+            if (!yesBookThin) continue;
+          }
+
+          try {
+            const count = Math.floor(4 * 100 / 99); // $4 cap → 4 shares
+            const body = JSON.stringify({
+              ticker: m.ticker,
+              action: 'buy',
+              side: 'yes',
+              type: 'limit',
+              count,
+              yes_price: 99,
+            });
+            const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+            const od = await or.json();
+            const accepted = !!od.order;
+            const errMsg = od.error?.message || '';
+            if (accepted || /already|exists|duplicate|active order/i.test(errMsg)) {
+              // One-off per option ticker: once accepted (or already active), never place again.
+              kalshiBtcdLiquidityFired.add(m.ticker);
+            }
+            if (accepted) {
+              console.log(`[kalshi-btcd] BTC $${currentPrice.toFixed(0)} strike $${strike.toFixed(0)} (+$${(currentPrice - strike).toFixed(0)}) thin YES book -> 99¢ YES ${count}sh on ${m.ticker} → filled:${od.order?.fill_count_fp || '0'}`);
+            } else {
+              console.log(`[kalshi-btcd] order not accepted on ${m.ticker}: ${errMsg.slice(0, 100)}`);
+            }
+          } catch (err) {
+            console.error('[kalshi-btcd] order err:', err.message?.slice(0, 80));
+          }
+        }
+
+        // === INVERSION STRATEGY — find orphan asks (NO < 100%) surrounded by 100% neighbors ===
+        // Scan every 2s, buy 5sh max per ticker, 4+ steps from mid
+        {
+          const allBuckets = [];
+          for (const m of (dD.markets || [])) {
+            if (!m?.ticker || m.status !== 'active') continue;
+            const strike = parseBtcdStrike(m.yes_sub_title);
+            if (!strike) continue;
+            const noAsk = parseFloat(m.no_ask_dollars || '1');
+            const yesAsk = parseFloat(m.yes_ask_dollars || '1');
+            const effNo = noAsk < 0.01 ? 1.0 : noAsk;
+            const effYes = yesAsk < 0.01 ? 1.0 : yesAsk;
+            allBuckets.push({ strike, noAsk, yesAsk, effNo, effYes, ticker: m.ticker, subtitle: m.yes_sub_title || '' });
+          }
+          allBuckets.sort((a, b) => a.strike - b.strike);
+
+          // Find mid (closest to 50/50)
+          const midIdx = allBuckets.reduce((best, b, i) => Math.abs(b.noAsk - 0.50) < Math.abs(allBuckets[best].noAsk - 0.50) ? i : best, 0);
+
+          // ABOVE mid: scan for NO inversions (orphan NO ask under 100%)
+          let maxNo = 0;
+          for (let i = midIdx + 1; i < allBuckets.length; i++) {
+            const dist = i - midIdx;
+            const b = allBuckets[i];
+            if (dist < 4 || b.effNo < 0.95) { maxNo = Math.max(maxNo, b.effNo); continue; }
+            if (b.noAsk < 0.01) { maxNo = Math.max(maxNo, b.effNo); continue; }
+            // Orphan: this bucket has a NO ask but maxNo from further out is higher (or 100%)
+            if (maxNo > 0 && b.effNo < maxNo - 0.001) {
+              const key = `inv5-${b.ticker}`;
+              if (!kalshiBtcdLiquidityFired.has(key)) {
+                kalshiBtcdLiquidityFired.add(key);
+                try {
+                  const body = JSON.stringify({ ticker: b.ticker, action: 'buy', side: 'no', type: 'limit', count: 5, no_price: 99 });
+                  const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+                  const od = await or.json();
+                  if (od.order) console.log(`[kalshi-btcd] INV↑ ${b.subtitle} NO 5sh@99¢ (${(b.effNo*100).toFixed(1)}¢ orphan, max ${(maxNo*100).toFixed(1)}¢) → filled:${od.order?.fill_count_fp || '0'}`);
+                } catch {}
+              }
+            }
+            maxNo = Math.max(maxNo, b.effNo);
+          }
+
+          // BELOW mid: scan for YES inversions (orphan YES ask under 100%)
+          let maxYes = 0;
+          for (let i = midIdx - 1; i >= 0; i--) {
+            const dist = midIdx - i;
+            const b = allBuckets[i];
+            if (dist < 4 || b.effYes < 0.95) { maxYes = Math.max(maxYes, b.effYes); continue; }
+            if (b.yesAsk < 0.01) { maxYes = Math.max(maxYes, b.effYes); continue; }
+            if (maxYes > 0 && b.effYes < maxYes - 0.001) {
+              const key = `inv5-${b.ticker}`;
+              if (!kalshiBtcdLiquidityFired.has(key)) {
+                kalshiBtcdLiquidityFired.add(key);
+                try {
+                  const body = JSON.stringify({ ticker: b.ticker, action: 'buy', side: 'yes', type: 'limit', count: 5, yes_price: 99 });
+                  const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+                  const od = await or.json();
+                  if (od.order) console.log(`[kalshi-btcd] INV↓ ${b.subtitle} YES 5sh@99¢ (${(b.effYes*100).toFixed(1)}¢ orphan, max ${(maxYes*100).toFixed(1)}¢) → filled:${od.order?.fill_count_fp || '0'}`);
+                } catch {}
+              }
+            }
+            maxYes = Math.max(maxYes, b.effYes);
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[kalshi-btcd] Error:', e.message?.slice(0, 80));
+    }
+    scheduleKalshiBtcdLiquidityScan();
+  }, 2000);
+}
+function tryStartKalshiBtcd(attempt = 0) {
+  setTimeout(() => {
+    if (typeof hasKalshiAuth === 'function' && hasKalshiAuth()) {
+      console.log('[kalshi-btcd] KXBTCD hourly scanner started (2s, 4sh @ 99¢, +$2000 early / +$1500 at :30)');
+      scheduleKalshiBtcdLiquidityScan();
+    } else if (attempt < 10) {
+      tryStartKalshiBtcd(attempt + 1);
+    }
+  }, 300000 + attempt * 5000); // start after 5 minutes
+}
+tryStartKalshiBtcd();
+
+// On first run, pre-populate fired set from existing orders to prevent duplicates after restart
+let weatherFiredInitialized = false;
+async function initWeatherFired() {
+  if (weatherFiredInitialized) return;
+  try {
+    const o = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders?limit=200`, { method: 'GET' });
+    const d = await o.json();
+    for (const x of (d.orders || [])) {
+      if (x.ticker?.includes('HIGH')) kalshiWeatherFired.add(x.ticker);
+    }
+    // Also check fills
+    const f = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/fills?limit=200`, { method: 'GET' });
+    const fd = await f.json();
+    for (const x of (fd.fills || [])) {
+      if (x.ticker?.includes('HIGH')) kalshiWeatherFired.add(x.ticker);
+    }
+    weatherFiredInitialized = true;
+    console.log(`[kalshi-weather] Pre-loaded ${kalshiWeatherFired.size} already-fired weather tickers`);
+  } catch {}
+}
+function scheduleKalshiWeatherScan() {
+  setTimeout(async () => {
+    try {
+      if (typeof hasKalshiAuth !== 'function' || !hasKalshiAuth()) { scheduleKalshiWeatherScan(); return; }
+      await initWeatherFired();
+      const now = new Date();
+      const et = new Date(now.getTime() - 4 * 3600000);
+      const months = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+      const dateStr = '26' + months[et.getUTCMonth()] + String(et.getUTCDate()).padStart(2, '0');
+      // ET date for filtering observations (not UTC — market resolves on ET calendar day)
+      const etDateStr = et.toISOString().slice(0, 10);
+
+      for (const city of KALSHI_WEATHER_CITIES) {
+        try {
+          const obsR = await fetch(`https://api.weather.gov/stations/${city.station}/observations?limit=50`, { headers: { 'User-Agent': 'Supertrader' }, signal: AbortSignal.timeout(5000) });
+          if (!obsR.ok) continue;
+          const obs = await obsR.json();
+          let maxF = -Infinity;
+          for (const f of (obs.features || [])) {
+            const p = f.properties || {};
+            // CRITICAL: convert observation timestamp to ET before comparing to today's ET date
+            // Market resolves on ET calendar day, not UTC
+            const obsDate = new Date(p.timestamp || 0);
+            const obsEt = new Date(obsDate.getTime() - 4 * 3600000);
+            const obsEtDate = obsEt.toISOString().slice(0, 10);
+            if (obsEtDate !== etDateStr) continue;
+            const c = p.temperature?.value;
+            if (c == null) continue;
+            const fDeg = c * 9/5 + 32;
+            if (fDeg > maxF) maxF = fDeg;
+          }
+          if (maxF === -Infinity) continue;
+          const eventTicker = `${city.series}-${dateStr}`;
+          const evR = await fetch(`https://api.elections.kalshi.com/trade-api/v2/events/${eventTicker}`, { signal: AbortSignal.timeout(5000) });
+          if (!evR.ok) continue;
+          const evD = await evR.json();
+          // Parse all markets to know bucket positions
+          const allBuckets = [];
+          for (const m of (evD.markets || [])) {
+            const r = parseKalshiTempMarket(m);
+            if (r) allBuckets.push({ ...r, ticker: m.ticker, m });
+          }
+          allBuckets.sort((a, b) => (a.low === -Infinity ? -999 : a.low) - (b.low === -Infinity ? -999 : b.low));
+          // Find which bucket the current max falls in
+          const currentBucketIdx = allBuckets.findIndex(b => {
+            if (b.type === 'below') return Math.floor(maxF) <= b.high;
+            if (b.type === 'above') return maxF >= b.low;
+            return Math.floor(maxF) >= b.low && Math.floor(maxF) <= b.high;
+          });
+
+          for (let bi = 0; bi < allBuckets.length; bi++) {
+            const b = allBuckets[bi];
+            const m = b.m;
+            if (kalshiWeatherFired.has(m.ticker)) continue;
+            const r = b;
+            let side = null, priceField = null;
+
+            // === CERTAIN bets (original logic) ===
+            if (r.type === 'above' && maxF >= r.low) { side = 'yes'; priceField = 'yes_price'; }
+            else if (Math.floor(maxF) > r.high) { side = 'no'; priceField = 'no_price'; }
+
+            // === EARLY ENTRY: temp within 1°F of exceeding bucket, NO price >90%, 3+ buckets above ===
+            if (!side && r.type === 'between' && currentBucketIdx >= 0) {
+              const stepsAbove = currentBucketIdx - bi; // how many buckets above this one
+              const distFromHigh = maxF - r.high; // how close to exceeding (negative = below, positive = above)
+              const noPrice = parseFloat(m.no_ask_dollars || '1.00');
+              // Within 1°F of the upper bound, 3+ steps above, NO side priced >90¢
+              if (distFromHigh >= -1 && distFromHigh < 1 && stepsAbove >= 3 && noPrice >= 0.90) {
+                side = 'no';
+                priceField = 'no_price';
+                console.log(`[kalshi-${city.name}] EARLY: max ${maxF.toFixed(1)}°F | ${m.yes_sub_title} | ${stepsAbove} steps above | NO ask ${(noPrice*100).toFixed(0)}¢`);
+              }
+            }
+
+            if (!side) continue;
+            const mAsk = side === 'yes' ? parseFloat(m.yes_ask_dollars || '1.00') : parseFloat(m.no_ask_dollars || '1.00');
+            if (mAsk < KALSHI_ENTRY_MIN_ASK_DOLLARS) continue;
+            kalshiWeatherFired.add(m.ticker);
+            try {
+              const count = kalshiCappedCount(14);
+              const body = JSON.stringify({ ticker: m.ticker, action: 'buy', side, type: 'limit', count, [priceField]: KALSHI_LIMIT_PRICE_CENTS });
+              const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+              const od = await or.json();
+              console.log(`[kalshi-${city.name}] max ${maxF.toFixed(1)}°F | ${m.yes_sub_title} → ${side.toUpperCase()} ${count}sh@99¢ on ${m.ticker} → filled:${od.order?.fill_count_fp || '0'}`);
+            } catch (e) {
+              console.error(`[kalshi-${city.name}] err:`, e.message?.slice(0, 80));
+            }
+          }
+        } catch {}
+      }
+    } catch (e) {
+      console.error('[kalshi-weather] Error:', e.message?.slice(0, 80));
+    }
+    scheduleKalshiWeatherScan();
+  }, 1000);
+}
+setTimeout(() => {
+  if (typeof hasKalshiAuth === 'function' && hasKalshiAuth()) {
+    console.log(`[kalshi-weather] US city high-temp scanner started (1s, ${KALSHI_WEATHER_CITIES.length} cities, 1sh @ 99¢)`);
+    scheduleKalshiWeatherScan();
+  }
+}, 35000);
+
+// ── Poly Weather Anomaly Scanner — finds mispriced NO across all cities ──
+const POLY_WEATHER_ANOMALY_CITIES = [
+  'nyc','denver','chicago','miami','los-angeles','houston','london','paris','tokyo','seoul',
+  'san-francisco','toronto','munich','madrid','hong-kong','singapore','warsaw','shanghai',
+  'beijing','taipei','wellington','kuala-lumpur','jakarta',
+];
+const polyWeatherAnomalyFired = new Set();
+
+function schedulePolyWeatherAnomalyScan() {
+  setTimeout(async () => {
+    try {
+      if (!clobClient) { schedulePolyWeatherAnomalyScan(); return; }
+      const bal = await getUsdcBalance();
+      if (bal < 10) { schedulePolyWeatherAnomalyScan(); return; }
+
+      // Build today's and tomorrow's date slugs
+      const now = new Date();
+      const months = ['january','february','march','april','may','june','july','august','september','october','november','december'];
+      const todayStr = `${months[now.getUTCMonth()]}-${now.getUTCDate()}-${now.getUTCFullYear()}`;
+      const tmrw = new Date(now.getTime() + 86400000);
+      const tmrwStr = `${months[tmrw.getUTCMonth()]}-${tmrw.getUTCDate()}-${tmrw.getUTCFullYear()}`;
+      const dates = [todayStr, tmrwStr];
+
+      let totalAnomalies = 0;
+      for (const city of POLY_WEATHER_ANOMALY_CITIES) {
+        for (const dateStr of dates) {
+          const isTomorrow = dateStr === tmrwStr;
+          const minGap = isTomorrow ? 0.02 : 0.005; // 2¢ for tomorrow, 0.5¢ for today
+          const slug = `highest-temperature-in-${city}-on-${dateStr}`;
+          try {
+            const r = await fetch(`https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(slug)}`, { signal: AbortSignal.timeout(5000) });
+            const data = await r.json();
+            const ev = Array.isArray(data) ? data[0] : data;
+            if (!ev?.markets?.length) continue;
+
+            // Parse markets: extract temp + prices
+            const mkts = [];
+            for (const m of ev.markets) {
+              const prices = typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices;
+              const outcomes = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes;
+              const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
+              if (!prices || !tokens || tokens.length < 2) continue;
+              const q = (m.question || '').toLowerCase();
+              const tempMatch = m.question?.match(/(\d+)°/);
+              const temp = tempMatch ? parseInt(tempMatch[1]) : 0;
+              if (!temp) continue;
+              const noPrice = parseFloat(prices[1] || 0);
+              const yesPrice = parseFloat(prices[0] || 0);
+              const isHigher = q.includes('or higher') || q.includes('or above');
+              mkts.push({ temp, noPrice, yesPrice, noToken: tokens[1], negRisk: m.negRisk || false, q: m.question, condId: m.conditionId, isHigher });
+            }
+            mkts.sort((a, b) => a.temp - b.temp);
+
+            // Only scan buckets in the "decided" zone (NO ≥ 95¢)
+            // Find anomalies: scanning from extremes inward, NO should monotonically decrease
+            // Any bucket where NO is cheaper than a more extreme bucket is mispriced
+
+            // Build price ladder for Gemini — let AI find the mispricing
+            const ladderStr = mkts.map(m => `${m.temp}° YES:${(m.yesPrice*100).toFixed(1)}¢ NO:${(m.noPrice*100).toFixed(1)}¢`).join('\n');
+
+            // Find all liquid buckets with NO ≥ 95¢ that we haven't traded
+            const liquidBuckets = mkts.filter(m => m.noPrice >= 0.95 && !polyWeatherAnomalyFired.has(`pos-${m.condId}`));
+            if (liquidBuckets.length >= 2 && GEMINI_API_KEY) {
+              const cityKey = `anomaly-${city}-${dateStr}`;
+              if (!polyWeatherAnomalyFired.has(cityKey)) {
+                try {
+                  const prompt = `You analyze weather prediction market pricing. Here is the full price ladder for "${city}" highest temperature on ${dateStr}:
+
+${ladderStr}
+
+Find the SINGLE most mispriced bucket to buy NO on. Rules:
+- The peak (highest YES) is the most likely temperature
+- Moving AWAY from the peak, NO prices should INCREASE monotonically (more certain the temp won't land there)
+- A bucket is mispriced if its NO is CHEAPER than another bucket FURTHER from the peak
+- IMPORTANT: NO at 0¢ means NO sell offers exist = effectively 100% NO (not dead). Treat NO 0¢ as NO 100¢ when comparing
+- A bucket at 99.4¢ when neighbors are at 100¢ (or 0¢ = no offers = 100%) is a GREAT buy, not an anomaly — only flag if a CLOSER-to-peak bucket has MORE expensive NO than a further one
+- Only consider buckets with NO ≥ 95¢ (the decided zone)
+- Natural decline toward the peak is NOT a mispricing
+- Pick the bucket that is FURTHEST from the peak among equally mispriced ones (safest bet)
+
+If you find a mispricing, respond with ONLY the temperature number (e.g., "25"). If no mispricing exists, respond "NONE". One word/number only.`;
+
+                  const gr = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+                    signal: AbortSignal.timeout(8000),
+                  });
+                  const gd = await gr.json();
+                  const answer = (gd.candidates?.[0]?.content?.parts?.[0]?.text || '').trim();
+
+                  if (answer !== 'NONE' && !isNaN(parseInt(answer))) {
+                    const targetTemp = parseInt(answer);
+                    const target = liquidBuckets.find(m => m.temp === targetTemp);
+                    if (target) {
+                      polyWeatherAnomalyFired.add(cityKey);
+                      polyWeatherAnomalyFired.add(`pos-${target.condId}`);
+                      totalAnomalies++;
+                      console.log(`[weather-anomaly] ✓GEMINI ${city} ${target.temp}° NO ${(target.noPrice*100).toFixed(1)}¢ ${isTomorrow ? '[tomorrow]' : '[today]'} — buying 5sh`);
+                      try { await placeLive99Order(target.noToken, 5, target.negRisk, `[weather-anomaly] ${city} ${target.temp}° NO 5sh`); }
+                      catch (e) { console.error(`[weather-anomaly] err: ${e.message?.slice(0,60)}`); }
+                    }
+                  } else {
+                    polyWeatherAnomalyFired.add(cityKey);
+                    console.log(`[weather-anomaly] ${city}: Gemini says NONE — no mispricing`);
+                  }
+                } catch (e) {
+                  console.log(`[weather-anomaly] Gemini err: ${e.message?.slice(0,60)} — skipping ${city}`);
+                }
+              }
+            }
+          } catch {}
+          await new Promise(r => setTimeout(r, 500)); // rate limit
+        }
+      }
+      if (totalAnomalies > 0) console.log(`[weather-anomaly] Found ${totalAnomalies} anomalies this scan`);
+    } catch (e) {
+      console.error('[weather-anomaly] Error:', e.message?.slice(0, 80));
+    }
+    schedulePolyWeatherAnomalyScan();
+  }, 3600000); // Every 1 hour
+}
+setTimeout(() => {
+  if (false) { // DISABLED — old anomaly scanner replaced by weather-inversions
+    console.log(`[weather-anomaly] Poly weather anomaly scanner started (1hr, ${POLY_WEATHER_ANOMALY_CITIES.length} cities, 5sh on mispriced NO ≥90¢)`);
+    // Run first scan immediately
+    (async () => {
+      try {
+        const origTimeout = 3600000;
+        // Inline first run
+        const bal = await getUsdcBalance();
+        if (bal < 10) return;
+        const now = new Date();
+        const months = ['january','february','march','april','may','june','july','august','september','october','november','december'];
+        const todayStr2 = `${months[now.getUTCMonth()]}-${now.getUTCDate()}-${now.getUTCFullYear()}`;
+        const tmrw2 = new Date(now.getTime() + 86400000);
+        const tmrwStr2 = `${months[tmrw2.getUTCMonth()]}-${tmrw2.getUTCDate()}-${tmrw2.getUTCFullYear()}`;
+        const dates = [todayStr2, tmrwStr2];
+        let totalAnomalies = 0;
+        for (const city of POLY_WEATHER_ANOMALY_CITIES) {
+          for (const dateStr of dates) {
+            const isTomorrow = dateStr === tmrwStr2;
+            const minGap = isTomorrow ? 0.02 : 0.005;
+            const slug = `highest-temperature-in-${city}-on-${dateStr}`;
+            try {
+              const r = await fetch(`https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(slug)}`, { signal: AbortSignal.timeout(5000) });
+              const data = await r.json();
+              const ev = Array.isArray(data) ? data[0] : data;
+              if (!ev?.markets?.length) continue;
+              const mkts = [];
+              for (const m of ev.markets) {
+                const prices = typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices;
+                const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
+                if (!prices || !tokens || tokens.length < 2) continue;
+                const tempMatch = m.question?.match(/(\d+)°/);
+                const temp = tempMatch ? parseInt(tempMatch[1]) : 0;
+                if (!temp) continue;
+                mkts.push({ temp, noPrice: parseFloat(prices[1] || 0), yesPrice: parseFloat(prices[0] || 0), noToken: tokens[1], negRisk: m.negRisk || false, q: m.question });
+              }
+              mkts.sort((a, b) => a.temp - b.temp);
+              // Pure Gemini — send full ladder, let AI find mispricing
+              const ladderStr2 = mkts.map(m => `${m.temp}° YES:${(m.yesPrice*100).toFixed(1)}¢ NO:${(m.noPrice*100).toFixed(1)}¢`).join('\n');
+              const liquidBuckets2 = mkts.filter(m => m.noPrice >= 0.95 && !polyWeatherAnomalyFired.has(`pos-${m.condId}`));
+              const cityKey2 = `anomaly-${city}-${dateStr}`;
+              if (liquidBuckets2.length >= 2 && GEMINI_API_KEY && !polyWeatherAnomalyFired.has(cityKey2)) {
+                try {
+                  const prompt2 = `You analyze weather prediction market pricing. Price ladder for "${city}" on ${dateStr}:\n${ladderStr2}\n\nFind the SINGLE most mispriced bucket to buy NO on. Rules:\n- Peak (highest YES) is most likely temperature\n- Moving AWAY from peak, NO should INCREASE monotonically\n- A bucket is mispriced if its NO is CHEAPER than another bucket FURTHER from the peak (even with dead/illiquid 0¢ buckets between)\n- Only consider NO ≥ 95¢\n- Natural decline toward peak is NOT mispricing\n- Pick the FURTHEST from peak among equal mispricings\n\nRespond ONLY the temp number if mispriced, or "NONE". One word.`;
+                  const gr2 = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ contents: [{ parts: [{ text: prompt2 }] }] }),
+                    signal: AbortSignal.timeout(8000),
+                  });
+                  const gd2 = await gr2.json();
+                  const answer2 = (gd2.candidates?.[0]?.content?.parts?.[0]?.text || '').trim();
+                  if (answer2 !== 'NONE' && !isNaN(parseInt(answer2))) {
+                    const target = liquidBuckets2.find(m => m.temp === parseInt(answer2));
+                    if (target) {
+                      polyWeatherAnomalyFired.add(cityKey2); polyWeatherAnomalyFired.add(`pos-${target.condId}`); totalAnomalies++;
+                      console.log(`[weather-anomaly] ✓GEMINI ${city} ${target.temp}° NO ${(target.noPrice*100).toFixed(1)}¢ — buying 5sh`);
+                      try { await placeLive99Order(target.noToken, 5, target.negRisk, `[weather-anomaly] ${city} ${target.temp}° NO 5sh`); } catch {}
+                    }
+                  } else {
+                    polyWeatherAnomalyFired.add(cityKey2);
+                  }
+                } catch {}
+              }
+            } catch {}
+            await new Promise(r => setTimeout(r, 500));
+          }
+        }
+        console.log(`[weather-anomaly] First scan done: ${totalAnomalies} anomalies found`);
+      } catch (e) { console.error('[weather-anomaly] first scan err:', e.message?.slice(0,80)); }
+    })();
+    schedulePolyWeatherAnomalyScan();
+  }
+}, 45000);
+
+// ── Weather Inversion Scanner (Poly) — inversions only, 10sh, hourly ──
+import { scanWeatherInversions } from './scripts/weather-inversions.mjs';
+function scheduleWeatherInversionScan() {
+  setTimeout(async () => {
+    try {
+      if (!clobClient) { scheduleWeatherInversionScan(); return; }
+      const { found, placed } = await scanWeatherInversions(placeLive99Order, clobClient);
+      if (found > 0) console.log(`[weather-inv] Scan done: ${found} inversions found, ${placed} placed`);
+    } catch (e) {
+      console.error('[weather-inv] err:', e.message?.slice(0, 80));
+    }
+    scheduleWeatherInversionScan();
+  }, 3600000); // every hour
+}
+setTimeout(async () => {
+  if (clobClient) {
+    console.log('[weather-inv] Weather inversion scanner started (1hr, inversions only, 10sh)');
+    try {
+      const { found, placed } = await scanWeatherInversions(placeLive99Order, clobClient);
+      console.log(`[weather-inv] First scan: ${found} inversions, ${placed} placed`);
+    } catch (e) { console.error('[weather-inv] first scan err:', e.message?.slice(0, 80)); }
+    scheduleWeatherInversionScan();
+  }
+}, 50000);
+
+// ── Kalshi Esports (CS2 + Valorant) — triggered by PandaScore ──
+// Series per game: { game: match-winner, map: per-map-winner, total: total-maps (CS2 only) }
+const KALSHI_ESPORTS_SERIES = {
+  cs2:      { game: 'KXCS2GAME',      map: 'KXCS2MAP',      total: 'KXCS2TOTALMAPS' },
+  valorant: { game: 'KXVALORANTGAME', map: 'KXVALORANTMAP', total: null },
+  dota2:    { game: 'KXDOTA2GAME',    map: 'KXDOTA2MAP',    total: null },
+  lol:      { game: 'KXLOLGAME',      map: 'KXLOLMAP',      total: 'KXLOLTOTALMAPS' },
+  r6:       { game: 'KXR6GAME',       map: 'KXR6MAP',       total: null },
+  rl:       { game: 'KXRLGAME',       map: null,            total: null },
+};
+// Per-game event cache + shared fired-set
+const kalshiEsportsCache = Object.fromEntries(
+  Object.keys(KALSHI_ESPORTS_SERIES).map(g => [g, { game: [], map: [], total: [], ts: 0 }])
+);
+const kalshiCs2Fired = new Set(); // keys: `${game}-match-${matchId}`, `${game}-map-${matchId}-${pos}`, `${game}-total-${matchId}-${line}`
+
+async function refreshKalshiEsportsEvents(game) {
+  const cache = kalshiEsportsCache[game];
+  if (!cache) return { game: [], map: [], total: [] };
+  // Reduced cache from 60s → 10s to catch newly-listed markets faster
+  if (Date.now() - cache.ts < 10000 && (cache.game.length || cache.map.length || cache.total.length)) return cache;
+  const s = KALSHI_ESPORTS_SERIES[game];
+  try {
+    const requests = [
+      s.game  ? fetch(`https://api.elections.kalshi.com/trade-api/v2/events?series_ticker=${s.game}&status=open&limit=200`, { signal: AbortSignal.timeout(5000) })  : Promise.resolve(null),
+      s.map   ? fetch(`https://api.elections.kalshi.com/trade-api/v2/events?series_ticker=${s.map}&status=open&limit=200`, { signal: AbortSignal.timeout(5000) })   : Promise.resolve(null),
+      s.total ? fetch(`https://api.elections.kalshi.com/trade-api/v2/events?series_ticker=${s.total}&status=open&limit=200&with_nested_markets=true`, { signal: AbortSignal.timeout(5000) }) : Promise.resolve(null),
+    ];
+    const [gR, mR, tR] = await Promise.all(requests);
+    cache.game  = gR ? ((await gR.json()).events || []) : [];
+    cache.map   = mR ? ((await mR.json()).events || []) : [];
+    cache.total = tR ? ((await tR.json()).events || []) : [];
+    cache.ts = Date.now();
+  } catch {}
+  return cache;
+}
+// Back-compat wrapper: default CS2
+async function refreshKalshiCs2Events() { return refreshKalshiEsportsEvents('cs2'); }
+
+// Format ps.scheduled_at into Kalshi's "(Mon DD)" tag (e.g., "(Apr 13)") — ET/UTC agnostic; use UTC date from scheduled_at
+function kalshiDateTag(isoTs) {
+  try {
+    const d = new Date(isoTs);
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    return `(${months[d.getUTCMonth()]} ${d.getUTCDate()})`;
+  } catch { return null; }
+}
+
+const _cs2Norm = s => (s || '').toLowerCase().replace(/\b(team|gaming|esports|gg|e-?sports)\b/g, '').trim();
+const _kalshiMonthToNum = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+
+function hasSameKalshiTickerDate(eventTicker, scheduledAt) {
+  if (!eventTicker || !scheduledAt) return true;
+  const m = String(eventTicker).match(/-(\d{2})([A-Z]{3})(\d{2})\d{4}/i);
+  if (!m) return true;
+  const yy = 2000 + parseInt(m[1], 10);
+  const mm = _kalshiMonthToNum[(m[2] || '').toLowerCase()];
+  const dd = parseInt(m[3], 10);
+  if (Number.isNaN(yy) || Number.isNaN(dd) || mm == null) return true;
+  const d = new Date(scheduledAt);
+  if (Number.isNaN(d.getTime())) return true;
+  return d.getUTCFullYear() === yy && d.getUTCMonth() === mm && d.getUTCDate() === dd;
+}
+
+function findKalshiCs2Event(events, psTeams, dateTag, scheduledAt = null) {
+  const t1 = (psTeams[0] || '').toLowerCase();
+  const t2 = (psTeams[1] || '').toLowerCase();
+  if (!t1 || !t2) return null;
+  const n1 = _cs2Norm(t1), n2 = _cs2Norm(t2);
+  const sameDateEvents = events.filter(e => hasSameKalshiTickerDate(e.event_ticker, scheduledAt));
+  const datePool = sameDateEvents.length ? sameDateEvents : events;
+  // Prefer events matching the date tag; fall back to team-only match if date missing
+  const dateMatches = datePool.filter(e => !dateTag || ((e.sub_title || '') + ' ' + (e.title || '')).includes(dateTag));
+  const pool = dateMatches.length ? dateMatches : datePool;
+  return pool.find(e => {
+    const s = ((e.sub_title || '') + ' ' + (e.title || '')).toLowerCase();
+    return (s.includes(n1) || s.includes(t1)) && (s.includes(n2) || s.includes(t2));
+  }) || null;
+}
+
+async function placeKalshiCs2YesOrder(eventTicker, winnerName, psTeams, label, game = 'cs2') {
+  try {
+    const r = await fetch(`${KALSHI_API}/trade-api/v2/events/${eventTicker}`, { signal: AbortSignal.timeout(5000) });
+    const d = await r.json();
+    const markets = d.markets || [];
+    const wn = winnerName.toLowerCase();
+    const wnNorm = _cs2Norm(wn);
+    const winMarket = markets.find(m => {
+      const ys = (m.yes_sub_title || '').toLowerCase();
+      if (!ys) return false;
+      const ysNorm = _cs2Norm(ys);
+      return ysNorm.includes(wnNorm) || wnNorm.includes(ysNorm) || ys.includes(wn) || wn.includes(ys);
+    });
+    if (!winMarket) {
+      console.log(`[kalshi-${game}] ${label} winner market not found: ${winnerName} in ${eventTicker}`);
+      return false;
+    }
+    // Blanket threshold rule: skip if ask is below configured entry minimum.
+    const ask = parseFloat(winMarket.yes_ask_dollars || '1.00');
+    if (ask < KALSHI_ENTRY_MIN_ASK_DOLLARS) {
+      console.log(`[kalshi-${game}] ${label} SKIP (yes_ask ${ask.toFixed(2)} < 80¢) on ${winMarket.ticker}`);
+      return false;
+    }
+    const count = kalshiCappedCount(14);
+    const body = JSON.stringify({ ticker: winMarket.ticker, action: 'buy', side: 'yes', type: 'limit', count, yes_price: KALSHI_LIMIT_PRICE_CENTS });
+    const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+    const od = await or.json();
+    const filled = od.order?.fill_count_fp || '0';
+    console.log(`[kalshi-${game}] ${label} ${psTeams.join(' vs ')} → ${winnerName} YES ${count}sh@99¢ on ${winMarket.ticker} → filled:${filled}`);
+    return true;
+  } catch (e) {
+    console.error(`[kalshi-${game}] ${label} err:`, e.message?.slice(0, 80));
+    return false;
+  }
+}
+
+async function fireKalshiCs2MapWinner(psTeams, mapWinnerName, matchId, pos, scheduledAt, game = 'cs2') {
+  if (typeof hasKalshiAuth === 'function' && !hasKalshiAuth()) return;
+  if (!KALSHI_ESPORTS_SERIES[game]?.map) return; // no map series for this game (e.g., RL)
+  const key = `${game}-map-${matchId}-${pos}`;
+  if (kalshiCs2Fired.has(key)) return;
+  kalshiCs2Fired.add(key);
+
+  const { map: mapEvents } = await refreshKalshiEsportsEvents(game);
+  const dateTag = kalshiDateTag(scheduledAt);
+  const posEvents = mapEvents.filter(e => e.event_ticker?.endsWith(`-${pos}`));
+  const ev = findKalshiCs2Event(posEvents, psTeams, dateTag, scheduledAt);
+  const seriesTag = KALSHI_ESPORTS_SERIES[game]?.map || 'MAP';
+  if (!ev) {
+    console.log(`[kalshi-${game}] No ${seriesTag} event for ${psTeams.join(' vs ')} map ${pos} ${dateTag || ''}`);
+    // Fallback: if per-map listings are missing, route map-winner signal to match-winner market.
+    const matchKey = `${game}-match-${matchId}`;
+    if (!kalshiCs2Fired.has(matchKey)) {
+      const { game: gameEvents } = await refreshKalshiEsportsEvents(game);
+      const gameEv = findKalshiCs2Event(gameEvents, psTeams, dateTag, scheduledAt);
+      if (gameEv) {
+        console.log(`[kalshi-${game}] Map ${pos}→Match fallback ${psTeams.join(' vs ')} → ${mapWinnerName}`);
+        const placed = await placeKalshiCs2YesOrder(gameEv.event_ticker, mapWinnerName, psTeams, `Map ${pos}→Match`, game);
+        if (placed) kalshiCs2Fired.add(matchKey);
+      } else {
+        const gameSeries = KALSHI_ESPORTS_SERIES[game]?.game || 'GAME';
+        console.log(`[kalshi-${game}] No ${gameSeries} fallback event for ${psTeams.join(' vs ')} ${dateTag || ''}`);
+      }
+    }
+    return;
+  }
+  await placeKalshiCs2YesOrder(ev.event_ticker, mapWinnerName, psTeams, `Map ${pos}`, game);
+}
+
+// Total maps: fire on each map end if any "Over X.5 maps" line is mathematically decided
+async function fireKalshiCs2TotalMaps(psTeams, matchId, ps, scheduledAt, game = 'cs2') {
+  if (typeof hasKalshiAuth === 'function' && !hasKalshiAuth()) return;
+  if (!KALSHI_ESPORTS_SERIES[game]?.total) return; // no total-maps series for this game
+  const { total: totalEvents } = await refreshKalshiEsportsEvents(game);
+  const dateTag = kalshiDateTag(scheduledAt);
+  const ev = findKalshiCs2Event(totalEvents, psTeams, dateTag, scheduledAt);
+  if (!ev) return;
+
+  const nGames = ps.number_of_games || 3;
+  const winsNeeded = Math.ceil(nGames / 2);
+  const psScore = ps.results?.map(r => r.score) || [];
+  const finishedMaps = (ps.games || []).filter(g => g.status === 'finished').length;
+  const maxScore = Math.max(0, ...psScore);
+  const minRemaining = Math.max(0, winsNeeded - maxScore); // extra maps guaranteed to be played
+  const minTotal = finishedMaps + minRemaining; // floor on final total
+  const maxTotal = nGames; // ceiling on final total (BO-N)
+
+  // Fetch markets for this event
+  let markets = ev.markets;
+  if (!markets?.length) {
+    try {
+      const r = await fetch(`${KALSHI_API}/trade-api/v2/events/${ev.event_ticker}`, { signal: AbortSignal.timeout(5000) });
+      const d = await r.json();
+      markets = d.markets || [];
+    } catch { return; }
+  }
+
+  for (const m of markets) {
+    const yst = (m.yes_sub_title || '').toLowerCase();
+    const mm = yst.match(/over\s*([\d.]+)/);
+    if (!mm) continue;
+    const line = parseFloat(mm[1]);
+    const key = `${game}-total-${matchId}-${line}`;
+    if (kalshiCs2Fired.has(key)) continue;
+
+    let side = null;
+    if (minTotal > line) side = 'yes'; // Over guaranteed
+    else if (maxTotal <= line) side = 'no'; // Under guaranteed (BO-N can't exceed)
+    // If match already ended, use actual total
+    if (ps.status === 'finished' || (psScore.length && maxScore >= winsNeeded)) {
+      const actualTotal = finishedMaps || psScore.reduce((a, b) => a + b, 0);
+      side = actualTotal > line ? 'yes' : 'no';
+    }
+    if (!side) continue;
+
+    // Blanket threshold rule
+    const mAsk = side === 'yes' ? parseFloat(m.yes_ask_dollars || '1.00') : parseFloat(m.no_ask_dollars || '1.00');
+    if (mAsk < KALSHI_ENTRY_MIN_ASK_DOLLARS) { console.log(`[kalshi-${game}] TotalMaps SKIP (${side} ask ${mAsk.toFixed(2)} < 80¢) on ${m.ticker}`); continue; }
+    kalshiCs2Fired.add(key);
+    try {
+      const count = kalshiCappedCount(14);
+      const body = JSON.stringify({
+        ticker: m.ticker, action: 'buy', side, type: 'limit', count,
+        ...(side === 'yes' ? { yes_price: KALSHI_LIMIT_PRICE_CENTS } : { no_price: KALSHI_LIMIT_PRICE_CENTS }),
+      });
+      const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+      const od = await or.json();
+      const filled = od.order?.fill_count_fp || '0';
+      console.log(`[kalshi-${game}] TotalMaps ${psTeams.join(' vs ')} → ${side.toUpperCase()} Over ${line} ${count}sh@99¢ on ${m.ticker} → filled:${filled}`);
+    } catch (e) {
+      console.error(`[kalshi-${game}] TotalMaps err:`, e.message?.slice(0, 80));
+    }
+  }
+}
+
+async function fireKalshiCs2Winner(psTeams, winnerName, matchId, scheduledAt, game = 'cs2') {
+  if (typeof hasKalshiAuth === 'function' && !hasKalshiAuth()) return;
+  const key = `${game}-match-${matchId}`;
+  if (kalshiCs2Fired.has(key)) return;
+  kalshiCs2Fired.add(key);
+
+  const { game: gameEvents } = await refreshKalshiEsportsEvents(game);
+  const dateTag = kalshiDateTag(scheduledAt);
+  const ev = findKalshiCs2Event(gameEvents, psTeams, dateTag, scheduledAt);
+  const seriesTag = KALSHI_ESPORTS_SERIES[game]?.game || 'GAME';
+  if (!ev) { console.log(`[kalshi-${game}] No ${seriesTag} event for ${psTeams.join(' vs ')} ${dateTag || ''}`); return; }
+  await placeKalshiCs2YesOrder(ev.event_ticker, winnerName, psTeams, 'Match', game);
+}
+
+// ── Kalshi NHL Goal Scanner ──
+// ESPN detects goals → buy YES on Kalshi O/U lines that are exceeded, NO on impossible ones at end of game
+import { kalshiFetch, hasKalshiAuth } from './lib/kalshiAuth.mjs';
+const KALSHI_API = 'https://api.elections.kalshi.com';
+const kalshiNhlFired = new Set();
+const nhlFirstGoalScorerCache = new Map();
+
+// Map ESPN team abbreviations to Kalshi 3-letter codes
+const ESPN_TO_KALSHI_NHL = {
+  'ANA':'ANA','ARI':'UTA','BOS':'BOS','BUF':'BUF','CAR':'CAR','CBJ':'CBJ','CGY':'CGY',
+  'CHI':'CHI','COL':'COL','DAL':'DAL','DET':'DET','EDM':'EDM','FLA':'FLA','LA':'LA',
+  'MIN':'MIN','MTL':'MTL','NJ':'NJ','NSH':'NSH','NYI':'NYI','NYR':'NYR','OTT':'OTT',
+  'PHI':'PHI','PIT':'PIT','SEA':'SEA','SJ':'SJ','STL':'STL','TB':'TB','TOR':'TOR',
+  'UTA':'UTA','VAN':'VAN','VGK':'VGK','WPG':'WPG','WSH':'WSH',
+};
+
+function nhlNameNorm(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function nhlNameVariants(name) {
+  const cleaned = String(name || '').replace(/\./g, ' ').trim().toLowerCase();
+  const tokens = cleaned.split(/\s+/).map(t => t.replace(/[^a-z0-9]/g, '')).filter(Boolean);
+  const variants = new Set();
+  if (!tokens.length) return variants;
+  variants.add(tokens.join(''));
+  variants.add(tokens.filter(t => t.length > 1).join('')); // drop middle initials, e.g. "Elias N Pettersson"
+  if (tokens.length >= 2) variants.add(tokens[0] + tokens[tokens.length - 1]); // first + last
+  return variants;
+}
+
+function extractFirstNhlGoalScorer(plays = []) {
+  const goalPlays = (plays || [])
+    .filter(p => p?.scoringPlay === true && /goal/i.test(p?.type?.text || ''))
+    .sort((a, b) => (Number(a?.sequenceNumber) || Number.MAX_SAFE_INTEGER) - (Number(b?.sequenceNumber) || Number.MAX_SAFE_INTEGER));
+  const first = goalPlays[0];
+  if (!first) return null;
+
+  const scorer = (first.participants || []).find(p => p?.type === 'scorer')?.athlete?.displayName;
+  if (scorer) return scorer.trim();
+
+  const m = String(first.text || '').match(/^(.+?)\s+Goal\b/i);
+  return m?.[1]?.trim() || null;
+}
+
+async function resolveNhlFirstGoalScorer(eventId) {
+  const cached = nhlFirstGoalScorerCache.get(eventId);
+  if (cached) return cached;
+  try {
+    const r = await fetch(`https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/summary?event=${eventId}`, { signal: AbortSignal.timeout(5000) });
+    const d = await r.json();
+    const scorer = extractFirstNhlGoalScorer(d.plays || []);
+    if (scorer) nhlFirstGoalScorerCache.set(eventId, scorer);
+    return scorer;
+  } catch {
+    return null;
+  }
+}
+
+function scheduleKalshiNhlScan() {
+  setTimeout(async () => {
+    try {
+      if (!hasKalshiAuth()) { scheduleKalshiNhlScan(); return; }
+
+      const espnR = await fetch('https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/scoreboard', { signal: AbortSignal.timeout(5000) });
+      const espnData = await espnR.json();
+
+      for (const ev of (espnData.events || [])) {
+        const comp = ev.competitions?.[0];
+        if (!comp?.competitors?.length) continue;
+        const status = comp.status?.type?.description || '';
+        if (status !== 'In Progress' && !status.startsWith('Final')) continue;
+
+        const awayT = comp.competitors.find(c => c.homeAway === 'away') || comp.competitors[1];
+        const homeT = comp.competitors.find(c => c.homeAway === 'home') || comp.competitors[0];
+        const awayScore = parseInt(awayT.score || 0);
+        const homeScore = parseInt(homeT.score || 0);
+        const totalGoals = awayScore + homeScore;
+
+        const awayAbbr = ESPN_TO_KALSHI_NHL[awayT.team?.abbreviation] || awayT.team?.abbreviation || '';
+        const homeAbbr = ESPN_TO_KALSHI_NHL[homeT.team?.abbreviation] || homeT.team?.abbreviation || '';
+
+        // Kalshi date format: 26APR12
+        const espnDate = new Date(ev.date);
+        const etDate = new Date(espnDate.getTime() - 4 * 3600000);
+        const months = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+        const dateStr = '26' + months[etDate.getMonth()] + String(etDate.getDate()).padStart(2, '0');
+        const gameKey = `${dateStr}${awayAbbr}${homeAbbr}`;
+
+        // FIRST GOAL SCORER (KXNHLFIRSTGOAL) — fire only when scorer is unambiguous.
+        if (totalGoals > 0) {
+          const firstGoalEvent = `KXNHLFIRSTGOAL-${gameKey}`;
+          if (!kalshiNhlFired.has(firstGoalEvent)) {
+            const firstScorer = await resolveNhlFirstGoalScorer(ev.id);
+            if (!firstScorer) {
+              console.log(`[kalshi-nhl] FIRST GOAL unresolved for ${awayAbbr}@${homeAbbr} (${ev.id})`);
+            } else {
+              try {
+                const er = await fetch(`${KALSHI_API}/trade-api/v2/events/${firstGoalEvent}`, { signal: AbortSignal.timeout(5000) });
+                const ed = await er.json();
+                const markets = ed.markets || [];
+                const scorerNorms = nhlNameVariants(firstScorer);
+                const scorerNorm = nhlNameNorm(firstScorer);
+                const matches = markets.filter(m => {
+                  const n = nhlNameNorm(m.yes_sub_title || m.title || '');
+                  if (n === scorerNorm || n.includes(scorerNorm) || scorerNorm.includes(n)) return true;
+                  for (const v of scorerNorms) {
+                    if (n === v || n.includes(v) || v.includes(n)) return true;
+                  }
+                  return false;
+                });
+
+                if (matches.length !== 1) {
+                  const why = matches.length ? `ambiguous (${matches.length})` : 'not found';
+                  console.log(`[kalshi-nhl] FIRST GOAL ${why}: ${firstScorer} on ${firstGoalEvent}`);
+                } else {
+                  const mkt = matches[0];
+                  const ok80 = await checkKalshiAskAbove90(mkt.ticker, 'yes');
+                  if (!ok80) {
+                    console.log(`[kalshi-nhl] FIRST GOAL SKIP (yes ask < 80¢) ${firstScorer} on ${mkt.ticker}`);
+                  } else {
+                    kalshiNhlFired.add(firstGoalEvent);
+                    const count = kalshiCappedCount(14);
+                    const body = JSON.stringify({ ticker: mkt.ticker, action: 'buy', side: 'yes', type: 'limit', count, yes_price: KALSHI_LIMIT_PRICE_CENTS });
+                    const r = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+                    const d = await r.json();
+                    const filled = d.order?.fill_count_fp || '0';
+                    console.log(`[kalshi-nhl] ${awayAbbr}@${homeAbbr} FIRST GOAL→${firstScorer} YES ${count}sh@99¢ on ${mkt.ticker} → filled:${filled}`);
+                  }
+                }
+              } catch (e) {
+                console.log(`[kalshi-nhl] ERR FIRST GOAL ${firstGoalEvent}: ${e.message?.slice(0, 50)}`);
+              }
+            }
+          }
+        }
+
+        // Buy YES on total goal lines BELOW current total (Over is decided)
+        for (let line = 2; line <= 9; line++) {
+          if (totalGoals <= line) continue; // not exceeded yet
+          const ticker = `KXNHLTOTAL-${gameKey}-${line}`;
+          if (kalshiNhlFired.has(ticker)) continue;
+          // Blanket 90¢ rule
+          const ok80 = await checkKalshiAskAbove90(ticker, 'yes');
+          if (!ok80) { console.log(`[kalshi-nhl] SKIP (yes ask < 80¢) on ${ticker}`); continue; }
+          kalshiNhlFired.add(ticker);
+
+          try {
+            const count = kalshiCappedCount(14);
+            const body = JSON.stringify({ ticker, action: 'buy', side: 'yes', type: 'limit', count, yes_price: KALSHI_LIMIT_PRICE_CENTS });
+            const r = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+            const d = await r.json();
+            const filled = d.order?.fill_count_fp || '0';
+            console.log(`[kalshi-nhl] ${awayAbbr}@${homeAbbr} ${awayScore}-${homeScore} | Over ${line}.5 YES ${count}sh@99¢ → filled:${filled}`);
+          } catch (e) {
+            console.log(`[kalshi-nhl] ERR ${ticker}: ${e.message?.slice(0, 50)}`);
+          }
+        }
+
+        // At end of game: buy NO on total lines ABOVE current total (Under is decided)
+        if (status.startsWith('Final')) {
+          for (let line = 2; line <= 9; line++) {
+            if (totalGoals > line) continue; // Over won, not Under
+            const ticker = `KXNHLTOTAL-${gameKey}-${line}`;
+            const noKey = ticker + '-NO';
+            if (kalshiNhlFired.has(noKey)) continue;
+            const ok80 = await checkKalshiAskAbove90(ticker, 'no');
+            if (!ok80) { console.log(`[kalshi-nhl] SKIP (no ask < 80¢) on ${ticker}`); continue; }
+            kalshiNhlFired.add(noKey);
+
+            try {
+              const count = kalshiCappedCount(14);
+              const body = JSON.stringify({ ticker, action: 'buy', side: 'no', type: 'limit', count, no_price: KALSHI_LIMIT_PRICE_CENTS });
+              const r = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+              const d = await r.json();
+              const filled = d.order?.fill_count_fp || '0';
+              console.log(`[kalshi-nhl] ${awayAbbr}@${homeAbbr} FINAL ${awayScore}-${homeScore} | Under ${line}.5 NO ${count}sh@99¢ → filled:${filled}`);
+            } catch (e) {
+              console.log(`[kalshi-nhl] ERR NO ${ticker}: ${e.message?.slice(0, 50)}`);
+            }
+          }
+
+          // MATCH WINNER (KXNHLGAME)
+          const winnerKey = `KXNHLGAME-${gameKey}`;
+          if (!kalshiNhlFired.has(winnerKey)) {
+            const winnerSuffix = homeScore > awayScore ? homeAbbr : awayAbbr;
+            const matchTicker = `${winnerKey}-${winnerSuffix}`;
+            const ok80 = await checkKalshiAskAbove90(matchTicker, 'yes');
+            if (ok80) {
+              kalshiNhlFired.add(winnerKey);
+              try {
+                const count = kalshiCappedCount(14);
+                const body = JSON.stringify({ ticker: matchTicker, action: 'buy', side: 'yes', type: 'limit', count, yes_price: KALSHI_LIMIT_PRICE_CENTS });
+                const r = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+                const d = await r.json();
+                const filled = d.order?.fill_count_fp || '0';
+                console.log(`[kalshi-nhl] ${awayAbbr}@${homeAbbr} FINAL ${awayScore}-${homeScore} | MATCH→${winnerSuffix} YES ${count}sh@99¢ → filled:${filled}`);
+              } catch (e) {
+                console.log(`[kalshi-nhl] ERR MATCH ${matchTicker}: ${e.message?.slice(0, 50)}`);
+              }
+            } else {
+              console.log(`[kalshi-nhl] SKIP MATCH (yes ask < 80¢) on ${matchTicker}`);
+            }
+          }
+
+          // SPREAD (KXNHLSPREAD) — fire when winner covers by over N.5
+          const diff = Math.abs(homeScore - awayScore);
+          const winnerAbbr = homeScore > awayScore ? homeAbbr : awayAbbr;
+          for (const line of [1, 2]) {
+            if (diff <= line) continue;
+            // Kalshi suffix: 1 = over 1.5, 2 = over 2.5
+            const spKey = `KXNHLSPREAD-${gameKey}-${winnerAbbr}${line}`;
+            if (kalshiNhlFired.has(spKey)) continue;
+            const ok80 = await checkKalshiAskAbove90(spKey, 'yes');
+            if (!ok80) { console.log(`[kalshi-nhl] SKIP SPREAD (yes ask < 80¢) on ${spKey}`); continue; }
+            kalshiNhlFired.add(spKey);
+            try {
+              const count = kalshiCappedCount(14);
+              const body = JSON.stringify({ ticker: spKey, action: 'buy', side: 'yes', type: 'limit', count, yes_price: KALSHI_LIMIT_PRICE_CENTS });
+              const r = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+              const d = await r.json();
+              const filled = d.order?.fill_count_fp || '0';
+              console.log(`[kalshi-nhl] ${awayAbbr}@${homeAbbr} FINAL ${awayScore}-${homeScore} | SPREAD ${winnerAbbr} -${line}.5 YES ${count}sh@99¢ → filled:${filled}`);
+            } catch (e) {
+              console.log(`[kalshi-nhl] ERR SPREAD ${spKey}: ${e.message?.slice(0, 50)}`);
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[kalshi-nhl] Error:', e.message?.slice(0, 80));
+    }
+    scheduleKalshiNhlScan();
+  }, 1000); // Every 1s
+}
+setTimeout(() => {
+  if (hasKalshiAuth()) {
+    console.log('[kalshi-nhl] Kalshi NHL goal scanner started (15s, 1sh @ 99¢)');
+    scheduleKalshiNhlScan();
+  }
+}, 20000);
+
+// ── Kalshi Tennis Scanner (price-driven) ──
+// No reliable external data source for Challengers. Instead, poll Kalshi open tennis events
+// and fire when market consensus says a player won (yes_ask ≥ 95¢).
+// Covers ATP, ATP Challenger, WTA — all match winners + set/game props.
+const kalshiTennisFired = new Set();
+const kalshiTennisSeriesAll = ['KXATPMATCH', 'KXATPCHALLENGERMATCH', 'KXWTAMATCH', 'KXATPGAME', 'KXWTAGAME',
+  'KXATPSETWINNER', 'KXATPTOTALSETS', 'KXATPANYSET', 'KXATPGAMETOTAL', 'KXATPGAMESPREAD'];
+const kalshiTennisCache = { events: [], ts: 0 };
+
+async function refreshKalshiTennisEvents() {
+  if (Date.now() - kalshiTennisCache.ts < 30000 && kalshiTennisCache.events.length) return kalshiTennisCache.events;
+  try {
+    const all = [];
+    // Fetch top 3 match-winner series (biggest volume)
+    for (const s of ['KXATPMATCH', 'KXATPCHALLENGERMATCH', 'KXWTAMATCH']) {
+      const r = await fetch(`https://api.elections.kalshi.com/trade-api/v2/events?series_ticker=${s}&status=open&limit=100`, { signal: AbortSignal.timeout(5000) });
+      const d = await r.json();
+      all.push(...(d.events || []));
+    }
+    kalshiTennisCache.events = all;
+    kalshiTennisCache.ts = Date.now();
+  } catch {}
+  return kalshiTennisCache.events;
+}
+
+function scheduleKalshiTennisScan() {
+  setTimeout(async () => {
+    try {
+      if (typeof hasKalshiAuth !== 'function' || !hasKalshiAuth()) { scheduleKalshiTennisScan(); return; }
+      const events = await refreshKalshiTennisEvents();
+      for (const ev of events) {
+        if (kalshiTennisFired.has(ev.event_ticker)) continue;
+        // Fetch full event with markets
+        let markets;
+        try {
+          const r = await fetch(`https://api.elections.kalshi.com/trade-api/v2/events/${ev.event_ticker}`, { signal: AbortSignal.timeout(5000) });
+          const d = await r.json();
+          markets = d.markets || [];
+        } catch { continue; }
+        // Check each market: if yes_ask ≥ 95¢ AND match is live (not pre-match favorite)
+        for (const m of markets) {
+          if (kalshiTennisFired.has(m.ticker)) continue;
+          if (m.status !== 'active') continue;
+          // CRITICAL: skip if match hasn't started yet — high ask could just be a pre-match favorite
+          // Parse scheduled start from event ticker: e.g. KXATPMATCH-26APR141000ALCVIR → 26APR14 1000 ET
+          const now = Date.now();
+          const etMatch = ev.event_ticker.match(/26([A-Z]{3})(\d{2})(\d{4})/);
+          if (etMatch) {
+            const mos = {JAN:0,FEB:1,MAR:2,APR:3,MAY:4,JUN:5,JUL:6,AUG:7,SEP:8,OCT:9,NOV:10,DEC:11};
+            const mo = mos[etMatch[1]] ?? 0;
+            const day = parseInt(etMatch[2]);
+            const hh = parseInt(etMatch[3].slice(0, 2));
+            const mm = parseInt(etMatch[3].slice(2));
+            const startET = new Date(Date.UTC(2026, mo, day, hh + 4, mm)); // ET→UTC (+4 EDT)
+            if (now < startET.getTime()) continue; // match hasn't started — skip pre-match favorite
+          }
+          const yesAsk = parseFloat(m.yes_ask_dollars || '1.00');
+          if (yesAsk >= 0.95) {
+            // Double check: no_ask should be very low (< 10¢) confirming consensus
+            const noAsk = parseFloat(m.no_ask_dollars || '0');
+            if (noAsk > 0.10) continue; // ambiguous — skip
+            kalshiTennisFired.add(m.ticker);
+            try {
+              const count = kalshiCappedCount(14);
+              const body = JSON.stringify({ ticker: m.ticker, action: 'buy', side: 'yes', type: 'limit', count, yes_price: KALSHI_LIMIT_PRICE_CENTS });
+              const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+              const od = await or.json();
+              const filled = od.order?.fill_count_fp || '0';
+              console.log(`[kalshi-tennis] ${ev.sub_title || ev.title} → ${m.yes_sub_title} YES ${count}sh@99¢ on ${m.ticker} → filled:${filled}`);
+            } catch (e) {
+              console.error('[kalshi-tennis] err:', e.message?.slice(0, 80));
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[kalshi-tennis] Error:', e.message?.slice(0, 80));
+    }
+    scheduleKalshiTennisScan();
+  }, 10000);
+}
+// Price-driven tennis scanner DISABLED — can't guarantee 100% decided.
+// ── Kalshi Tennis Scanner (api-tennis.com — Challengers + all tiers) ──
+// Polls api-tennis livescore every 3s. Fires when event_status='Finished' and event_winner is set.
+const TENNIS_API_KEY = '9e15099f078119a8519b6aa167f5d28ea1804072eb66065806ced403ff4f84bf';
+const kalshiTennisApiFired = new Set();
+
+function tennisLastName(fullName) {
+  // "I. Ivashka" → "IVASHKA", "Carlos Alcaraz" → "ALCARAZ"
+  const parts = (fullName || '').trim().split(/\s+/);
+  return parts.length >= 2 ? parts[parts.length - 1].toUpperCase() : (fullName || '').toUpperCase();
+}
+
+function scheduleKalshiTennisApiScan() {
+  setTimeout(async () => {
+    try {
+      if (typeof hasKalshiAuth !== 'function' || !hasKalshiAuth()) { scheduleKalshiTennisApiScan(); return; }
+      const r = await fetch(`https://api.api-tennis.com/tennis/?method=get_livescore&APIkey=${TENNIS_API_KEY}`, { signal: AbortSignal.timeout(5000) });
+      const d = await r.json();
+      const events = d.result || [];
+      for (const ev of events) {
+        if (ev.event_status !== 'Finished' || !ev.event_winner) continue;
+        const eKey = `tennis-${ev.event_key}`;
+        if (kalshiTennisApiFired.has(eKey)) continue;
+        kalshiTennisApiFired.add(eKey);
+
+        const p1 = ev.event_first_player || '';
+        const p2 = ev.event_second_player || '';
+        const winnerName = ev.event_winner === 'First Player' ? p1 : p2;
+        const loserName = ev.event_winner === 'First Player' ? p2 : p1;
+        const wLast = tennisLastName(winnerName);
+        const lLast = tennisLastName(loserName);
+        const isChallenger = (ev.event_type_type || '').toLowerCase().includes('challenger');
+        const typeStr = (ev.event_type_type || '').toLowerCase();
+        const isWta = typeStr.includes('women') || typeStr.includes('wta');
+
+        // Search Kalshi events — try Challenger first, then main tour
+        const seriesToTry = isWta
+          ? ['KXWTAMATCH', 'KXWTACHALLENGERMATCH']
+          : isChallenger ? ['KXATPCHALLENGERMATCH', 'KXATPMATCH'] : ['KXATPMATCH', 'KXATPCHALLENGERMATCH'];
+
+        let fired = false;
+        for (const series of seriesToTry) {
+          if (fired) break;
+          try {
+            const kr = await fetch(`https://api.elections.kalshi.com/trade-api/v2/events?series_ticker=${series}&status=open&limit=100`, { signal: AbortSignal.timeout(5000) });
+            const kd = await kr.json();
+            const kEvent = (kd.events || []).find(e => {
+              const s = ((e.sub_title || '') + ' ' + (e.title || '')).toLowerCase();
+              return s.includes(wLast.toLowerCase()) && s.includes(lLast.toLowerCase());
+            });
+            if (!kEvent) continue;
+            // Fetch markets, find winner
+            const mr = await fetch(`https://api.elections.kalshi.com/trade-api/v2/events/${kEvent.event_ticker}`, { signal: AbortSignal.timeout(5000) });
+            const md = await mr.json();
+            const markets = md.markets || [];
+            const winMkt = markets.find(m => {
+              const ys = (m.yes_sub_title || '').toLowerCase();
+              return ys.includes(wLast.toLowerCase().slice(0, 5));
+            });
+            if (!winMkt) { console.log(`[kalshi-tennis] Winner mkt not found: ${winnerName} in ${kEvent.event_ticker}`); continue; }
+            if (winMkt.status !== 'active') continue;
+            const ask = parseFloat(winMkt.yes_ask_dollars || '1.00');
+            if (ask < KALSHI_ENTRY_MIN_ASK_DOLLARS) { console.log(`[kalshi-tennis] SKIP (ask ${ask} < 80¢) ${winnerName} on ${winMkt.ticker}`); continue; }
+            const count = kalshiCappedCount(14);
+            const body = JSON.stringify({ ticker: winMkt.ticker, action: 'buy', side: 'yes', type: 'limit', count, yes_price: KALSHI_LIMIT_PRICE_CENTS });
+            const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+            const od = await or.json();
+            const filled = od.order?.fill_count_fp || '0';
+            console.log(`[kalshi-tennis] ${winnerName} beat ${loserName} (${ev.event_final_result}) → YES ${count}sh@99¢ on ${winMkt.ticker} → filled:${filled}`);
+            fired = true;
+          } catch {}
+        }
+        if (!fired) console.log(`[kalshi-tennis] No Kalshi match for ${winnerName} vs ${loserName}`);
+
+        // Fire Poly sub-markets at match end: match winner, total sets, total games
+        try {
+          if (!clobClient) throw 'no clob';
+          const polyKey = `poly-tennis-end-${ev.event_key}`;
+          if (kalshiTennisApiFired.has(polyKey)) throw 'already fired';
+          // Search Gamma for event
+          const gR = await fetch(`https://gamma-api.polymarket.com/events?active=true&closed=false&limit=50`, { signal: AbortSignal.timeout(5000) });
+          const gD = await gR.json();
+          const polyEvent = (gD || []).find(e => {
+            const t = (e.title || '').toLowerCase();
+            return t.includes(wLast.toLowerCase()) && t.includes(lLast.toLowerCase());
+          });
+          if (!polyEvent?.markets?.length) throw 'no poly event';
+          kalshiTennisApiFired.add(polyKey);
+          const setScore = (ev.event_final_result || '').split(' - ').map(Number);
+          const totalSets = (setScore[0] || 0) + (setScore[1] || 0);
+          // Parse game counts from pointbypoint or estimate from set score
+          let totalGames = 0;
+          if (ev.pointbypoint) {
+            for (const s of ev.pointbypoint) totalGames += (s.number_game ? parseInt(s.number_game) : 0);
+            // Actually count games from last game number per set
+            totalGames = 0;
+            const sets = ev.pointbypoint || [];
+            for (const s of sets) {
+              const games = Array.isArray(s) ? s : (s.games || []);
+              // Last score in set gives total games
+              if (s.score) {
+                const gs = s.score.split(' - ').map(Number);
+                totalGames += (gs[0] || 0) + (gs[1] || 0);
+              }
+            }
+          }
+          for (const m of polyEvent.markets) {
+            const q = (m.question || '').toLowerCase();
+            const outcomes = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes;
+            const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
+            if (!outcomes || !tokens || tokens.length < 2) continue;
+            // Match winner
+            if (q.includes('winner') && !q.includes('set') && !q.includes('game')) {
+              const winIdx = outcomes.findIndex(o => o.toLowerCase().includes(wLast.toLowerCase().slice(0, 5)));
+              if (winIdx >= 0) {
+                try { await placeLive99Order(tokens[winIdx], 150, m.negRisk === true, `[tennis] ${winnerName} match winner 150sh`);
+                console.log(`[poly-tennis] ${winnerName} match winner → ${outcomes[winIdx]} 150sh`); } catch {}
+              }
+            }
+            // Total sets O/U
+            if (q.includes('total sets') || q.includes('o/u') && q.includes('set')) {
+              const ouMatch = q.match(/(?:o\/u|over\/under)\s*([\d.]+)/);
+              if (ouMatch) {
+                const line = parseFloat(ouMatch[1]);
+                const overIdx = outcomes.findIndex(o => o.toLowerCase().includes('over'));
+                const underIdx = outcomes.findIndex(o => o.toLowerCase().includes('under'));
+                if (totalSets > line && overIdx >= 0) {
+                  try { await placeLive99Order(tokens[overIdx], 150, m.negRisk === true, `[tennis] Total Sets Over ${line} 150sh`);
+                  console.log(`[poly-tennis] Total Sets Over ${line} (actual ${totalSets}) 150sh`); } catch {}
+                } else if (totalSets <= line && underIdx >= 0) {
+                  try { await placeLive99Order(tokens[underIdx], 150, m.negRisk === true, `[tennis] Total Sets Under ${line} 150sh`);
+                  console.log(`[poly-tennis] Total Sets Under ${line} (actual ${totalSets}) 150sh`); } catch {}
+                }
+              }
+            }
+            // 1st Set Winner
+            if (q.includes('1st set') && q.includes('winner')) {
+              // Determine 1st set winner from pointbypoint or set score
+              const pp = ev.pointbypoint || [];
+              if (pp.length >= 1) {
+                const s1 = pp[0];
+                const s1Score = (s1.score || '').split(' - ').map(Number);
+                const s1Winner = (s1Score[0] || 0) > (s1Score[1] || 0) ? p1 : p2;
+                const s1WLast = tennisLastName(s1Winner);
+                const idx = outcomes.findIndex(o => o.toLowerCase().includes(s1WLast.toLowerCase().slice(0, 5)));
+                if (idx >= 0) {
+                  try { await placeLive99Order(tokens[idx], 150, m.negRisk === true, `[tennis] 1st Set Winner ${s1Winner} 150sh`);
+                  console.log(`[poly-tennis] 1st Set Winner → ${outcomes[idx]} 150sh`); } catch {}
+                }
+              }
+            }
+          }
+        } catch {}
+
+
+        // Also fire on Polymarket
+        try {
+          if (!clobClient) continue;
+          const polyKey = `poly-tennis-${ev.event_key}`;
+          if (kalshiTennisApiFired.has(polyKey)) continue;
+          // Search Gamma API for the match by player names
+          const searchTerms = [wLast.toLowerCase(), lLast.toLowerCase()];
+          const gR = await fetch(`https://gamma-api.polymarket.com/events?active=true&closed=false&limit=50`, { signal: AbortSignal.timeout(5000) });
+          const gD = await gR.json();
+          const polyEvent = (gD || []).find(e => {
+            const t = (e.title || '').toLowerCase();
+            return searchTerms.every(s => t.includes(s));
+          });
+          if (!polyEvent?.markets?.length) continue;
+          kalshiTennisApiFired.add(polyKey);
+          // Find the match-winner market (main market)
+          for (const m of polyEvent.markets) {
+            const q = (m.question || m.title || '').toLowerCase();
+            // Match winner market usually contains both player names or "winner"
+            const outcomes = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes;
+            const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
+            if (!outcomes || !tokens || tokens.length < 2) continue;
+            const winIdx = outcomes.findIndex(o => o.toLowerCase().includes(wLast.toLowerCase().slice(0, 5)));
+            if (winIdx < 0) continue;
+            try {
+              await placeLive99Order(tokens[winIdx], 150, m.negRisk === true, `[tennis] ${winnerName} beat ${loserName} 150sh`);
+              console.log(`[poly-tennis] ${winnerName} beat ${loserName} → ${outcomes[winIdx]} 150sh on Poly`);
+            } catch (pe) {
+              console.error('[poly-tennis] err:', pe.message?.slice(0, 60));
+            }
+            break;
+          }
+        } catch (pe) {
+          // silent — Poly match might not exist
+        }
+      }
+    } catch (e) {
+      console.error('[kalshi-tennis] Error:', e.message?.slice(0, 80));
+    }
+    scheduleKalshiTennisApiScan();
+  }, 3000);
+}
+setTimeout(() => {
+  if (typeof hasKalshiAuth === 'function' && hasKalshiAuth()) {
+    console.log('[kalshi-tennis] api-tennis scanner started (3s, all tiers incl Challengers, 14sh @ 99¢)');
+    scheduleKalshiTennisApiScan();
+  }
+}, 36000);
+
+// ── Kalshi Tennis Scanner (ESPN-based, ATP + WTA main tour only) ──
+// Fires on match winner when ESPN reports "Final". No Challengers (ESPN doesn't cover).
+const kalshiTennisEspnFired = new Set();
+const ESPN_TENNIS_LEAGUES = [
+  { name: 'atp', espn: 'tennis/atp', ksSeries: 'KXATPMATCH' },
+  { name: 'wta', espn: 'tennis/wta', ksSeries: 'KXWTAMATCH' },
+];
+
+function tennisPlayerToKalshiKey(name) {
+  // "Carlos Alcaraz" → "ALC" (first 3 of last name, uppercase)
+  const parts = (name || '').trim().split(/\s+/);
+  return parts.length >= 2 ? parts[parts.length - 1].toUpperCase() : name?.toUpperCase() || '';
+}
+
+function scheduleKalshiTennisEspnScan() {
+  setTimeout(async () => {
+    try {
+      if (typeof hasKalshiAuth !== 'function' || !hasKalshiAuth()) { scheduleKalshiTennisEspnScan(); return; }
+      for (const lg of ESPN_TENNIS_LEAGUES) {
+        const er = await fetch(`https://site.api.espn.com/apis/site/v2/sports/${lg.espn}/scoreboard`, { signal: AbortSignal.timeout(5000) });
+        const ed = await er.json();
+        for (const ev of (ed.events || [])) {
+          for (const comp of (ev.competitions || [])) {
+            const st = comp.status?.type?.description || '';
+            const state = comp.status?.type?.state || '';
+            if (state !== 'post' && !st.includes('Final') && !st.includes('Won')) continue;
+            const cs = comp.competitors || [];
+            if (cs.length < 2) continue;
+            const winner = cs.find(c => c.winner === true);
+            if (!winner) continue;
+            const winnerName = winner.athlete?.displayName || winner.team?.displayName || '';
+            const loser = cs.find(c => !c.winner);
+            const loserName = loser?.athlete?.displayName || loser?.team?.displayName || '';
+            const matchKey = `${lg.name}-${winnerName}-${loserName}`;
+            if (kalshiTennisEspnFired.has(matchKey)) continue;
+            kalshiTennisEspnFired.add(matchKey);
+
+            // Find matching Kalshi event — search open events by team names
+            try {
+              const kr = await fetch(`https://api.elections.kalshi.com/trade-api/v2/events?series_ticker=${lg.ksSeries}&status=open&limit=100`, { signal: AbortSignal.timeout(5000) });
+              const kd = await kr.json();
+              const wLast = tennisPlayerToKalshiKey(winnerName);
+              const lLast = tennisPlayerToKalshiKey(loserName);
+              const kEvent = (kd.events || []).find(e => {
+                const s = ((e.sub_title || '') + ' ' + (e.title || '')).toLowerCase();
+                return s.includes(wLast.toLowerCase()) && s.includes(lLast.toLowerCase());
+              });
+              if (!kEvent) { console.log(`[kalshi-tennis] No Kalshi event for ${winnerName} vs ${loserName}`); continue; }
+              // Fetch markets, find winner's market
+              const mr = await fetch(`https://api.elections.kalshi.com/trade-api/v2/events/${kEvent.event_ticker}`, { signal: AbortSignal.timeout(5000) });
+              const md = await mr.json();
+              const markets = md.markets || [];
+              const winMkt = markets.find(m => {
+                const ys = (m.yes_sub_title || '').toLowerCase();
+                return ys.includes(wLast.toLowerCase().slice(0, 5));
+              });
+              if (!winMkt) { console.log(`[kalshi-tennis] Winner market not found for ${winnerName} in ${kEvent.event_ticker}`); continue; }
+              const ask = parseFloat(winMkt.yes_ask_dollars || '1.00');
+              if (ask < KALSHI_ENTRY_MIN_ASK_DOLLARS) { console.log(`[kalshi-tennis] SKIP (ask ${ask} < 80¢) on ${winMkt.ticker}`); continue; }
+              const count = kalshiCappedCount(14);
+              const body = JSON.stringify({ ticker: winMkt.ticker, action: 'buy', side: 'yes', type: 'limit', count, yes_price: KALSHI_LIMIT_PRICE_CENTS });
+              const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+              const od = await or.json();
+              const filled = od.order?.fill_count_fp || '0';
+              console.log(`[kalshi-tennis] ${winnerName} beat ${loserName} → YES ${count}sh@99¢ on ${winMkt.ticker} → filled:${filled}`);
+            } catch (e) {
+              console.error('[kalshi-tennis] err:', e.message?.slice(0, 80));
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[kalshi-tennis] Error:', e.message?.slice(0, 80));
+    }
+    scheduleKalshiTennisEspnScan();
+  }, 10000);
+}
+setTimeout(() => {
+  if (typeof hasKalshiAuth === 'function' && hasKalshiAuth()) {
+    console.log('[kalshi-tennis] ESPN tennis scanner started (10s, ATP+WTA main tour, 14sh @ 99¢)');
+    scheduleKalshiTennisEspnScan();
+  }
+}, 35000);
+
+// ── Kalshi IPL Cricket Scanner (Cricbuzz via RapidAPI) ──
+const CRICBUZZ_KEY = '45f986dd71msh1cb0a8bab28e8f6p12ee87jsn9aa80f7755f1';
+const kalshiIplFired = new Set();
+const iplMatchState = new Map(); // matchId → { team1Score, team2Score, ... }
+
+async function cricbuzzFetch(path) {
+  const r = await fetch(`https://cricbuzz-cricket.p.rapidapi.com${path}`, {
+    headers: { 'x-rapidapi-host': 'cricbuzz-cricket.p.rapidapi.com', 'x-rapidapi-key': CRICBUZZ_KEY },
+    signal: AbortSignal.timeout(5000),
+  });
+  return r.json();
+}
+
+function scheduleKalshiIplScan() {
+  setTimeout(async () => {
+    try {
+      if (typeof hasKalshiAuth !== 'function' || !hasKalshiAuth()) { scheduleKalshiIplScan(); return; }
+      const live = await cricbuzzFetch('/matches/v1/live');
+      for (const mt of (live.typeMatches || [])) {
+        for (const sm of (mt.seriesMatches || [])) {
+          const wrapper = sm.seriesAdWrapper;
+          if (!wrapper || typeof wrapper !== 'object') continue;
+          const series = (wrapper.seriesName || '').toLowerCase();
+          if (!series.includes('ipl') && !series.includes('indian premier')) continue;
+          for (const sa of (wrapper.matches || [])) {
+            const mi = sa.matchInfo || {};
+            const matchId = mi.matchId;
+            const t1 = mi.team1?.teamSName || '';
+            const t2 = mi.team2?.teamSName || '';
+            const state = mi.stateTitle || '';
+            const status = mi.status || '';
+            if (!matchId || !t1 || !t2) continue;
+
+            // Fetch live score
+            let scoreData;
+            try { scoreData = await cricbuzzFetch(`/mcenter/v1/${matchId}/scomm`); } catch { continue; }
+            const ms = scoreData.miniscore || {};
+            const header = scoreData.matchHeader || {};
+            const matchState = header.state || state;
+            const innings = ms.matchScoreDetails?.inningsScoreList || [];
+
+            // Build team scores
+            const teamScores = {};
+            for (const inn of innings) {
+              const team = inn.batTeamName || '';
+              const teamShort = team.includes(t1) ? t1 : team.includes(t2) ? t2 : '';
+              if (teamShort) {
+                teamScores[teamShort] = (teamScores[teamShort] || 0) + (inn.score || 0);
+              }
+            }
+
+            // Kalshi date/key — parse from event start
+            const startTs = mi.startDate ? new Date(parseInt(mi.startDate)).getTime() : 0;
+            const et = new Date(startTs - 4 * 3600000);
+            const months = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+            const dateStr = '26' + months[et.getUTCMonth()] + String(et.getUTCDate()).padStart(2, '0');
+            // Kalshi ticker: KXIPLGAME-{date}{AWAY}{HOME} — need to figure out order
+            // Try both combinations
+            const keys = [`${dateStr}${t1}${t2}`, `${dateStr}${t2}${t1}`];
+
+            // 1) MATCH WINNER — at Complete
+            if (matchState === 'Complete' || state.includes('Won')) {
+              for (const key of keys) {
+                const gKey = `ipl-game-${key}`;
+                if (kalshiIplFired.has(gKey)) continue;
+                // Determine winner from status text
+                let winTeam = null;
+                if (status.toLowerCase().includes(t1.toLowerCase())) winTeam = t1;
+                else if (status.toLowerCase().includes(t2.toLowerCase())) winTeam = t2;
+                if (!winTeam) continue;
+                const ticker = `KXIPLGAME-${key}-${winTeam}`;
+                const ok = await checkKalshiAskAbove90(ticker, 'yes');
+                if (!ok) continue;
+                kalshiIplFired.add(gKey);
+                try {
+                  const count = kalshiCappedCount(1);
+                  const body = JSON.stringify({ ticker, action: 'buy', side: 'yes', type: 'limit', count, yes_price: KALSHI_LIMIT_PRICE_CENTS });
+                  const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+                  const od = await or.json();
+                  console.log(`[kalshi-ipl] ${t1} vs ${t2} MATCH→${winTeam} YES ${count}sh@99¢ on ${ticker} → filled:${od.order?.fill_count_fp || '0'}`);
+                } catch {}
+                break;
+              }
+            }
+
+            // 2) TEAM TOTALS — fire YES when team score exceeds line (mid-game)
+            for (const [team, score] of Object.entries(teamScores)) {
+              for (const line of [155, 160, 185, 190, 215, 220]) {
+                const lineHalf = line + 0.5;
+                if (score <= lineHalf) continue;
+                for (const key of keys) {
+                  const suffix = `${team}${line + 1}`;
+                  const fKey = `ipl-tt-${key}-${suffix}`;
+                  if (kalshiIplFired.has(fKey)) continue;
+                  const ticker = `KXIPLTEAMTOTAL-${key}-${suffix}`;
+                  const ok = await checkKalshiAskAbove90(ticker, 'yes');
+                  if (!ok) continue;
+                  kalshiIplFired.add(fKey);
+                  try {
+                    const count = kalshiCappedCount(1);
+                    const body = JSON.stringify({ ticker, action: 'buy', side: 'yes', type: 'limit', count, yes_price: KALSHI_LIMIT_PRICE_CENTS });
+                    const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+                    const od = await or.json();
+                    console.log(`[kalshi-ipl] ${team} ${score} > ${lineHalf} → YES ${count}sh@99¢ on ${ticker} → filled:${od.order?.fill_count_fp || '0'}`);
+                  } catch {}
+                  break;
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[kalshi-ipl] Error:', e.message?.slice(0, 80));
+    }
+    scheduleKalshiIplScan();
+  }, 30000);
+}
+setTimeout(() => {
+  if (typeof hasKalshiAuth === 'function' && hasKalshiAuth()) {
+    console.log('[kalshi-ipl] ... 1sh @ 99¢)');
+    scheduleKalshiIplScan();
+  }
+}, 38000);
 
 // ── Crypto Above Pre-Expiry Scanner ──
 // 30 min before expiry: pick safest bet (biggest buffer >$1500 >97¢), 10sh
@@ -9187,11 +12864,11 @@ async function scanAboveAtHourStart() {
 
       if (bestYes) {
         console.log(`[above-start] ${cfg.name} $${currentPrice.toFixed(0)} → YES $${bestYes.strike} (lowest strike)`);
-        try { await placeLive99Order(bestYes.tokens[0], 5, bestYes.negRisk, `[above-start] ${cfg.name} YES $${bestYes.strike} 5sh`); } catch {}
+        try { await placeLive99Order(bestYes.tokens[0], 5, bestYes.negRisk, `[above-start] ${cfg.name} YES $${bestYes.strike} 50sh`); } catch {}
       }
       if (bestNo && (!bestYes || bestNo.strike !== bestYes.strike)) {
         console.log(`[above-start] ${cfg.name} $${currentPrice.toFixed(0)} → NO $${bestNo.strike} (highest strike)`);
-        try { await placeLive99Order(bestNo.tokens[1], 5, bestNo.negRisk, `[above-start] ${cfg.name} NO $${bestNo.strike} 5sh`); } catch {}
+        try { await placeLive99Order(bestNo.tokens[1], 5, bestNo.negRisk, `[above-start] ${cfg.name} NO $${bestNo.strike} 50sh`); } catch {}
       }
       if (!bestYes && !bestNo) {
         console.log(`[above-start] ${cfg.name} $${currentPrice.toFixed(0)} — no strikes found`);
@@ -9423,6 +13100,7 @@ function scheduleWeatherPreMarket() {
 // If past 9 PM PT, scan tomorrow instead of today
 const SANDWICH_CITIES = ['wellington','tokyo','seoul','shanghai','beijing','taipei','singapore','kuala-lumpur','jakarta','paris','london','miami','chicago','los-angeles','amsterdam','ankara','wuhan','mumbai','delhi','bangkok','sao-paulo','mexico-city','cairo','istanbul','hong-kong','toronto','new-york','berlin','rome','madrid','lisbon','milan','warsaw','helsinki','buenos-aires','munich','atlanta','denver','san-francisco','seattle','dallas','houston','austin'];
 const sandwichFired = new Set(); // conditionIds already placed
+const sandwichDirectionFired = new Set(); // one pick per city/day/direction
 
 function scheduleWeatherSandwich() {
   setTimeout(async () => {
@@ -9469,6 +13147,7 @@ function scheduleWeatherSandwich() {
           for (const m of e.markets) {
             const prices = typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices;
             if (!prices || prices.length < 2) continue;
+            const yesPrice = parseFloat(prices[0]);
             const noPrice = parseFloat(prices[1]);
             const q = m.question || '';
             let temp = null, label = '';
@@ -9489,42 +13168,110 @@ function scheduleWeatherSandwich() {
             if (temp == null) continue;
 
             const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
-            markets.push({ temp, label, noPrice, tokens, negRisk: m.negRisk, conditionId: m.conditionId, vol: parseFloat(m.volume || 0) });
+            markets.push({ temp, label, yesPrice, noPrice, tokens, negRisk: m.negRisk, conditionId: m.conditionId, vol: parseFloat(m.volume || 0) });
           }
 
           markets.sort((a, b) => a.temp - b.temp);
+          if (markets.length < 7) continue;
 
-          // Find consecutive run from lowest where NO >= 99.5%
-          const eligible = [];
-          for (const m of markets) {
-            if (m.noPrice >= 0.995) eligible.push(m);
-            else break;
+          // Deterministic anomaly logic (no Gemini):
+          // - peak = highest YES bucket
+          // - scan both directions away from peak
+          // - only 3+ buckets away and NO>=95¢
+          // - ignore smooth monotonic drift toward peak
+          // - choose one best per direction (high/low) per city/day
+          const peakIdx = markets.reduce((best, m, idx) => (m.yesPrice > markets[best].yesPrice ? idx : best), 0);
+          const toNoEff = (x) => (x <= 0.0001 ? 1.0 : x); // NO 0¢ => effectively 100%
+          const minGap = ptHour >= 21 ? 0.02 : 0.005; // tomorrow: 2¢, today: 0.5¢
+          const mkDirectionKey = (dir) => `sandwich-${city}-${month}-${day}-${year}-${dir}`;
+
+          function buildSide(dir) {
+            const out = [];
+            if (dir === 'high') {
+              for (let i = peakIdx + 1; i < markets.length; i++) out.push({ ...markets[i], dist: i - peakIdx });
+            } else {
+              for (let i = peakIdx - 1; i >= 0; i--) out.push({ ...markets[i], dist: peakIdx - i });
+            }
+            return out;
           }
-          if (eligible.length < 3) continue; // need at least 3 for a sandwich
 
-          // Find dips (sandwiches)
-          for (let i = 1; i < eligible.length - 1; i++) {
-            const prev = eligible[i-1], curr = eligible[i], next = eligible[i+1];
-            if (curr.noPrice < prev.noPrice && curr.noPrice < next.noPrice) {
-              const dip = Math.min(prev.noPrice, next.noPrice) - curr.noPrice;
-              if (dip < 0.0005) continue; // too small
+          function pickBestAnomaly(side) {
+            const zone = side
+              .filter(m => m.dist >= 3 && toNoEff(m.noPrice) >= 0.95)
+              .map(m => ({ ...m, noEff: toNoEff(m.noPrice) }));
+            if (zone.length < 2) return null;
 
-              const noToken = curr.tokens?.[1];
-              if (!noToken) continue;
-              if (sandwichFired.has(curr.conditionId)) continue;
-              if (openOrderTokens.has(noToken)) { console.log(`[sandwich] SKIP ${city} ${curr.label}: already have order`); continue; }
+            const cands = [];
+            for (let i = 0; i < zone.length; i++) {
+              const prev = i > 0 ? zone[i - 1] : null; // closer to peak
+              const curr = zone[i];
+              const next = i < zone.length - 1 ? zone[i + 1] : null; // further from peak
+              let score = 0;
+              const reasons = [];
 
-              sandwichFired.add(curr.conditionId);
-              console.log(`[sandwich] ${city} ${curr.label} NO ${(curr.noPrice*100).toFixed(1)}¢ (neighbors: ${(prev.noPrice*100).toFixed(1)}/${(next.noPrice*100).toFixed(1)}¢) dip ${(dip*100).toFixed(1)}¢ | $${curr.vol.toFixed(0)} vol`);
-
-              try {
-                const signed = await clobClient.createOrder({ tokenID: noToken, price: 0.99, size: 30, side: 'BUY', expiration }, { tickSize: '0.01', negRisk: curr.negRisk != null ? curr.negRisk : true });
-                const result = await clobClient.postOrder(signed, 'GTD');
-                console.log(`[sandwich]   → 30sh @ 99¢ ${result?.status || '?'}`);
-                placed++;
-              } catch (e2) {
-                console.log(`[sandwich]   → ERROR: ${(e2?.response?.data?.error || e2.message)?.slice(0, 60)}`);
+              // Outward violation: farther bucket is materially cheaper than closer bucket.
+              if (prev && curr.noEff + minGap <= prev.noEff) {
+                score += 2;
+                reasons.push('outward-drop');
               }
+              // Sandwiched dip in decided zone.
+              if (prev && next && curr.noEff + minGap <= prev.noEff && curr.noEff + minGap <= next.noEff) {
+                score += 3;
+                reasons.push('sandwich-dip');
+              }
+              // Adjacent 100% (0¢ offerless) with this bucket still offered materially cheaper.
+              if (((prev && prev.noEff >= 0.9999) || (next && next.noEff >= 0.9999)) && curr.noEff <= 1.0 - minGap) {
+                score += 2;
+                reasons.push('adjacent-100');
+              }
+              // Tie-break helper: among similarly priced candidates, prefer farther.
+              if (prev && Math.abs(curr.noEff - prev.noEff) <= (minGap / 2)) {
+                score += 1;
+                reasons.push('equal-farther');
+              }
+
+              if (score > 0) cands.push({ curr, score, reasons: reasons.join(',') });
+            }
+            if (!cands.length) return null;
+            cands.sort((a, b) =>
+              b.score - a.score ||
+              b.curr.dist - a.curr.dist ||
+              a.curr.noEff - b.curr.noEff
+            );
+            return cands[0];
+          }
+
+          for (const dir of ['low', 'high']) {
+            const dirKey = mkDirectionKey(dir);
+            if (sandwichDirectionFired.has(dirKey)) continue;
+            const best = pickBestAnomaly(buildSide(dir));
+            if (!best) continue;
+
+            const curr = best.curr;
+            const noToken = curr.tokens?.[1];
+            if (!noToken) continue;
+            if (sandwichFired.has(curr.conditionId)) { sandwichDirectionFired.add(dirKey); continue; }
+            if (openOrderTokens.has(noToken)) {
+              console.log(`[sandwich] SKIP ${city} ${curr.label} (${dir}): already have order`);
+              sandwichDirectionFired.add(dirKey);
+              continue;
+            }
+
+            sandwichFired.add(curr.conditionId);
+            sandwichDirectionFired.add(dirKey);
+            console.log(`[sandwich] ${city} ${dir.toUpperCase()} ${curr.label} NO ${(curr.noPrice * 100).toFixed(1)}¢ | peak ${markets[peakIdx].label} YES ${(markets[peakIdx].yesPrice * 100).toFixed(1)}¢ | dist ${curr.dist} | ${best.reasons}`);
+
+            try {
+              const signed = await clobClient.createOrder(
+                { tokenID: noToken, price: 0.99, size: 30, side: 'BUY', expiration },
+                { tickSize: '0.01', negRisk: curr.negRisk != null ? curr.negRisk : true }
+              );
+              const result = await clobClient.postOrder(signed, 'GTD');
+              openOrderTokens.add(noToken);
+              console.log(`[sandwich]   → 30sh @ 99¢ ${result?.status || '?'}`);
+              placed++;
+            } catch (e2) {
+              console.log(`[sandwich]   → ERROR: ${(e2?.response?.data?.error || e2.message)?.slice(0, 60)}`);
             }
           }
         } catch {}
@@ -9771,18 +13518,9 @@ async function runWeatherScan() {
           } else if (exactMatch) {
             const threshold = parseInt(exactMatch[1]);
             // "Will highest be X°C" — exact match
-            // If observed max already > threshold, NO is guaranteed (max exceeded X)
+            // ONLY fire NO when observed max EXCEEDS threshold (100% decided — max can only go higher)
+            // DO NOT buy YES on exact buckets — temp can keep rising even late in day, making YES lose
             if (maxTemp > threshold) {
-              winIdx = outcomes.findIndex(o => o.toLowerCase() === 'no');
-              if (winIdx < 0) winIdx = 1;
-            }
-            // If day is over and max == threshold, YES is guaranteed
-            if (maxTemp === threshold && localHour >= 20) {
-              winIdx = outcomes.findIndex(o => o.toLowerCase() === 'yes');
-              if (winIdx < 0) winIdx = 0;
-            }
-            // If day is over and max != threshold, NO is guaranteed
-            if (maxTemp !== threshold && localHour >= 20) {
               winIdx = outcomes.findIndex(o => o.toLowerCase() === 'no');
               if (winIdx < 0) winIdx = 1;
             }
@@ -11952,4 +15690,25 @@ server.listen(PORT, async () => {
 
   // Auto-flow: check every 3s for smooth price trends
   setInterval(checkFlowTrigger, 3000);
+});
+
+// Temporary: IA weather order placement
+app.post('/api/ia-weather-order', async (req, res) => {
+  if (!clobClient) return res.json({ error: 'no clob' });
+  const { tokenId, size, negRisk, price, label } = req.body;
+  try {
+    const expiration = Math.floor(Date.now() / 1000) + 86400;
+    let result;
+    try {
+      const signed = await clobClient.createOrder({ tokenID: tokenId, price, size, side: 'BUY', expiration }, { tickSize: '0.01', negRisk });
+      result = await clobClient.postOrder(signed, 'GTD');
+    } catch {
+      const signed2 = await clobClient.createOrder({ tokenID: tokenId, price, size, side: 'BUY', expiration }, { tickSize: '0.001', negRisk });
+      result = await clobClient.postOrder(signed2, 'GTD');
+    }
+    console.log('[ia-weather] ' + label + ' ' + size + 'sh @ ' + (price*100) + 'c → ' + result?.status);
+    res.json({ success: true, status: result?.status, orderId: result?.orderID });
+  } catch(e) {
+    res.json({ success: false, error: e?.response?.data?.error?.slice(0,60) || e.message?.slice(0,60) });
+  }
 });
