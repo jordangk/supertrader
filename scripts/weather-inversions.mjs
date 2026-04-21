@@ -7,6 +7,8 @@ const CITIES = [
   'nyc','denver','chicago','miami','los-angeles','houston','london','paris','tokyo','seoul',
   'san-francisco','toronto','munich','madrid','hong-kong','singapore','warsaw','shanghai',
   'beijing','taipei','wellington','kuala-lumpur','jakarta',
+  'istanbul','moscow','amsterdam','helsinki','lagos','sao-paulo','buenos-aires','mexico-city',
+  'seattle','dallas','atlanta','austin',
 ];
 
 const firedInversions = new Set(); // "city-dateStr-temp-side" — never buy same twice
@@ -24,6 +26,7 @@ export async function scanWeatherInversions(placeLive99Order, clobClient) {
     const dt = new Date(now.getTime() + d * 86400000);
     const dateStr = `${months[dt.getUTCMonth()]}-${dt.getUTCDate()}-${dt.getUTCFullYear()}`;
     const label = d === 0 ? 'TODAY' : d === 1 ? 'TOMORROW' : 'DAY+2';
+    const maxNoPrice = d === 0 ? 0.999 : d === 1 ? 0.998 : 0.997; // today max 99.9¢, tomorrow max 99.8¢, day+2 max 99.7¢
 
     for (const city of CITIES) {
       const slug = `highest-temperature-in-${city}-on-${dateStr}`;
@@ -54,10 +57,9 @@ export async function scanWeatherInversions(placeLive99Order, clobClient) {
           const dist = i - peakIdx;
           if (dist < 3 || mkts[i].effNo < 0.95) { maxSoFar = Math.max(maxSoFar, mkts[i].effNo); continue; }
           if (mkts[i].noPrice < 0.01) { maxSoFar = Math.max(maxSoFar, mkts[i].effNo); continue; }
-          if (maxSoFar > 0 && (mkts[i].effNo < maxSoFar - 0.001)) {
+          if (maxSoFar > 0 && (mkts[i].effNo < maxSoFar - 0.001) && mkts[i].noPrice <= maxNoPrice) {
             const key = `${city}-${dateStr}-${mkts[i].temp}-HIGH`;
             if (!firedInversions.has(key)) {
-              const limit = mkts[i].noPrice >= 0.99 ? mkts[i].noPrice : mkts[i].noPrice;
               results.push({ label, city, side: 'HIGH', temp: mkts[i].temp, noPrice: mkts[i].noPrice, noToken: mkts[i].noToken, negRisk: mkts[i].negRisk, gap: maxSoFar - mkts[i].effNo, key });
             }
           }
@@ -70,7 +72,7 @@ export async function scanWeatherInversions(placeLive99Order, clobClient) {
           const dist = peakIdx - i;
           if (dist < 3 || mkts[i].effNo < 0.95) { maxSoFar = Math.max(maxSoFar, mkts[i].effNo); continue; }
           if (mkts[i].noPrice < 0.01) { maxSoFar = Math.max(maxSoFar, mkts[i].effNo); continue; }
-          if (maxSoFar > 0 && (mkts[i].effNo < maxSoFar - 0.001)) {
+          if (maxSoFar > 0 && (mkts[i].effNo < maxSoFar - 0.001) && mkts[i].noPrice <= maxNoPrice) {
             const key = `${city}-${dateStr}-${mkts[i].temp}-LOW`;
             if (!firedInversions.has(key)) {
               results.push({ label, city, side: 'LOW', temp: mkts[i].temp, noPrice: mkts[i].noPrice, noToken: mkts[i].noToken, negRisk: mkts[i].negRisk, gap: maxSoFar - mkts[i].effNo, key });

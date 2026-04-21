@@ -1,4 +1,6 @@
 import 'dotenv/config';
+import { kalshiFetch, hasKalshiAuth } from './lib/kalshiAuth.mjs';
+const KALSHI_API = 'https://api.elections.kalshi.com';
 
 // Prevent unhandled WS/stream errors from crashing the process
 process.on('uncaughtException', (err) => {
@@ -126,8 +128,8 @@ function scheduleBatchGasRedeem() {
       const redeemable = (positions || []).filter(p => p.redeemable);
 
       const redeemableTotal = redeemable.reduce((s,p) => s + parseFloat(p.size||0), 0);
-      if (redeemable.length >= 2 && redeemableTotal >= 300 && Date.now() - lastBatchRedeemTime > 300000) {
-        // $300+ redeemable — gasless couldn't handle it, batch via gas
+      if (redeemable.length >= 2 && redeemableTotal >= 100 && Date.now() - lastBatchRedeemTime > 300000) {
+        // $100+ redeemable — gasless couldn't handle it, batch via gas
         console.log(`[batch-redeem] ${redeemable.length} redeemable, \$${redeemableTotal.toFixed(2)} ≥ $300 — batching via gas`);
 
         const { Wallet } = await import('@ethersproject/wallet');
@@ -9527,11 +9529,11 @@ const ESPN_TO_KALSHI_BRASILEIRO = {
   'VIT':'VIT',
 };
 const ESPN_TO_KALSHI_ARG = {
-  'BOC':'BOC','RIV':'RIV','IND':'IND','RAC':'RAC','SLO':'SLO','ESI':'ESI','HUR':'HUR',
+  'BOC':'BOC','RIV':'RIV','IND':'IND','RAC':'RAC','SLO':'SLO','ESI':'ESI','HUR':'HUR','IRM':'IRM',
   'BAN':'BAN','VEL':'VEL','LAN':'LAN','DYJ':'DYJ','GLP':'GLP','ROS':'ROS','NOB':'NOB','NWL':'NOB',
   'COL':'COL','UNI':'UNI','EST':'EST','GOD':'GOD','TAL':'TAL','TALL':'TAL','TIG':'TIG',
   'SARM':'CAS','ARG':'ARG','PLA':'PLA','IRO':'IRO','INS':'INS','PAT':'PAT','BEL':'BEL',
-  'CTR':'CTR','CCE':'CCE','BAR':'BAR','ALD':'ALD','SCR':'SCR','DEP':'DEP',
+  'CTR':'CC','CCE':'CCE','BAR':'BAR','ALD':'ALD','SCR':'SCR','DEP':'DEP',
 };
 const ESPN_TO_KALSHI_LIGAPOR = {
   'POR':'FCP','FCP':'FCP','SPOR':'SPO','SCP':'SPO','BEN':'BEN','SLB':'BEN','BRA':'BRA','SCB':'BRA',
@@ -9616,7 +9618,7 @@ async function fireKalshiOrder(ticker, side, label) {
   try {
     const ok = await checkKalshiAskAbove90(ticker, side);
     if (!ok) { console.log(`${label} SKIP (ask < 80¢) on ${ticker}`); return; }
-    const count = 14;
+    const count = 2;
     const body = JSON.stringify({ ticker, action: 'buy', side, type: 'limit', count, [side === 'yes' ? 'yes_price' : 'no_price']: KALSHI_LIMIT_PRICE_CENTS });
     const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
     const od = await or.json();
@@ -9789,16 +9791,16 @@ async function refreshKalshiNbaEvents() {
 }
 function findKalshiNbaEvent(events, awayName, homeName, awayAbbr, homeAbbr, dateTag) {
   const pool = events.filter(e => !dateTag || ((e.sub_title || '') + ' ' + (e.title || '')).includes(dateTag));
-  const p = pool.length ? pool : events;
+  if (!pool.length) return null; // STRICT: no date match = no event. Don't fall back to all events.
   const abbrNeedle = `${awayAbbr} at ${homeAbbr}`.toLowerCase();
-  const byAbbr = p.find(e => ((e.sub_title || '') + ' ' + (e.title || '')).toLowerCase().includes(abbrNeedle));
+  const byAbbr = pool.find(e => ((e.sub_title || '') + ' ' + (e.title || '')).toLowerCase().includes(abbrNeedle));
   if (byAbbr) return byAbbr;
 
   const aNorm = nbaNorm(awayName);
   const hNorm = nbaNorm(homeName);
   const aTok = aNorm.split(' ').filter(t => t.length > 2);
   const hTok = hNorm.split(' ').filter(t => t.length > 2);
-  return p.find(e => {
+  return pool.find(e => {
     const s = nbaNorm((e.sub_title || '') + ' ' + (e.title || ''));
     const aOk = aTok.length ? aTok.some(t => s.includes(t)) : false;
     const hOk = hTok.length ? hTok.some(t => s.includes(t)) : false;
@@ -9950,14 +9952,16 @@ setTimeout(() => {
 
 // ── Kalshi NBA Player Props Scanner (PTS/AST/REB from ESPN) ──
 const kalshiNbaPropFired2 = new Set();
+const kalshiNbaPropPending = new Map(); // key → { ticker, side, label, detectedAt, stat, playerName, cfg, gameKey, awayAbbr, homeAbbr }
+const IMMEDIATE_STATS = new Set(['points', 'threes']); // never revised → fire immediately, 14sh
+const DELAYED_STATS = new Set(['assists', 'rebounds', 'steals', 'blocks']); // revision-prone → 3min delay, 4sh
 const KALSHI_NBA_PROP_SERIES = [
   { series: 'KXNBAPTS', stat: 'points' },
   { series: 'KXNBAAST', stat: 'assists' },
   { series: 'KXNBAREB', stat: 'rebounds' },
   { series: 'KXNBA3PT', stat: 'threes' },
-  // KXNBASTL and KXNBABLK disabled — steals/blocks get revised too often, even with dual-source check
-  // { series: 'KXNBASTL', stat: 'steals' },
-  // { series: 'KXNBABLK', stat: 'blocks' },
+  { series: 'KXNBASTL', stat: 'steals' },  // re-enabled with 3min delay
+  { series: 'KXNBABLK', stat: 'blocks' },  // re-enabled with 3min delay
 ];
 
 function nbaTickerDateStr(isoTs) {
@@ -10045,9 +10049,7 @@ async function fireKalshiNbaPropOrder(ticker, side, label) {
       console.log(`${label} SKIP (ask < 80¢) on ${ticker}`);
       return false;
     }
-    const certain = await geminiVerifyBet(label, side);
-    if (!certain) { console.log(`${label} SKIP (Gemini not certain) on ${ticker}`); return false; }
-    const count = 14;
+    const count = 2;
     const body = JSON.stringify({
       ticker,
       action: 'buy',
@@ -10192,8 +10194,44 @@ function scheduleKalshiNbaPlayerPropsScan() {
               }
             }
             const label = `[kalshi-nba-prop] ${awayAbbr}@${homeAbbr} ${statRow.displayName} ${cfg.stat}=${actual} ${side === 'yes' ? '>=' : '<'} ${parsed.line}`;
-            const placed = await fireKalshiNbaPropOrder(m.ticker, side, label);
-            if (placed) kalshiNbaPropFired2.add(firedKey);
+
+            if (IMMEDIATE_STATS.has(cfg.stat)) {
+              // Points, 3PT — never revised, fire immediately at 14sh
+              const placed = await fireKalshiNbaPropOrder(m.ticker, side, label);
+              if (placed) kalshiNbaPropFired2.add(firedKey);
+            } else if (DELAYED_STATS.has(cfg.stat)) {
+              // Assists, rebounds, steals, blocks — 3min delay, re-check, 4sh
+              const pendingKey = firedKey;
+              if (!kalshiNbaPropPending.has(pendingKey)) {
+                kalshiNbaPropPending.set(pendingKey, { ticker: m.ticker, side, label, detectedAt: Date.now(), stat: cfg.stat, playerName: parsed.playerName, line: parsed.line, cdnGameId: nbaCdnGameIds[`${awayAbbr}-${homeAbbr}`] || nbaCdnGameIds[`${awayT.team?.abbreviation}-${homeT.team?.abbreviation}`] });
+                console.log(`${label} — DELAYED 3min (revision-prone stat)`);
+              } else {
+                const pending = kalshiNbaPropPending.get(pendingKey);
+                if (Date.now() - pending.detectedAt >= 180000) { // 3 minutes passed
+                  // Re-check both sources
+                  let stillValid = true;
+                  if (pending.cdnGameId) {
+                    const recheck = await getNbaCdnPlayerStat(pending.cdnGameId, pending.playerName, pending.stat);
+                    if (recheck !== null && recheck < pending.line) {
+                      console.log(`${label} — REVISED after 3min! NBA.com=${recheck} < ${pending.line} — SKIP`);
+                      stillValid = false;
+                    }
+                  }
+                  if (stillValid) {
+                    // Override count to 4sh for delayed stats
+                    const ok = await checkKalshiAskAbove90(m.ticker, side);
+                    if (ok) {
+                      const body = JSON.stringify({ ticker: m.ticker, action: 'buy', side, type: 'limit', count: 4, [side === 'yes' ? 'yes_price' : 'no_price']: KALSHI_LIMIT_PRICE_CENTS });
+                      const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+                      const od = await or.json();
+                      console.log(`${label} → ${side.toUpperCase()} 4sh@99¢ [3min confirmed] on ${m.ticker} → filled:${od.order?.fill_count_fp || '0'}`);
+                    }
+                  }
+                  kalshiNbaPropFired2.add(firedKey);
+                  kalshiNbaPropPending.delete(pendingKey);
+                }
+              }
+            }
           }
         }
       }
@@ -10269,9 +10307,7 @@ async function fireKalshiMlbOrder(ticker, side, label) {
   try {
     const ok = await checkKalshiAskAbove90(ticker, side);
     if (!ok) { console.log(`${label} SKIP (ask < 80¢) on ${ticker}`); return; }
-    const certain = await geminiVerifyBet(label, side);
-    if (!certain) { console.log(`${label} SKIP (Gemini not certain) on ${ticker}`); return; }
-    const count = 14;
+    const count = 2;
     const body = JSON.stringify({ ticker, action: 'buy', side, type: 'limit', count, [side === 'yes' ? 'yes_price' : 'no_price']: KALSHI_LIMIT_PRICE_CENTS });
     const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
     const od = await or.json();
@@ -10287,7 +10323,7 @@ async function fireKalshiMlbPropOrder(ticker, side, label) {
     if (!ok) { console.log(`${label} SKIP (ask < 80¢) on ${ticker}`); return; }
     const certain = await geminiVerifyBet(label, side);
     if (!certain) { console.log(`${label} SKIP (Gemini not certain) on ${ticker}`); return; }
-    const count = 14;
+    const count = 2;
     const body = JSON.stringify({ ticker, action: 'buy', side, type: 'limit', count, [side === 'yes' ? 'yes_price' : 'no_price']: KALSHI_LIMIT_PRICE_CENTS });
     const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
     const od = await or.json();
@@ -10671,12 +10707,16 @@ function scheduleKalshiMlbPropsScan() {
         }
 
         // For each Kalshi series, check markets
+        // Immediate (14sh): HR, K — never revised
+        // Delayed 2min (4sh): HIT, HRR, TB — scorer judgment calls
+        const MLB_IMMEDIATE = new Set(['KXMLBHR', 'KXMLBKS']);
+        const MLB_DELAYED = new Set(['KXMLBHIT', 'KXMLBHRR', 'KXMLBTB']);
         const seriesToStat = {
-          // KXMLBHIT: p => p.h,    // DISABLED — hit vs error is subjective scorer call
-          KXMLBHR:  p => p.hr,       // objective — ball left the park
-          KXMLBKS:  p => p.k,        // objective — strikeout is clear
-          // KXMLBHRR: p => p.h + p.r + p.rbi, // DISABLED — depends on hits (14 losses, worst offender)
-          // KXMLBTB:  p => p.tbMin, // DISABLED — depends on hits being correct
+          KXMLBHIT: p => p.h,
+          KXMLBHR:  p => p.hr,
+          KXMLBKS:  p => p.k,
+          KXMLBHRR: p => p.h + p.r + p.rbi,
+          KXMLBTB:  p => p.tbMin,
         };
         for (const [series, stat] of Object.entries(seriesToStat)) {
           const markets = await fetchKalshiPropMarkets(matchKey, series);
@@ -10702,9 +10742,11 @@ function scheduleKalshiMlbPropsScan() {
               if (mlbVal !== null) {
                 console.log(`[kalshi-mlb-prop] ${mkt.playerKey} ESPN=${val} MLB.com=${mlbVal} ✓ both confirm >= ${mkt.threshold}`);
               }
-              kalshiMlbPropFired.add(mkt.ticker);
               const statName = series.replace('KXMLB','').toLowerCase();
-              fireKalshiMlbPropOrder(mkt.ticker, 'yes', `[kalshi-mlb-prop] ${mkt.playerKey} ${statName}=${val} >= ${mkt.threshold}`);
+
+              // Game is Final + 2min settled — fire everything at 14sh
+              kalshiMlbPropFired.add(mkt.ticker);
+              fireKalshiMlbPropOrder(mkt.ticker, 'yes', `[kalshi-mlb-prop] ${mkt.playerKey} ${statName}=${val} >= ${mkt.threshold} [2min settled]`);
             }
           }
         }
@@ -10970,11 +11012,41 @@ function scheduleKalshiNhlPropsScan() {
                   }
                   if (nhlVal !== null) console.log(`[kalshi-nhl-prop] ${mkt.playerKey} ${statName}: ESPN=${val} NHL.com=${nhlVal} ✓ both confirm >= ${mkt.threshold}`);
                 }
-                const count = 14;
-                const body = JSON.stringify({ ticker: mkt.ticker, action: 'buy', side: 'yes', type: 'limit', count, yes_price: KALSHI_LIMIT_PRICE_CENTS });
-                const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
-                const od = await or.json();
-                console.log(`[kalshi-nhl-prop] ${mkt.playerKey} ${statName}=${val} >= ${mkt.threshold} → YES ${count}sh@99¢ on ${mkt.ticker} → filled:${od.order?.fill_count_fp || '0'}`);
+                // NHL goals = immediate 14sh (clear event, reviewed at time of scoring)
+                // NHL assists/points/saves = 3-min delay 4sh (can be reassigned)
+                if (series === 'KXNHLGOAL') {
+                  const body = JSON.stringify({ ticker: mkt.ticker, action: 'buy', side: 'yes', type: 'limit', count: 2, yes_price: KALSHI_LIMIT_PRICE_CENTS });
+                  const or2 = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+                  const od2 = await or2.json();
+                  console.log(`[kalshi-nhl-prop] ${mkt.playerKey} ${statName}=${val} >= ${mkt.threshold} → YES 14sh@99¢ on ${mkt.ticker} → filled:${od2.order?.fill_count_fp || '0'}`);
+                } else {
+                // Other NHL stats use 3-min delay
+                const nhlPendingKey = `nhl-${mkt.ticker}`;
+                if (!kalshiNbaPropPending.has(nhlPendingKey)) {
+                  kalshiNbaPropPending.set(nhlPendingKey, { ticker: mkt.ticker, detectedAt: Date.now(), playerKey: mkt.playerKey, statName, val, threshold: mkt.threshold, nhlGameId });
+                  console.log(`[kalshi-nhl-prop] ${mkt.playerKey} ${statName}=${val} >= ${mkt.threshold} — DELAYED 3min`);
+                } else {
+                  const pend = kalshiNbaPropPending.get(nhlPendingKey);
+                  if (Date.now() - pend.detectedAt >= 180000) {
+                    // Re-check NHL API after 3 min
+                    let stillValid = true;
+                    if (pend.nhlGameId) {
+                      const recheck = await getNhlPlayerStat(pend.nhlGameId, pend.playerKey.replace(/^[A-Z]{2,4}/, '').replace(/\d+$/, ''), nhlStatMap[series]);
+                      if (recheck !== null && recheck < pend.threshold) {
+                        console.log(`[kalshi-nhl-prop] ${pend.playerKey} ${pend.statName}: REVISED after 3min! NHL.com=${recheck} < ${pend.threshold} — SKIP`);
+                        stillValid = false;
+                      }
+                    }
+                    if (stillValid) {
+                      const body = JSON.stringify({ ticker: mkt.ticker, action: 'buy', side: 'yes', type: 'limit', count: 4, yes_price: KALSHI_LIMIT_PRICE_CENTS });
+                      const or2 = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+                      const od2 = await or2.json();
+                      console.log(`[kalshi-nhl-prop] ${pend.playerKey} ${pend.statName}=${pend.val} >= ${pend.threshold} → YES 4sh@99¢ [3min confirmed] → filled:${od2.order?.fill_count_fp || '0'}`);
+                    }
+                    kalshiNbaPropPending.delete(nhlPendingKey);
+                  }
+                }
+                } // end else (non-goal NHL stats)
               } catch {}
             }
           }
@@ -11177,16 +11249,16 @@ function scheduleKalshiBtcdLiquidityScan() {
           if (!cursor || (dD.markets || []).length < 100) break;
         }
         const dD = { markets: allMarkets };
+        // OLD buffer-based scanner DISABLED — replaced by inversion scanner below
+        if (false) {
         for (const m of (dD.markets || [])) {
           if (!m?.ticker || m.status !== 'active') continue;
           if (kalshiBtcdLiquidityFired.has(m.ticker)) continue;
 
           const strike = parseBtcdStrike(m.yes_sub_title);
           if (!strike) continue;
-          if (currentPrice < strike + buffer) continue; // $2000 early, $1500 at :30
+          if (currentPrice < strike + buffer) continue;
 
-          // For $2000+ buffer, buy regardless — it's basically certain
-          // For $1500-2000 (tightened at :30), only buy thin books
           const actualBuffer = currentPrice - strike;
           if (actualBuffer < 2000) {
             const yesBid = parseFloat(m.yes_bid_dollars || '0');
@@ -11222,70 +11294,31 @@ function scheduleKalshiBtcdLiquidityScan() {
             console.error('[kalshi-btcd] order err:', err.message?.slice(0, 80));
           }
         }
+        } // end if(false) — old buffer scanner disabled
 
-        // === INVERSION STRATEGY — find orphan asks (NO < 100%) surrounded by 100% neighbors ===
-        // Scan every 2s, buy 5sh max per ticker, 4+ steps from mid
-        {
-          const allBuckets = [];
-          for (const m of (dD.markets || [])) {
-            if (!m?.ticker || m.status !== 'active') continue;
-            const strike = parseBtcdStrike(m.yes_sub_title);
-            if (!strike) continue;
-            const noAsk = parseFloat(m.no_ask_dollars || '1');
-            const yesAsk = parseFloat(m.yes_ask_dollars || '1');
-            const effNo = noAsk < 0.01 ? 1.0 : noAsk;
-            const effYes = yesAsk < 0.01 ? 1.0 : yesAsk;
-            allBuckets.push({ strike, noAsk, yesAsk, effNo, effYes, ticker: m.ticker, subtitle: m.yes_sub_title || '' });
-          }
-          allBuckets.sort((a, b) => a.strike - b.strike);
+        // === SNIPE ALL strikes $3k+ from BTC — same pattern as ETH scanner ===
+        for (const m of (dD.markets || [])) {
+          if (!m?.ticker || m.status !== 'active') continue;
+          if (kalshiBtcdLiquidityFired.has(m.ticker)) continue;
 
-          // Find mid (closest to 50/50)
-          const midIdx = allBuckets.reduce((best, b, i) => Math.abs(b.noAsk - 0.50) < Math.abs(allBuckets[best].noAsk - 0.50) ? i : best, 0);
+          const strike = parseBtcdStrike(m.yes_sub_title);
+          if (!strike) continue;
+          const dist = Math.abs(currentPrice - strike);
+          if (dist < 3000) continue; // must be $3k+ from current BTC price
 
-          // ABOVE mid: scan for NO inversions (orphan NO ask under 100%)
-          let maxNo = 0;
-          for (let i = midIdx + 1; i < allBuckets.length; i++) {
-            const dist = i - midIdx;
-            const b = allBuckets[i];
-            if (dist < 4 || b.effNo < 0.95) { maxNo = Math.max(maxNo, b.effNo); continue; }
-            if (b.noAsk < 0.01) { maxNo = Math.max(maxNo, b.effNo); continue; }
-            // Orphan: this bucket has a NO ask but maxNo from further out is higher (or 100%)
-            if (maxNo > 0 && b.effNo < maxNo - 0.001) {
-              const key = `inv5-${b.ticker}`;
-              if (!kalshiBtcdLiquidityFired.has(key)) {
-                kalshiBtcdLiquidityFired.add(key);
-                try {
-                  const body = JSON.stringify({ ticker: b.ticker, action: 'buy', side: 'no', type: 'limit', count: 5, no_price: 99 });
-                  const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
-                  const od = await or.json();
-                  if (od.order) console.log(`[kalshi-btcd] INV↑ ${b.subtitle} NO 5sh@99¢ (${(b.effNo*100).toFixed(1)}¢ orphan, max ${(maxNo*100).toFixed(1)}¢) → filled:${od.order?.fill_count_fp || '0'}`);
-                } catch {}
-              }
-            }
-            maxNo = Math.max(maxNo, b.effNo);
-          }
+          // Below BTC → YES (BTC is above), Above BTC → NO (BTC won't reach)
+          const side = strike < currentPrice ? 'yes' : 'no';
 
-          // BELOW mid: scan for YES inversions (orphan YES ask under 100%)
-          let maxYes = 0;
-          for (let i = midIdx - 1; i >= 0; i--) {
-            const dist = midIdx - i;
-            const b = allBuckets[i];
-            if (dist < 4 || b.effYes < 0.95) { maxYes = Math.max(maxYes, b.effYes); continue; }
-            if (b.yesAsk < 0.01) { maxYes = Math.max(maxYes, b.effYes); continue; }
-            if (maxYes > 0 && b.effYes < maxYes - 0.001) {
-              const key = `inv5-${b.ticker}`;
-              if (!kalshiBtcdLiquidityFired.has(key)) {
-                kalshiBtcdLiquidityFired.add(key);
-                try {
-                  const body = JSON.stringify({ ticker: b.ticker, action: 'buy', side: 'yes', type: 'limit', count: 5, yes_price: 99 });
-                  const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
-                  const od = await or.json();
-                  if (od.order) console.log(`[kalshi-btcd] INV↓ ${b.subtitle} YES 5sh@99¢ (${(b.effYes*100).toFixed(1)}¢ orphan, max ${(maxYes*100).toFixed(1)}¢) → filled:${od.order?.fill_count_fp || '0'}`);
-                } catch {}
-              }
-            }
-            maxYes = Math.max(maxYes, b.effYes);
-          }
+          // Dynamic sizing: 20sh at $3k, +5sh per extra $100
+          const count = 20 + Math.floor((dist - 3000) / 100) * 5;
+
+          kalshiBtcdLiquidityFired.add(m.ticker);
+          try {
+            const body = JSON.stringify({ ticker: m.ticker, action: 'buy', side, type: 'limit', count, [side === 'yes' ? 'yes_price' : 'no_price']: 99 });
+            const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+            const od = await or.json();
+            if (od.order) console.log(`[kalshi-btcd] ${side.toUpperCase()} $${strike.toLocaleString()} ${count}sh@99¢ (dist $${dist.toFixed(0)}) → filled:${od.order?.fill_count_fp || '0'}`);
+          } catch {}
         }
       }
     } catch (e) {
@@ -11294,6 +11327,158 @@ function scheduleKalshiBtcdLiquidityScan() {
     scheduleKalshiBtcdLiquidityScan();
   }, 2000);
 }
+
+// ── KXETHD Hourly Sniper — same as BTCD but for ETH, $250 buffer, 5sh base ──
+const kalshiEthdFired = new Set();
+let kalshiEthdLastEvent = null;
+
+function scheduleKalshiEthdScan() {
+  setTimeout(async () => {
+    try {
+      if (typeof hasKalshiAuth !== 'function' || !hasKalshiAuth()) { scheduleKalshiEthdScan(); return; }
+
+      // Get ETH price
+      const pR = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT', { signal: AbortSignal.timeout(3000) });
+      const ethPrice = parseFloat((await pR.json()).price);
+      if (!ethPrice) { scheduleKalshiEthdScan(); return; }
+
+      // Build current hour event ticker
+      const etNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+      const dd = String(etNow.getDate()).padStart(2, '0');
+      const months = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+      const mm = months[etNow.getMonth()];
+      const yy = String(etNow.getFullYear()).slice(2);
+      const hh = etNow.getHours();
+      const evTicker = `KXETHD-${yy}${mm}${dd}${String(hh).padStart(2, '0')}`;
+      // Also next hour
+      const nextH = new Date(etNow.getTime() + 3600000);
+      const evTicker2 = `KXETHD-${yy}${months[nextH.getMonth()]}${String(nextH.getDate()).padStart(2, '0')}${String(nextH.getHours()).padStart(2, '0')}`;
+
+      for (const ticker of [evTicker, evTicker2]) {
+        // Detect new event — snipe immediately
+        const isNew = !kalshiEthdFired.has(`new-${ticker}`);
+        if (isNew) kalshiEthdFired.add(`new-${ticker}`);
+
+        // Fetch markets
+        let allMarkets = [];
+        let cursor = '';
+        for (let page = 0; page < 3; page++) {
+          const url = `${KALSHI_API}/trade-api/v2/markets?event_ticker=${ticker}&limit=100${cursor ? '&cursor=' + cursor : ''}`;
+          const dR = await fetch(url, { signal: AbortSignal.timeout(10000) });
+          if (!dR.ok) break;
+          const dD = await dR.json();
+          allMarkets.push(...(dD.markets || []));
+          cursor = dD.cursor || '';
+          if (!cursor || (dD.markets || []).length < 100) break;
+        }
+        if (!allMarkets.length) continue;
+
+        for (const m of allMarkets) {
+          if (!m?.ticker || m.status !== 'active') continue;
+          if (kalshiEthdFired.has(m.ticker)) continue;
+
+          const strike = parseBtcdStrike(m.yes_sub_title);
+          if (!strike) continue;
+          const dist = Math.abs(ethPrice - strike);
+          if (dist < 120) continue; // must be $120+ from current price
+
+          // Determine side: if strike < ethPrice → YES (ETH is above), if strike > ethPrice → NO (ETH won't reach)
+          const side = strike < ethPrice ? 'yes' : 'no';
+
+          // Dynamic sizing: base 5sh at $120, +5sh per extra $10 (min 5)
+          const count = Math.max(5, 5 + Math.floor((dist - 120) / 10) * 5);
+
+          kalshiEthdFired.add(m.ticker);
+          try {
+            const body = JSON.stringify({ ticker: m.ticker, action: 'buy', side, type: 'limit', count, [side === 'yes' ? 'yes_price' : 'no_price']: 99 });
+            const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+            const od = await or.json();
+            if (od.order) console.log(`[kalshi-ethd] ${side.toUpperCase()} $${strike} ${count}sh@99¢ (dist $${dist.toFixed(0)}) on ${m.ticker} → filled:${od.order?.fill_count_fp || '0'}`);
+          } catch {}
+        }
+      }
+    } catch (e) {
+      console.error('[kalshi-ethd] Error:', e.message?.slice(0, 80));
+    }
+    scheduleKalshiEthdScan();
+  }, 1000); // every 1 second
+}
+setTimeout(() => {
+  if (typeof hasKalshiAuth === 'function' && hasKalshiAuth()) {
+    console.log('[kalshi-ethd] KXETHD hourly sniper started (1s, $120+ buffer, 5sh base +5/10)');
+    scheduleKalshiEthdScan();
+  }
+}, 30000);
+
+// ── Sports Game Winner Sniper — find 100% markets with no book, place 5sh at 99¢ ──
+const sportsSnipeFired = new Set();
+const SPORTS_SNIPE_SERIES = [
+  'KXNHLGAME', 'KXNBAGAME', 'KXMLBGAME',
+  'KXEPLGAME', 'KXLALIGAGAME', 'KXSERIEAGAME', 'KXBUNDESLIGAGAME', 'KXLIGUE1GAME',
+  'KXMLSGAME', 'KXLIGAMXGAME', 'KXUCLGAME', 'KXJLEAGUEGAME',
+];
+
+function scheduleSportsSnipe() {
+  setTimeout(async () => {
+    try {
+      if (typeof hasKalshiAuth !== 'function' || !hasKalshiAuth()) { scheduleSportsSnipe(); return; }
+
+      for (const series of SPORTS_SNIPE_SERIES) {
+        try {
+          const r = await fetch(`${KALSHI_API}/trade-api/v2/events?series_ticker=${series}&status=open&limit=20&with_nested_markets=true`, { signal: AbortSignal.timeout(8000) });
+          const d = await r.json();
+          for (const ev of (d.events || [])) {
+            for (const m of (ev.markets || [])) {
+              if (!m?.ticker || m.status !== 'active') continue;
+              if (sportsSnipeFired.has(m.ticker)) continue;
+
+              const yesAsk = parseFloat(m.yes_ask_dollars || '1');
+              const noAsk = parseFloat(m.no_ask_dollars || '1');
+
+              // YES side at 100% (no offers) = decided → buy YES at 99¢
+              if (yesAsk >= 1.0 || yesAsk === 0) {
+                const yesBid = parseFloat(m.yes_bid_dollars || '0');
+                if (yesBid >= 0.95) { // market confirms it's decided
+                  sportsSnipeFired.add(m.ticker);
+                  try {
+                    const body = JSON.stringify({ ticker: m.ticker, action: 'buy', side: 'yes', type: 'limit', count: 5, yes_price: 99 });
+                    const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+                    const od = await or.json();
+                    if (od.order) console.log(`[sports-snipe] YES ${m.yes_sub_title || m.ticker} 5sh@99¢ → filled:${od.order?.fill_count_fp || '0'}`);
+                  } catch {}
+                }
+              }
+
+              // NO side at 100% (no offers) = decided → buy NO at 99¢
+              if (noAsk >= 1.0 || noAsk === 0) {
+                const noBid = parseFloat(m.no_bid_dollars || '0');
+                if (noBid >= 0.95) {
+                  sportsSnipeFired.add(m.ticker);
+                  try {
+                    const body = JSON.stringify({ ticker: m.ticker, action: 'buy', side: 'no', type: 'limit', count: 5, no_price: 99 });
+                    const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+                    const od = await or.json();
+                    if (od.order) console.log(`[sports-snipe] NO ${m.yes_sub_title || m.ticker} 5sh@99¢ → filled:${od.order?.fill_count_fp || '0'}`);
+                  } catch {}
+                }
+              }
+            }
+          }
+        } catch {}
+      }
+    } catch (e) {
+      console.error('[sports-snipe] Error:', e.message?.slice(0, 80));
+    }
+    scheduleSportsSnipe();
+  }, 2000); // every 2 seconds
+}
+setTimeout(() => {
+  if (typeof hasKalshiAuth === 'function' && hasKalshiAuth()) {
+    console.log(`[sports-snipe] Sports game winner sniper started (2s, ${SPORTS_SNIPE_SERIES.length} series, 5sh@99¢ on 100% markets)`);
+    scheduleSportsSnipe();
+  }
+}, 35000); // start after 35s
+
 function tryStartKalshiBtcd(attempt = 0) {
   setTimeout(() => {
     if (typeof hasKalshiAuth === 'function' && hasKalshiAuth()) {
@@ -11302,7 +11487,7 @@ function tryStartKalshiBtcd(attempt = 0) {
     } else if (attempt < 10) {
       tryStartKalshiBtcd(attempt + 1);
     }
-  }, 300000 + attempt * 5000); // start after 5 minutes
+  }, 30000 + attempt * 5000); // start after 30s
 }
 tryStartKalshiBtcd();
 
@@ -11402,7 +11587,10 @@ function scheduleKalshiWeatherScan() {
 
             if (!side) continue;
             const mAsk = side === 'yes' ? parseFloat(m.yes_ask_dollars || '1.00') : parseFloat(m.no_ask_dollars || '1.00');
-            if (mAsk < KALSHI_ENTRY_MIN_ASK_DOLLARS) continue;
+            if (mAsk < 0.90) { // Weather needs 90¢+ (stricter than other markets)
+              console.log(`[kalshi-${city.name}] SKIP ${m.yes_sub_title} ${side} ask ${(mAsk*100).toFixed(0)}¢ < 90¢`);
+              continue;
+            }
             kalshiWeatherFired.add(m.ticker);
             try {
               const count = kalshiCappedCount(14);
@@ -11434,6 +11622,8 @@ const POLY_WEATHER_ANOMALY_CITIES = [
   'nyc','denver','chicago','miami','los-angeles','houston','london','paris','tokyo','seoul',
   'san-francisco','toronto','munich','madrid','hong-kong','singapore','warsaw','shanghai',
   'beijing','taipei','wellington','kuala-lumpur','jakarta',
+  'istanbul','moscow','amsterdam','helsinki','lagos','sao-paulo','buenos-aires','mexico-city',
+  'seattle','dallas','atlanta','austin',
 ];
 const polyWeatherAnomalyFired = new Set();
 
@@ -11780,9 +11970,15 @@ async function fireKalshiCs2MapWinner(psTeams, mapWinnerName, matchId, pos, sche
   const seriesTag = KALSHI_ESPORTS_SERIES[game]?.map || 'MAP';
   if (!ev) {
     console.log(`[kalshi-${game}] No ${seriesTag} event for ${psTeams.join(' vs ')} map ${pos} ${dateTag || ''}`);
-    // Fallback: if per-map listings are missing, route map-winner signal to match-winner market.
+    // Fallback: only route to match-winner if map winner is LEADING the series (not tied)
+    // pos = map number just won. If pos=1, winner leads 1-0. If pos=2 in Bo3, could be 1-1 (tied) or 2-0.
+    // Only safe to bet match winner if winner has won MORE than half the maps needed.
     const matchKey = `${game}-match-${matchId}`;
     if (!kalshiCs2Fired.has(matchKey)) {
+      // Skip match fallback — map winner doesn't mean series winner unless we know the series score
+      // The total-maps scanner and match-end detection handle this properly
+      console.log(`[kalshi-${game}] Map ${pos}→Match SKIP (can't confirm series lead from map win alone)`);
+      if (false) { // DISABLED — was betting on match winner from single map win
       const { game: gameEvents } = await refreshKalshiEsportsEvents(game);
       const gameEv = findKalshiCs2Event(gameEvents, psTeams, dateTag, scheduledAt);
       if (gameEv) {
@@ -11793,6 +11989,7 @@ async function fireKalshiCs2MapWinner(psTeams, mapWinnerName, matchId, pos, sche
         const gameSeries = KALSHI_ESPORTS_SERIES[game]?.game || 'GAME';
         console.log(`[kalshi-${game}] No ${gameSeries} fallback event for ${psTeams.join(' vs ')} ${dateTag || ''}`);
       }
+      } // end if(false) — map→match fallback disabled
     }
     return;
   }
@@ -11881,8 +12078,6 @@ async function fireKalshiCs2Winner(psTeams, winnerName, matchId, scheduledAt, ga
 
 // ── Kalshi NHL Goal Scanner ──
 // ESPN detects goals → buy YES on Kalshi O/U lines that are exceeded, NO on impossible ones at end of game
-import { kalshiFetch, hasKalshiAuth } from './lib/kalshiAuth.mjs';
-const KALSHI_API = 'https://api.elections.kalshi.com';
 const kalshiNhlFired = new Set();
 const nhlFirstGoalScorerCache = new Map();
 
@@ -12221,6 +12416,79 @@ function scheduleKalshiTennisApiScan() {
       const r = await fetch(`https://api.api-tennis.com/tennis/?method=get_livescore&APIkey=${TENNIS_API_KEY}`, { signal: AbortSignal.timeout(5000) });
       const d = await r.json();
       const events = d.result || [];
+
+      // === SET WINNERS — parse pointbypoint using set_number field ===
+      for (const ev of events) {
+        if (!ev.event_first_player || !ev.event_second_player) continue;
+        const pp = ev.pointbypoint || [];
+        if (!pp.length) continue;
+        const p1 = ev.event_first_player || '';
+        const p2 = ev.event_second_player || '';
+        const p1Last = tennisLastName(p1);
+        const p2Last = tennisLastName(p2);
+
+        // Group games by set using set_number field
+        const sets = {}; // "Set 1" → { p1Games: 0, p2Games: 0 }
+        for (const g of pp) {
+          const sn = (g.set_number || '').replace(/\s*TieBreak\s*/i, ''); // "Set 1 TieBreak" → "Set 1"
+          if (!sn || !sn.startsWith('Set')) continue;
+          if (!sets[sn]) sets[sn] = { p1Games: 0, p2Games: 0 };
+          if (g.serve_winner === 'First Player') sets[sn].p1Games++;
+          else if (g.serve_winner === 'Second Player') sets[sn].p2Games++;
+        }
+
+        // Check which sets are complete
+        const setNums = Object.keys(sets).sort((a, b) => parseInt(a.replace('Set ', '')) - parseInt(b.replace('Set ', '')));
+        for (let i = 0; i < setNums.length; i++) {
+          const sn = setNums[i];
+          const setNum = parseInt(sn.replace('Set ', ''));
+          const setKey = `set-${ev.event_key}-${setNum}`;
+          if (kalshiTennisApiFired.has(setKey)) continue;
+
+          const s = sets[sn];
+          const maxGames = Math.max(s.p1Games, s.p2Games);
+          const minGames = Math.min(s.p1Games, s.p2Games);
+          // Set is complete: someone has 6+ and leads by 2+, or 7-6 (tiebreak)
+          const setComplete = (maxGames >= 6 && maxGames - minGames >= 2) || (maxGames === 7 && minGames === 6);
+          // Also must be confirmed: next set exists OR match is finished
+          const nextSetExists = i < setNums.length - 1;
+          if (!setComplete || (!nextSetExists && ev.event_status !== 'Finished')) continue;
+
+          const setWinner = s.p1Games > s.p2Games ? p1 : p2;
+          const setWinnerLast = tennisLastName(setWinner);
+          kalshiTennisApiFired.add(setKey);
+
+          console.log(`[kalshi-tennis] Set ${setNum} complete: ${s.p1Games}-${s.p2Games} → ${setWinner}`);
+
+          // Find Kalshi set winner market
+          try {
+            const kr = await fetch(`https://api.elections.kalshi.com/trade-api/v2/events?series_ticker=KXATPSETWINNER&status=open&limit=100`, { signal: AbortSignal.timeout(5000) });
+            const kd = await kr.json();
+            const setEv = (kd.events || []).find(e => {
+              const sub = ((e.sub_title || '') + ' ' + (e.title || '')).toLowerCase();
+              return sub.includes(p1Last.toLowerCase()) && sub.includes(p2Last.toLowerCase()) && e.event_ticker?.endsWith(`-${setNum}`);
+            });
+            if (!setEv) continue;
+            const mr = await fetch(`https://api.elections.kalshi.com/trade-api/v2/events/${setEv.event_ticker}`, { signal: AbortSignal.timeout(5000) });
+            const md = await mr.json();
+            const winMkt = (md.markets || []).find(m => {
+              const ys = (m.yes_sub_title || '').toLowerCase();
+              return ys.includes(setWinnerLast.toLowerCase().slice(0, 5));
+            });
+            if (winMkt && winMkt.status === 'active') {
+              const ask = parseFloat(winMkt.yes_ask_dollars || '1');
+              if (ask < 0.90) { console.log(`[kalshi-tennis] Set ${setNum} SKIP (ask ${(ask*100).toFixed(0)}¢ < 90¢) — market doesn't confirm`); continue; }
+              const count = 2;
+              const body = JSON.stringify({ ticker: winMkt.ticker, action: 'buy', side: 'yes', type: 'limit', count, yes_price: 99 });
+              const or = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders`, { method: 'POST', body });
+              const od = await or.json();
+              console.log(`[kalshi-tennis] Set ${setNum} Winner → ${setWinner} (${s.p1Games}-${s.p2Games}) YES ${count}sh@99¢ on ${winMkt.ticker} → filled:${od.order?.fill_count_fp || '0'}`);
+            }
+          } catch {}
+        }
+      }
+
+      // === MATCH WINNERS — only on finished matches ===
       for (const ev of events) {
         if (ev.event_status !== 'Finished' || !ev.event_winner) continue;
         const eKey = `tennis-${ev.event_key}`;
@@ -12750,6 +13018,44 @@ function scheduleBtcAboveScan() {
       if (!clobClient || !scannerFlags.btcAbove) { scheduleBtcAboveScan(); return; }
 
       const currentSlug = getBtcAboveSlug();
+
+      // ── NEW EVENT SNIPE: when hour changes, place YES 10sh at 99¢ on strikes $2500+ below BTC ──
+      const snipeKey = `snipe-${currentSlug}`;
+      if (!btcAboveState.firedSlugs.has(snipeKey)) {
+        btcAboveState.firedSlugs.add(snipeKey);
+        try {
+          // Get BTC price
+          const btcR = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT', { signal: AbortSignal.timeout(3000) });
+          const btcPrice = parseFloat((await btcR.json()).price);
+
+          // Fetch the new event
+          const evR = await fetch(`https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(currentSlug)}`, { signal: AbortSignal.timeout(5000) });
+          const evData = await evR.json();
+          const ev = Array.isArray(evData) ? evData[0] : evData;
+          if (ev?.markets?.length) {
+            let sniped = 0;
+            for (const m of ev.markets) {
+              const q = m.question || '';
+              const strikeMatch = q.match(/above\s+([\d,]+)/);
+              if (!strikeMatch) continue;
+              const strike = parseInt(strikeMatch[1].replace(/,/g, ''));
+              if (!strike) continue;
+              const buffer = btcPrice - strike;
+              if (buffer < 2500) continue; // only $2500+ below current price
+
+              const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
+              if (!tokens?.length) continue;
+
+              try {
+                await placeLive99Order(tokens[0], 10, m.negRisk || false, `[btc-above-snipe] YES $${strike.toLocaleString()} (buffer $${buffer.toFixed(0)}) 10sh`);
+                sniped++;
+                console.log(`[btc-above-snipe] YES $${strike.toLocaleString()} | BTC $${btcPrice.toFixed(0)} | buffer $${buffer.toFixed(0)} | 10sh@99¢`);
+              } catch {}
+            }
+            if (sniped > 0) console.log(`[btc-above-snipe] Sniped ${sniped} strikes on ${currentSlug}`);
+          }
+        } catch (e) { console.log('[btc-above-snipe] err:', e.message?.slice(0, 60)); }
+      }
 
       // Detect event change — previous slug just expired
       if (btcAboveState.currentSlug && btcAboveState.currentSlug !== currentSlug && !btcAboveState.firedSlugs.has(btcAboveState.currentSlug)) {
@@ -13398,6 +13704,7 @@ setTimeout(() => {
 // Weather cities — only those with Wunderground resolution source on Poly
 // Station codes from Poly event resolutionSource URLs
 const WEATHER_CITIES = {
+  // Asia-Pacific
   wellington: { station: 'NZWN:9:NZ', tz: 'Pacific/Auckland' },
   tokyo: { station: 'RJTT:9:JP', tz: 'Asia/Tokyo' },
   seoul: { station: 'RKSI:9:KR', tz: 'Asia/Seoul' },
@@ -13407,11 +13714,35 @@ const WEATHER_CITIES = {
   singapore: { station: 'WSSS:9:SG', tz: 'Asia/Singapore' },
   'kuala-lumpur': { station: 'WMKK:9:MY', tz: 'Asia/Kuala_Lumpur' },
   jakarta: { station: 'WIHH:9:ID', tz: 'Asia/Jakarta' },
+  'hong-kong': { station: 'VHHH:9:HK', tz: 'Asia/Hong_Kong' },
+  // Europe
   paris: { station: 'LFPG:9:FR', tz: 'Europe/Paris' },
   london: { station: 'EGLC:9:GB', tz: 'Europe/London' },
+  madrid: { station: 'LEMD:9:ES', tz: 'Europe/Madrid' },
+  munich: { station: 'EDDM:9:DE', tz: 'Europe/Berlin' },
+  warsaw: { station: 'EPWA:9:PL', tz: 'Europe/Warsaw' },
+  istanbul: { station: 'LTFM:9:TR', tz: 'Europe/Istanbul' },
+  moscow: { station: 'UUEE:9:RU', tz: 'Europe/Moscow' },
+  amsterdam: { station: 'EHAM:9:NL', tz: 'Europe/Amsterdam' },
+  helsinki: { station: 'EFHK:9:FI', tz: 'Europe/Helsinki' },
+  // Africa
+  lagos: { station: 'DNMM:9:NG', tz: 'Africa/Lagos' },
+  // Americas
+  nyc: { station: 'KJFK:9:US', tz: 'America/New_York' },
   miami: { station: 'KMIA:9:US', tz: 'America/New_York' },
   chicago: { station: 'KORD:9:US', tz: 'America/Chicago' },
   'los-angeles': { station: 'KLAX:9:US', tz: 'America/Los_Angeles' },
+  houston: { station: 'KIAH:9:US', tz: 'America/Chicago' },
+  denver: { station: 'KDEN:9:US', tz: 'America/Denver' },
+  'san-francisco': { station: 'KSFO:9:US', tz: 'America/Los_Angeles' },
+  toronto: { station: 'CYYZ:9:CA', tz: 'America/Toronto' },
+  seattle: { station: 'KSEA:9:US', tz: 'America/Los_Angeles' },
+  dallas: { station: 'KDFW:9:US', tz: 'America/Chicago' },
+  atlanta: { station: 'KATL:9:US', tz: 'America/New_York' },
+  austin: { station: 'KAUS:9:US', tz: 'America/Chicago' },
+  'sao-paulo': { station: 'SBGR:9:BR', tz: 'America/Sao_Paulo' },
+  'buenos-aires': { station: 'SAEZ:9:AR', tz: 'America/Argentina/Buenos_Aires' },
+  'mexico-city': { station: 'MMMX:9:MX', tz: 'America/Mexico_City' },
 };
 // Persist weather fired conditionIds to survive restarts
 const WEATHER_FIRED_FILE = new URL('./.weather-fired.json', import.meta.url).pathname;
@@ -15651,6 +15982,135 @@ async function k9TradeMonitor() {
     console.error('[k9-monitor] error:', e.message);
   }
 }
+
+// ── Hourly Wallet Tracker — records portfolio value every hour ──
+const WALLET_LOG_FILE = new URL('./.wallet-history.json', import.meta.url).pathname;
+let walletHistory = [];
+try { walletHistory = JSON.parse(fs.readFileSync(WALLET_LOG_FILE, 'utf8')); } catch {}
+
+function scheduleWalletTracker() {
+  setTimeout(async () => {
+    try {
+      const { createPublicClient, http, getAddress } = await import('viem');
+      const { polygon } = await import('viem/chains');
+      const pc = createPublicClient({ chain: polygon, transport: http('https://polygon-mainnet.g.alchemy.com/v2/' + (process.env.ALCHEMY_KEY || '8kruQGYamUT6J4Ib0aMfw')) });
+      const FUNDER = getAddress(process.env.FUNDER_ADDRESS);
+
+      // Poly
+      const usdc = Number(await pc.readContract({ address: getAddress('0x2791bca1f2de4661ed88a30c99a7a9449aa84174'), abi: [{name:'balanceOf',type:'function',inputs:[{type:'address'}],outputs:[{type:'uint256'}],stateMutability:'view'}], functionName:'balanceOf', args:[FUNDER] })) / 1e6;
+      const wcol = Number(await pc.readContract({ address: getAddress('0x3a3bd7bb9528e159577f7c2e685cc81a765002e2'), abi: [{name:'balanceOf',type:'function',inputs:[{type:'address'}],outputs:[{type:'uint256'}],stateMutability:'view'}], functionName:'balanceOf', args:[FUNDER] })) / 1e6;
+      const r = await fetch('https://data-api.polymarket.com/positions?user=' + process.env.FUNDER_ADDRESS.toLowerCase() + '&sizeThreshold=0.01&limit=500');
+      const positions = await r.json();
+      let polyRedeem = 0, polyPending = 0;
+      for (const p of (positions || [])) {
+        const s = parseFloat(p.size || 0);
+        if (p.redeemable) polyRedeem += s; else polyPending += s;
+      }
+      const polyTotal = usdc + wcol + polyRedeem + polyPending;
+
+      // Kalshi
+      let kalshiTotal = 0;
+      try {
+        const kr = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/balance`, { method: 'GET' });
+        const kd = await kr.json();
+        kalshiTotal = parseFloat(kd.balance || 0) / 100;
+        const kr2 = await kalshiFetch(`${KALSHI_API}/trade-api/v2/portfolio/orders?status=resting&limit=500`, { method: 'GET' });
+        const kd2 = await kr2.json();
+        for (const o of (kd2.orders || [])) {
+          kalshiTotal += parseInt(o.remaining_count || 1) * parseFloat(o.yes_price_dollars || o.no_price_dollars || 0.99);
+        }
+      } catch {}
+
+      const entry = {
+        ts: new Date().toISOString(),
+        poly: Math.round(polyTotal * 100) / 100,
+        kalshi: Math.round(kalshiTotal * 100) / 100,
+        total: Math.round((polyTotal + kalshiTotal) * 100) / 100,
+      };
+      walletHistory.push(entry);
+      // Keep last 30 days (720 hourly entries)
+      if (walletHistory.length > 720) walletHistory = walletHistory.slice(-720);
+      try { fs.writeFileSync(WALLET_LOG_FILE, JSON.stringify(walletHistory, null, 2)); } catch {}
+      console.log(`[wallet] Poly: $${entry.poly} | Kalshi: $${entry.kalshi} | Total: $${entry.total}`);
+    } catch (e) {
+      console.error('[wallet] err:', e.message?.slice(0, 60));
+    }
+    scheduleWalletTracker();
+  }, 3600000); // every hour
+}
+// First snapshot after 60s
+setTimeout(() => {
+  console.log('[wallet] Hourly wallet tracker started');
+  scheduleWalletTracker();
+}, 60000);
+
+// ── Monday 5pm Scanner — buy $100 on 97%+ certainty markets ──
+const mondaySnipeFired = new Set();
+function scheduleMondaySnipe() {
+  setTimeout(async () => {
+    try {
+      if (!clobClient) { scheduleMondaySnipe(); return; }
+      const et = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+      const isMonday = et.getDay() === 1;
+      const isAfter5 = et.getHours() >= 17;
+      const weekKey = `${et.getFullYear()}-${et.getMonth()}-${et.getDate()}`;
+
+      if (isMonday && isAfter5 && !mondaySnipeFired.has(weekKey)) {
+        mondaySnipeFired.add(weekKey);
+        console.log('[monday-snipe] Monday 5pm+ — scanning for 97%+ certainty markets');
+
+        const r = await fetch('https://gamma-api.polymarket.com/events?active=true&closed=false&limit=200&order=volume&ascending=false', { signal: AbortSignal.timeout(10000) });
+        const events = await r.json();
+
+        let placed = 0;
+        for (const ev of (events || [])) {
+          for (const m of (ev.markets || [])) {
+            if (placed >= 1) break; // only 1 per week
+            const prices = typeof m.outcomePrices === 'string' ? JSON.parse(m.outcomePrices) : m.outcomePrices;
+            const outcomes = typeof m.outcomes === 'string' ? JSON.parse(m.outcomes) : m.outcomes;
+            const tokens = typeof m.clobTokenIds === 'string' ? JSON.parse(m.clobTokenIds) : m.clobTokenIds;
+            if (!prices || !outcomes || !tokens || tokens.length < 2) continue;
+
+            const p0 = parseFloat(prices[0] || 0);
+            const p1 = parseFloat(prices[1] || 0);
+            const maxP = Math.max(p0, p1);
+            if (maxP < 0.97) continue; // must be 97%+
+
+            // Check CLOB ask to confirm ≥90% certainty
+            const winIdx = p0 > p1 ? 0 : 1;
+            try {
+              const askR = await fetch('https://clob.polymarket.com/price?token_id=' + tokens[winIdx] + '&side=sell', { signal: AbortSignal.timeout(3000) });
+              const askD = await askR.json();
+              const clobAsk = askD?.price ? parseFloat(askD.price) : null;
+              if (clobAsk != null && clobAsk < 0.90) continue; // CLOB must confirm ≥90%
+            } catch { continue; }
+
+            // Place $100 (100sh at 99.9¢)
+            const negRisk = m.negRisk || false;
+            const size = 100;
+            try {
+              await placeLive99Order(tokens[winIdx], size, negRisk, `[monday-snipe] ${outcomes[winIdx]} on ${(m.question||'').slice(0,40)} 100sh`);
+              placed++;
+              console.log(`[monday-snipe] ✓ ${outcomes[winIdx]} ${(maxP*100).toFixed(1)}¢ | ${(m.question||'').slice(0,50)} | 100sh@99.9¢`);
+            } catch (e) {
+              console.error('[monday-snipe] err:', e.message?.slice(0, 60));
+            }
+          }
+          if (placed >= 1) break;
+        }
+        if (placed) console.log(`[monday-snipe] Placed ${placed} orders`);
+        else console.log('[monday-snipe] No qualifying markets found');
+      }
+    } catch (e) {
+      console.error('[monday-snipe] Error:', e.message?.slice(0, 60));
+    }
+    scheduleMondaySnipe();
+  }, 300000); // check every 5 min
+}
+setTimeout(() => {
+  console.log('[monday-snipe] Weekly scanner armed (Mondays 5pm ET, $100 on 97%+ certainty)');
+  scheduleMondaySnipe();
+}, 60000);
 
 // ── Start ──────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
